@@ -4,5 +4,6 @@
 #include "Ldefines.h"
 #include "core/Lcore.h"
 #include "backends/GLFW/glfw_backend.h"
+#include "graphics/Lgraphics.h"
 
 #endif // _LAPIZ_H_

@@ -1,4 +1,5 @@
-#pragma once
+#ifndef _LAPIZ_GLFW_BACKEND_H_
+#define _LAPIZ_GLFW_BACKEND_H_
 
 /* Backend-agnostic window API. Implemented via GLFW for now; swap backend in one place below. */
 
@@ -268,9 +269,24 @@ LAPIZ_HIDDEN LAPIZ_INLINE LapizWindow* LapizWindowCreate(int width, int height, 
     return glfwCreateWindow(width, height, title, NULL, NULL);
 }
 
-LAPIZ_HIDDEN LAPIZ_INLINE void LapizWindowDestroy(void)
+LAPIZ_HIDDEN LAPIZ_INLINE void LapizWindowMakeCurrent(LapizWindow* window)
 {
-    glfwDestroyWindow(LAPIZ_WINDOW_TO_GLFW(L_State.window));
+    glfwMakeContextCurrent(LAPIZ_WINDOW_TO_GLFW(window));
+}
+
+LAPIZ_HIDDEN LAPIZ_INLINE void LapizWindowDestroy(LapizWindow* window)
+{
+    glfwDestroyWindow(LAPIZ_WINDOW_TO_GLFW(window));
+}
+
+LAPIZ_HIDDEN LAPIZ_INLINE void LapizWindowGetProcAddress(const char* name, void** proc)
+{
+    *proc = glfwGetProcAddress(name);
+}
+
+LAPIZ_HIDDEN LAPIZ_INLINE void LapizSwapInterval(int interval)
+{
+    glfwSwapInterval(interval);
 }
 
 LAPIZ_API LAPIZ_INLINE int LapizWindowShouldClose(void)
@@ -345,3 +361,4 @@ LAPIZ_API LAPIZ_INLINE void LapizSetFPS(int fps)
     glfwSwapInterval(fps);
 }
 
+#endif // _LAPIZ_GLFW_BACKEND_H_

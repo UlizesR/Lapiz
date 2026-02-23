@@ -3,7 +3,14 @@
 
 int main(void)
 {
-    LapizInit(800, 600, "Lapiz Example");
+    #if defined(LAPIZ_VULKAN)
+        const char* title = "Lapiz Vulkan Example";
+    #elif defined(LAPIZ_OPENGL)
+        const char* title = "Lapiz OpenGL Example";
+    #elif defined(LAPIZ_METAL)
+        const char* title = "Lapiz Metal Example";
+    #endif
+    LapizInit(800, 600, title);
 
     while (!LapizWindowShouldClose())
     {
@@ -13,6 +20,10 @@ int main(void)
         {
             LapizSetWindowShouldClose(TRUE);
         }
+
+        LapizClearColor(LAPIZ_COLOR_DARK_SLATE_GRAY);
+        LapizBeginDraw();
+        LapizEndDraw();
     }
     LapizTerminate();
     return 0;

@@ -41,6 +41,8 @@ typedef struct LapizError
         return; \
     } while (0)
 
+#define LAPIZ_PRINT_STATE_ERROR(state) LAPIZ_PRINT_ERROR((state)->error.result, (state)->error.message)
+
 void LapizSetError(LapizError* error, LapizResult result, const char* message);
 
 #endif // _LERROR_H_
