@@ -55,4 +55,7 @@ dkms.conf
 *.dwo
 
 build/
+build-opengl/
+build-vulkan/
+build-metal/
 .DS_Store

@@ -1,6 +1,6 @@
 #include "Lapiz/core/Lcore.h"
 #include "Lapiz/core/Lerror.h"
-#include "Lapiz/backends/GLFW/glfw_backend.h"
+
 #if defined(LAPIZ_OPENGL)
 #include "Lapiz/backends/OpenGL/LGL.h"
 #endif
@@ -8,51 +8,145 @@
 #include "Lapiz/backends/Vulkan/LVK.h"
 #endif
 
+#ifdef LAPIZ_USE_GLFW
+#include "Lapiz/backends/GLFW/glfw_backend.h"
+#endif
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#elif defined(__linux__)
+#include <unistd.h>
+#elif defined(_WIN32)
+#include <windows.h>
+#endif
+#if !defined(_WIN32)
+#include <libgen.h>
+#endif
+
 LapizState L_State;
 
-LAPIZ_API void LapizInit(UINT width, UINT height, const char* title)
+#if defined(_WIN32)
+    static char* win_dirname(char* path)
+    {
+        char* last = strrchr(path, '\\');
+        if (last) { *last = '\0'; return path; }
+        last = strrchr(path, '/');
+        if (last) { *last = '\0'; return path; }
+        return path;
+    }
+#endif
+
+static char s_resolve_buf[LAPIZ_MAX_PATH];
+
+static void init_exe_dir(void)
 {
-    if (!LapizGLFWInit()) LAPIZ_FAIL_RETURN(&L_State, LAPIZ_ERROR_INIT_FAILED, "Failed to initialize Lapiz");
+    char path[LAPIZ_MAX_PATH];
+    path[0] = '\0';
 
-    #if defined(LAPIZ_METAL) || defined(LAPIZ_VULKAN)
-        LapizWindowHint(LAPIZ_CLIENT_API, LAPIZ_NO_API);
-    #elif defined(LAPIZ_OPENGL)
-        LapizWindowHint(LAPIZ_CLIENT_API, LAPIZ_OPENGL_API);
-        LapizWindowHint(LAPIZ_CONTEXT_VERSION_MAJOR, LAPIZ_GL_VERSION_MAJOR);
-        LapizWindowHint(LAPIZ_CONTEXT_VERSION_MINOR, LAPIZ_GL_VERSION_MINOR);
-        LapizWindowHint(LAPIZ_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    #if defined(__APPLE__)
+        uint32_t size = sizeof(path);
+        if (_NSGetExecutablePath(path, &size) == 0)
+        {
+            char* dir = dirname(path);
+            if (dir)
+                L_State.exe_dir = strdup(dir);
+        }
+    #elif defined(__linux__)
+        ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
+        if (n > 0)
+        {
+            path[n] = '\0';
+            char* dir = dirname(path);
+            if (dir)
+                L_State.exe_dir = strdup(dir);
+        }
+    #elif defined(_WIN32)
+        wchar_t wpath[LAPIZ_MAX_PATH];
+        if (GetModuleFileNameW(NULL, wpath, (DWORD)(sizeof(wpath) / sizeof(wpath[0]))) > 0)
+        {
+            char mbpath[LAPIZ_MAX_PATH];
+            if (WideCharToMultiByte(CP_UTF8, 0, wpath, -1, mbpath, sizeof(mbpath), NULL, NULL) > 0)
+            {
+                char* dir = win_dirname(mbpath);
+                if (dir && dir[0])
+                    L_State.exe_dir = strdup(dir);
+            }
+        }
+    #endif
+}
+
+LAPIZ_API void LapizInit(void)
+{
+    L_State.error.result = LAPIZ_ERROR_SUCCESS;
+    L_State.error.message = "No error";
+    L_State.exe_dir = NULL;
+
+    #if defined(LAPIZ_USE_GLFW)
+        glfw_api_init(&L_State);
     #endif
 
-    L_State.window = LapizWindowCreate(width, height, title);
-    if (!L_State.window) LAPIZ_FAIL_RETURN(&L_State, LAPIZ_ERROR_WINDOW_CREATE_FAILED, "Failed to create window");
-
-    #if defined(LAPIZ_OPENGL)
-        if (LapizGLInit() != LAPIZ_ERROR_SUCCESS) LAPIZ_FAIL_RETURN(&L_State, LAPIZ_ERROR_INIT_FAILED, "Failed to initialize OpenGL");
-    #elif defined(LAPIZ_VULKAN)
-        if (LapizVKInit() != LAPIZ_ERROR_SUCCESS) LAPIZ_FAIL_RETURN(&L_State, LAPIZ_ERROR_INIT_FAILED, "Failed to initialize Vulkan");
-    #endif
+    init_exe_dir();
 
     L_State.isInitialized = TRUE;
     L_State.isRunning = TRUE;
     L_State.isPaused = FALSE;
     L_State.isResumed = FALSE;
     L_State.isTerminated = FALSE;
+    L_State.window = NULL;
+}
+
+LAPIZ_API LapizResult LapizSetContext(LapizWindow* ctx)
+{
+    if (!ctx)
+        return LAPIZ_ERROR_FAILED;
+
+    #if defined(LAPIZ_OPENGL)
+        return LapizGLInit(ctx);
+    #elif defined(LAPIZ_VULKAN)
+        return LapizVKInit(ctx);
+    #elif defined(LAPIZ_METAL)
+        (void)ctx;
+        return LAPIZ_ERROR_SUCCESS;
+    #else
+        (void)ctx;
+        return LAPIZ_ERROR_SUCCESS;
+    #endif
+}
+
+LAPIZ_API const char* LapizGetExeDir(void)
+{
+    return L_State.exe_dir ? L_State.exe_dir : "";
+}
+
+LAPIZ_API const char* LapizResolvePath(const char* relative)
+{
+    if (!relative || relative[0] == '\0')
+        return relative;
+    if (!L_State.exe_dir)
+        return relative;
+    #if defined(_WIN32)
+        (void)snprintf(s_resolve_buf, LAPIZ_MAX_PATH, "%s\\%s", L_State.exe_dir, relative);
+    #else
+        (void)snprintf(s_resolve_buf, LAPIZ_MAX_PATH, "%s/%s", L_State.exe_dir, relative);
+    #endif
+    return s_resolve_buf;
 }
 
 LAPIZ_API void LapizTerminate(void)
 {
-    if (!L_State.isInitialized) return;
-
-    #if defined(LAPIZ_OPENGL)
-        LapizGLShutdown();
-    #elif defined(LAPIZ_VULKAN)
-        LapizVKShutdown();
+    #if defined(LAPIZ_USE_GLFW)
+        glfwTerminate();
     #endif
-    LapizWindowDestroy(L_State.window);
+
+    free(L_State.exe_dir);
+    L_State.exe_dir = NULL;
+
     L_State.isInitialized = FALSE;
     L_State.isRunning = FALSE;
     L_State.isPaused = FALSE;
     L_State.isResumed = FALSE;
     L_State.isTerminated = TRUE;
-    LapizGLFWTerminate();
 }

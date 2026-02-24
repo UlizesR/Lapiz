@@ -1,3 +1,4 @@
+#define GLFW_INCLUDE_VULKAN
 #include "Lapiz/backends/Vulkan/LVK.h"
 #include "Lapiz/backends/GLFW/glfw_backend.h"
 #include "Lapiz/core/Lerror.h"
@@ -21,25 +22,25 @@ static VkResult create_instance(VkInstance* out)
         .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
         .pEngineName = "Lapiz",
         .engineVersion = VK_MAKE_VERSION(1, 0, 0),
-        .apiVersion = VK_API_VERSION_1_0,
+        .apiVersion = VK_API_VERSION_1_3,
     };
 
     UINT ext_count = 0;
     const char* const* ext_names = glfwGetRequiredInstanceExtensions(&ext_count);
-#if defined(__APPLE__)
-    const char* ext_list[16];
-    UINT n = 0;
-    for (UINT i = 0; i < ext_count && n < 15; i++) ext_list[n++] = ext_names[i];
-    ext_list[n++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
-    ext_names = ext_list;
-    ext_count = n;
-#endif
+    #if defined(__APPLE__)
+        const char* ext_list[16];
+        UINT n = 0;
+        for (UINT i = 0; i < ext_count && n < 15; i++) ext_list[n++] = ext_names[i];
+        ext_list[n++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+        ext_names = ext_list;
+        ext_count = n;
+    #endif
 
     VkInstanceCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-#if defined(__APPLE__)
+    #if defined(__APPLE__)
         .flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR,
-#endif
+    #endif
         .pApplicationInfo = &app,
         .enabledExtensionCount = ext_count,
         .ppEnabledExtensionNames = ext_names,
@@ -47,14 +48,14 @@ static VkResult create_instance(VkInstance* out)
     return vkCreateInstance(&info, NULL, out);
 }
 
-static VkPhysicalDevice pick_device(VkInstance inst, VkSurfaceKHR surf)
+static VkPhysicalDevice pick_device(VkInstance instance, VkSurfaceKHR surface)
 {
     UINT n = 0;
-    vkEnumeratePhysicalDevices(inst, &n, NULL);
+    vkEnumeratePhysicalDevices(instance, &n, NULL);
     if (!n) return VK_NULL_HANDLE;
 
-    VkPhysicalDevice* devs = calloc(n, sizeof(VkPhysicalDevice));
-    vkEnumeratePhysicalDevices(inst, &n, devs);
+    VkPhysicalDevice* devices = calloc(n, sizeof(VkPhysicalDevice));
+    vkEnumeratePhysicalDevices(instance, &n, devices);
 
     VkPhysicalDevice best = VK_NULL_HANDLE;
     VkDeviceSize best_mem = 0;
@@ -63,28 +64,28 @@ static VkPhysicalDevice pick_device(VkInstance inst, VkSurfaceKHR surf)
     {
         VkBool32 present = VK_FALSE;
         UINT qf = 0;
-        vkGetPhysicalDeviceQueueFamilyProperties(devs[i], &qf, NULL);
+        vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &qf, NULL);
         for (UINT j = 0; j < qf && !present; j++)
-            vkGetPhysicalDeviceSurfaceSupportKHR(devs[i], j, surf, &present);
+            vkGetPhysicalDeviceSurfaceSupportKHR(devices[i], j, surface, &present);
         if (!present) continue;
 
         VkPhysicalDeviceProperties prop;
-        vkGetPhysicalDeviceProperties(devs[i], &prop);
+        vkGetPhysicalDeviceProperties(devices[i], &prop);
         VkPhysicalDeviceMemoryProperties mem;
-        vkGetPhysicalDeviceMemoryProperties(devs[i], &mem);
+        vkGetPhysicalDeviceMemoryProperties(devices[i], &mem);
         VkDeviceSize total = 0;
         for (UINT j = 0; j < mem.memoryHeapCount; j++) total += mem.memoryHeaps[j].size;
 
         if (prop.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU && total > best_mem) 
         {
-            best = devs[i];
+            best = devices[i];
             best_mem = total;
         } else if (!best && total > best_mem) {
-            best = devs[i];
+            best = devices[i];
             best_mem = total;
         }
     }
-    free(devs);
+    free(devices);
     return best;
 }
 
@@ -100,14 +101,14 @@ static UINT find_queue(VkPhysicalDevice device, VkSurfaceKHR surface)
     {
         if (!(q[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
         VkBool32 ok = VK_FALSE;
-        vkGetPhysicalDeviceSurfaceSupportKHR(device, i, surf, &ok);
+        vkGetPhysicalDeviceSurfaceSupportKHR(device, i, surface, &ok);
         if (ok) { idx = i; break; }
     }
     free(q);
     return idx;
 }
 
-LapizResult LapizVKInit(void)
+LapizResult LapizVKInit(LapizWindow *window)
 {
     vk_s = calloc(1, sizeof(struct VKState));
     if (!vk_s) 
@@ -126,7 +127,7 @@ LapizResult LapizVKInit(void)
         goto fail_instance;
     }
 
-    if (glfwCreateWindowSurface(vk_s->instance, LAPIZ_WINDOW_TO_GLFW(L_State.window), NULL, &vk_s->surface) != VK_SUCCESS) 
+    if (glfwCreateWindowSurface(vk_s->instance, window, NULL, &vk_s->surface) != VK_SUCCESS) 
     {
         LapizSetError(&L_State.error, LAPIZ_ERROR_INIT_FAILED, "Failed to create window surface");
         LAPIZ_PRINT_STATE_ERROR(&L_State);
@@ -153,9 +154,9 @@ LapizResult LapizVKInit(void)
 
     const char* dev_ext[] = { "VK_KHR_swapchain", "VK_KHR_portability_subset" };
     UINT dev_ext_n = 1;
-#if defined(__APPLE__)
-    dev_ext_n = 2;
-#endif
+    #if defined(__APPLE__)
+        dev_ext_n = 2;
+    #endif
     VkDeviceCreateInfo dinfo = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1,
@@ -202,7 +203,7 @@ LapizResult LapizVKInit(void)
     free(fmts);
 
     int w, h;
-    LapizGetFramebufferSize(&w, &h);
+    LapizGetFramebufferSize(window, &w, &h);
     vk_s->swapchain_extent.width = (UINT)(w > 0 ? w : 800);
     vk_s->swapchain_extent.height = (UINT)(h > 0 ? h : 600);
     if (capabilities.currentExtent.width != UINT32_MAX)

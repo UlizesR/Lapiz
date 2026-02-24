@@ -1,282 +1,262 @@
-#ifndef _LAPIZ_GLFW_BACKEND_H_
-#define _LAPIZ_GLFW_BACKEND_H_
+#ifndef _LAPIZ_USE_GLFW_H_
+#define _LAPIZ_USE_GLFW_H_
 
 /* Backend-agnostic window API. Implemented via GLFW for now; swap backend in one place below. */
 
 #include "../../Ldefines.h"
+#if defined(LAPIZ_VULKAN)
+#define GLFW_INCLUDE_VULKAN
+#include "Lapiz/backends/Vulkan/LVK.h"
+#elif defined(LAPIZ_OPENGL)
+#include "Lapiz/backends/OpenGL/LGL.h"
+#else
 #define GLFW_INCLUDE_NONE
+#endif
 #include "GLFW/glfw3.h"
 
-typedef struct GLFWwindow LapizWindow;
+
+
 #define LAPIZ_WINDOW_TO_GLFW(w) ((GLFWwindow*)(w))
 
 /* ---------------------------------------------------------------------------
- * Input: enums (values match GLFW; change when swapping backend) + wrapper functions
+ * Input: type-safe struct constants (values match GLFW; change when swapping backend)
  * --------------------------------------------------------------------------- */
 
-/* Action (key/button state). Returned by LapizGetKey / LapizGetMouseButton (see lapiz_core.h). */
-typedef enum LapizAction {
-    LAPIZ_RELEASE = GLFW_RELEASE,
-    LAPIZ_PRESS   = GLFW_PRESS,
-    LAPIZ_REPEAT  = GLFW_REPEAT
-} LapizAction;
+/* Action (key/button state). For comparison with LapizGetKey/LapizGetMouseButton return value. */
+#define LAPIZ_RELEASE        LAPIZ_MAKE_ACTION(GLFW_RELEASE)
+#define LAPIZ_PRESS          LAPIZ_MAKE_ACTION(GLFW_PRESS)
+#define LAPIZ_REPEAT         LAPIZ_MAKE_ACTION(GLFW_REPEAT)
+#define LAPIZ_ACTION_PRESS   GLFW_PRESS    /* int for comparison: LapizGetKey(k) == LAPIZ_ACTION_PRESS */
+#define LAPIZ_ACTION_RELEASE GLFW_RELEASE
+#define LAPIZ_ACTION_REPEAT  GLFW_REPEAT
 
-/* Key code. Values match GLFW; swap to MWSL_KEY_* etc. when changing backend. */
-typedef enum LapizKey {
-    LAPIZ_KEY_UNKNOWN       = GLFW_KEY_UNKNOWN,
-    LAPIZ_KEY_SPACE         = GLFW_KEY_SPACE,
-    LAPIZ_KEY_APOSTROPHE    = GLFW_KEY_APOSTROPHE,
-    LAPIZ_KEY_COMMA         = GLFW_KEY_COMMA,
-    LAPIZ_KEY_MINUS         = GLFW_KEY_MINUS,
-    LAPIZ_KEY_PERIOD        = GLFW_KEY_PERIOD,
-    LAPIZ_KEY_SLASH         = GLFW_KEY_SLASH,
-    LAPIZ_KEY_0             = GLFW_KEY_0,
-    LAPIZ_KEY_1             = GLFW_KEY_1,
-    LAPIZ_KEY_2             = GLFW_KEY_2,
-    LAPIZ_KEY_3             = GLFW_KEY_3,
-    LAPIZ_KEY_4             = GLFW_KEY_4,
-    LAPIZ_KEY_5             = GLFW_KEY_5,
-    LAPIZ_KEY_6             = GLFW_KEY_6,
-    LAPIZ_KEY_7             = GLFW_KEY_7,
-    LAPIZ_KEY_8             = GLFW_KEY_8,
-    LAPIZ_KEY_9             = GLFW_KEY_9,
-    LAPIZ_KEY_SEMICOLON     = GLFW_KEY_SEMICOLON,
-    LAPIZ_KEY_EQUAL         = GLFW_KEY_EQUAL,
-    LAPIZ_KEY_A             = GLFW_KEY_A,
-    LAPIZ_KEY_B             = GLFW_KEY_B,
-    LAPIZ_KEY_C             = GLFW_KEY_C,
-    LAPIZ_KEY_D             = GLFW_KEY_D,
-    LAPIZ_KEY_E             = GLFW_KEY_E,
-    LAPIZ_KEY_F             = GLFW_KEY_F,
-    LAPIZ_KEY_G             = GLFW_KEY_G,
-    LAPIZ_KEY_H             = GLFW_KEY_H,
-    LAPIZ_KEY_I             = GLFW_KEY_I,
-    LAPIZ_KEY_J             = GLFW_KEY_J,
-    LAPIZ_KEY_K             = GLFW_KEY_K,
-    LAPIZ_KEY_L             = GLFW_KEY_L,
-    LAPIZ_KEY_M             = GLFW_KEY_M,
-    LAPIZ_KEY_N             = GLFW_KEY_N,
-    LAPIZ_KEY_O             = GLFW_KEY_O,
-    LAPIZ_KEY_P             = GLFW_KEY_P,
-    LAPIZ_KEY_Q             = GLFW_KEY_Q,
-    LAPIZ_KEY_R             = GLFW_KEY_R,
-    LAPIZ_KEY_S             = GLFW_KEY_S,
-    LAPIZ_KEY_T             = GLFW_KEY_T,
-    LAPIZ_KEY_U             = GLFW_KEY_U,
-    LAPIZ_KEY_V             = GLFW_KEY_V,
-    LAPIZ_KEY_W             = GLFW_KEY_W,
-    LAPIZ_KEY_X             = GLFW_KEY_X,
-    LAPIZ_KEY_Y             = GLFW_KEY_Y,
-    LAPIZ_KEY_Z             = GLFW_KEY_Z,
-    LAPIZ_KEY_LEFT_BRACKET  = GLFW_KEY_LEFT_BRACKET,
-    LAPIZ_KEY_BACKSLASH     = GLFW_KEY_BACKSLASH,
-    LAPIZ_KEY_RIGHT_BRACKET = GLFW_KEY_RIGHT_BRACKET,
-    LAPIZ_KEY_GRAVE_ACCENT  = GLFW_KEY_GRAVE_ACCENT,
-    LAPIZ_KEY_ESCAPE        = GLFW_KEY_ESCAPE,
-    LAPIZ_KEY_ENTER         = GLFW_KEY_ENTER,
-    LAPIZ_KEY_TAB           = GLFW_KEY_TAB,
-    LAPIZ_KEY_BACKSPACE     = GLFW_KEY_BACKSPACE,
-    LAPIZ_KEY_INSERT        = GLFW_KEY_INSERT,
-    LAPIZ_KEY_DELETE        = GLFW_KEY_DELETE,
-    LAPIZ_KEY_RIGHT         = GLFW_KEY_RIGHT,
-    LAPIZ_KEY_LEFT          = GLFW_KEY_LEFT,
-    LAPIZ_KEY_DOWN          = GLFW_KEY_DOWN,
-    LAPIZ_KEY_UP            = GLFW_KEY_UP,
-    LAPIZ_KEY_PAGE_UP       = GLFW_KEY_PAGE_UP,
-    LAPIZ_KEY_PAGE_DOWN     = GLFW_KEY_PAGE_DOWN,
-    LAPIZ_KEY_HOME          = GLFW_KEY_HOME,
-    LAPIZ_KEY_END           = GLFW_KEY_END,
-    LAPIZ_KEY_CAPS_LOCK     = GLFW_KEY_CAPS_LOCK,
-    LAPIZ_KEY_SCROLL_LOCK   = GLFW_KEY_SCROLL_LOCK,
-    LAPIZ_KEY_NUM_LOCK      = GLFW_KEY_NUM_LOCK,
-    LAPIZ_KEY_PRINT_SCREEN  = GLFW_KEY_PRINT_SCREEN,
-    LAPIZ_KEY_PAUSE         = GLFW_KEY_PAUSE,
-    LAPIZ_KEY_F1            = GLFW_KEY_F1,
-    LAPIZ_KEY_F2            = GLFW_KEY_F2,
-    LAPIZ_KEY_F3            = GLFW_KEY_F3,
-    LAPIZ_KEY_F4            = GLFW_KEY_F4,
-    LAPIZ_KEY_F5            = GLFW_KEY_F5,
-    LAPIZ_KEY_F6            = GLFW_KEY_F6,
-    LAPIZ_KEY_F7            = GLFW_KEY_F7,
-    LAPIZ_KEY_F8            = GLFW_KEY_F8,
-    LAPIZ_KEY_F9            = GLFW_KEY_F9,
-    LAPIZ_KEY_F10           = GLFW_KEY_F10,
-    LAPIZ_KEY_F11           = GLFW_KEY_F11,
-    LAPIZ_KEY_F12           = GLFW_KEY_F12,
-    LAPIZ_KEY_LEFT_SHIFT    = GLFW_KEY_LEFT_SHIFT,
-    LAPIZ_KEY_LEFT_CONTROL  = GLFW_KEY_LEFT_CONTROL,
-    LAPIZ_KEY_LEFT_ALT      = GLFW_KEY_LEFT_ALT,
-    LAPIZ_KEY_LEFT_SUPER    = GLFW_KEY_LEFT_SUPER,
-    LAPIZ_KEY_RIGHT_SHIFT   = GLFW_KEY_RIGHT_SHIFT,
-    LAPIZ_KEY_RIGHT_CONTROL = GLFW_KEY_RIGHT_CONTROL,
-    LAPIZ_KEY_RIGHT_ALT     = GLFW_KEY_RIGHT_ALT,
-    LAPIZ_KEY_RIGHT_SUPER   = GLFW_KEY_RIGHT_SUPER,
-    LAPIZ_KEY_MENU          = GLFW_KEY_MENU
-} LapizKey;
+/* Key codes */
+#define LAPIZ_KEY_UNKNOWN       LAPIZ_MAKE_KEY(GLFW_KEY_UNKNOWN)
+#define LAPIZ_KEY_SPACE         LAPIZ_MAKE_KEY(GLFW_KEY_SPACE)
+#define LAPIZ_KEY_APOSTROPHE    LAPIZ_MAKE_KEY(GLFW_KEY_APOSTROPHE)
+#define LAPIZ_KEY_COMMA         LAPIZ_MAKE_KEY(GLFW_KEY_COMMA)
+#define LAPIZ_KEY_MINUS         LAPIZ_MAKE_KEY(GLFW_KEY_MINUS)
+#define LAPIZ_KEY_PERIOD        LAPIZ_MAKE_KEY(GLFW_KEY_PERIOD)
+#define LAPIZ_KEY_SLASH         LAPIZ_MAKE_KEY(GLFW_KEY_SLASH)
+#define LAPIZ_KEY_0             LAPIZ_MAKE_KEY(GLFW_KEY_0)
+#define LAPIZ_KEY_1             LAPIZ_MAKE_KEY(GLFW_KEY_1)
+#define LAPIZ_KEY_2             LAPIZ_MAKE_KEY(GLFW_KEY_2)
+#define LAPIZ_KEY_3             LAPIZ_MAKE_KEY(GLFW_KEY_3)
+#define LAPIZ_KEY_4             LAPIZ_MAKE_KEY(GLFW_KEY_4)
+#define LAPIZ_KEY_5             LAPIZ_MAKE_KEY(GLFW_KEY_5)
+#define LAPIZ_KEY_6             LAPIZ_MAKE_KEY(GLFW_KEY_6)
+#define LAPIZ_KEY_7             LAPIZ_MAKE_KEY(GLFW_KEY_7)
+#define LAPIZ_KEY_8             LAPIZ_MAKE_KEY(GLFW_KEY_8)
+#define LAPIZ_KEY_9             LAPIZ_MAKE_KEY(GLFW_KEY_9)
+#define LAPIZ_KEY_SEMICOLON     LAPIZ_MAKE_KEY(GLFW_KEY_SEMICOLON)
+#define LAPIZ_KEY_EQUAL         LAPIZ_MAKE_KEY(GLFW_KEY_EQUAL)
+#define LAPIZ_KEY_A             LAPIZ_MAKE_KEY(GLFW_KEY_A)
+#define LAPIZ_KEY_B             LAPIZ_MAKE_KEY(GLFW_KEY_B)
+#define LAPIZ_KEY_C             LAPIZ_MAKE_KEY(GLFW_KEY_C)
+#define LAPIZ_KEY_D             LAPIZ_MAKE_KEY(GLFW_KEY_D)
+#define LAPIZ_KEY_E             LAPIZ_MAKE_KEY(GLFW_KEY_E)
+#define LAPIZ_KEY_F             LAPIZ_MAKE_KEY(GLFW_KEY_F)
+#define LAPIZ_KEY_G             LAPIZ_MAKE_KEY(GLFW_KEY_G)
+#define LAPIZ_KEY_H             LAPIZ_MAKE_KEY(GLFW_KEY_H)
+#define LAPIZ_KEY_I             LAPIZ_MAKE_KEY(GLFW_KEY_I)
+#define LAPIZ_KEY_J             LAPIZ_MAKE_KEY(GLFW_KEY_J)
+#define LAPIZ_KEY_K             LAPIZ_MAKE_KEY(GLFW_KEY_K)
+#define LAPIZ_KEY_L             LAPIZ_MAKE_KEY(GLFW_KEY_L)
+#define LAPIZ_KEY_M             LAPIZ_MAKE_KEY(GLFW_KEY_M)
+#define LAPIZ_KEY_N             LAPIZ_MAKE_KEY(GLFW_KEY_N)
+#define LAPIZ_KEY_O             LAPIZ_MAKE_KEY(GLFW_KEY_O)
+#define LAPIZ_KEY_P             LAPIZ_MAKE_KEY(GLFW_KEY_P)
+#define LAPIZ_KEY_Q             LAPIZ_MAKE_KEY(GLFW_KEY_Q)
+#define LAPIZ_KEY_R             LAPIZ_MAKE_KEY(GLFW_KEY_R)
+#define LAPIZ_KEY_S             LAPIZ_MAKE_KEY(GLFW_KEY_S)
+#define LAPIZ_KEY_T             LAPIZ_MAKE_KEY(GLFW_KEY_T)
+#define LAPIZ_KEY_U             LAPIZ_MAKE_KEY(GLFW_KEY_U)
+#define LAPIZ_KEY_V             LAPIZ_MAKE_KEY(GLFW_KEY_V)
+#define LAPIZ_KEY_W             LAPIZ_MAKE_KEY(GLFW_KEY_W)
+#define LAPIZ_KEY_X             LAPIZ_MAKE_KEY(GLFW_KEY_X)
+#define LAPIZ_KEY_Y             LAPIZ_MAKE_KEY(GLFW_KEY_Y)
+#define LAPIZ_KEY_Z             LAPIZ_MAKE_KEY(GLFW_KEY_Z)
+#define LAPIZ_KEY_LEFT_BRACKET  LAPIZ_MAKE_KEY(GLFW_KEY_LEFT_BRACKET)
+#define LAPIZ_KEY_BACKSLASH     LAPIZ_MAKE_KEY(GLFW_KEY_BACKSLASH)
+#define LAPIZ_KEY_RIGHT_BRACKET LAPIZ_MAKE_KEY(GLFW_KEY_RIGHT_BRACKET)
+#define LAPIZ_KEY_GRAVE_ACCENT  LAPIZ_MAKE_KEY(GLFW_KEY_GRAVE_ACCENT)
+#define LAPIZ_KEY_ESCAPE        LAPIZ_MAKE_KEY(GLFW_KEY_ESCAPE)
+#define LAPIZ_KEY_ENTER         LAPIZ_MAKE_KEY(GLFW_KEY_ENTER)
+#define LAPIZ_KEY_TAB           LAPIZ_MAKE_KEY(GLFW_KEY_TAB)
+#define LAPIZ_KEY_BACKSPACE     LAPIZ_MAKE_KEY(GLFW_KEY_BACKSPACE)
+#define LAPIZ_KEY_INSERT        LAPIZ_MAKE_KEY(GLFW_KEY_INSERT)
+#define LAPIZ_KEY_DELETE        LAPIZ_MAKE_KEY(GLFW_KEY_DELETE)
+#define LAPIZ_KEY_RIGHT         LAPIZ_MAKE_KEY(GLFW_KEY_RIGHT)
+#define LAPIZ_KEY_LEFT          LAPIZ_MAKE_KEY(GLFW_KEY_LEFT)
+#define LAPIZ_KEY_DOWN          LAPIZ_MAKE_KEY(GLFW_KEY_DOWN)
+#define LAPIZ_KEY_UP            LAPIZ_MAKE_KEY(GLFW_KEY_UP)
+#define LAPIZ_KEY_PAGE_UP       LAPIZ_MAKE_KEY(GLFW_KEY_PAGE_UP)
+#define LAPIZ_KEY_PAGE_DOWN     LAPIZ_MAKE_KEY(GLFW_KEY_PAGE_DOWN)
+#define LAPIZ_KEY_HOME          LAPIZ_MAKE_KEY(GLFW_KEY_HOME)
+#define LAPIZ_KEY_END           LAPIZ_MAKE_KEY(GLFW_KEY_END)
+#define LAPIZ_KEY_CAPS_LOCK     LAPIZ_MAKE_KEY(GLFW_KEY_CAPS_LOCK)
+#define LAPIZ_KEY_SCROLL_LOCK   LAPIZ_MAKE_KEY(GLFW_KEY_SCROLL_LOCK)
+#define LAPIZ_KEY_NUM_LOCK      LAPIZ_MAKE_KEY(GLFW_KEY_NUM_LOCK)
+#define LAPIZ_KEY_PRINT_SCREEN  LAPIZ_MAKE_KEY(GLFW_KEY_PRINT_SCREEN)
+#define LAPIZ_KEY_PAUSE         LAPIZ_MAKE_KEY(GLFW_KEY_PAUSE)
+#define LAPIZ_KEY_F1            LAPIZ_MAKE_KEY(GLFW_KEY_F1)
+#define LAPIZ_KEY_F2            LAPIZ_MAKE_KEY(GLFW_KEY_F2)
+#define LAPIZ_KEY_F3            LAPIZ_MAKE_KEY(GLFW_KEY_F3)
+#define LAPIZ_KEY_F4            LAPIZ_MAKE_KEY(GLFW_KEY_F4)
+#define LAPIZ_KEY_F5            LAPIZ_MAKE_KEY(GLFW_KEY_F5)
+#define LAPIZ_KEY_F6            LAPIZ_MAKE_KEY(GLFW_KEY_F6)
+#define LAPIZ_KEY_F7            LAPIZ_MAKE_KEY(GLFW_KEY_F7)
+#define LAPIZ_KEY_F8            LAPIZ_MAKE_KEY(GLFW_KEY_F8)
+#define LAPIZ_KEY_F9            LAPIZ_MAKE_KEY(GLFW_KEY_F9)
+#define LAPIZ_KEY_F10           LAPIZ_MAKE_KEY(GLFW_KEY_F10)
+#define LAPIZ_KEY_F11           LAPIZ_MAKE_KEY(GLFW_KEY_F11)
+#define LAPIZ_KEY_F12           LAPIZ_MAKE_KEY(GLFW_KEY_F12)
+#define LAPIZ_KEY_LEFT_SHIFT    LAPIZ_MAKE_KEY(GLFW_KEY_LEFT_SHIFT)
+#define LAPIZ_KEY_LEFT_CONTROL  LAPIZ_MAKE_KEY(GLFW_KEY_LEFT_CONTROL)
+#define LAPIZ_KEY_LEFT_ALT      LAPIZ_MAKE_KEY(GLFW_KEY_LEFT_ALT)
+#define LAPIZ_KEY_LEFT_SUPER    LAPIZ_MAKE_KEY(GLFW_KEY_LEFT_SUPER)
+#define LAPIZ_KEY_RIGHT_SHIFT   LAPIZ_MAKE_KEY(GLFW_KEY_RIGHT_SHIFT)
+#define LAPIZ_KEY_RIGHT_CONTROL LAPIZ_MAKE_KEY(GLFW_KEY_RIGHT_CONTROL)
+#define LAPIZ_KEY_RIGHT_ALT     LAPIZ_MAKE_KEY(GLFW_KEY_RIGHT_ALT)
+#define LAPIZ_KEY_RIGHT_SUPER   LAPIZ_MAKE_KEY(GLFW_KEY_RIGHT_SUPER)
+#define LAPIZ_KEY_MENU          LAPIZ_MAKE_KEY(GLFW_KEY_MENU)
 
 /* Modifier flags */
-typedef enum LapizMod {
-    LAPIZ_MOD_SHIFT     = GLFW_MOD_SHIFT,
-    LAPIZ_MOD_CONTROL   = GLFW_MOD_CONTROL,
-    LAPIZ_MOD_ALT       = GLFW_MOD_ALT,
-    LAPIZ_MOD_SUPER     = GLFW_MOD_SUPER,
-    LAPIZ_MOD_CAPS_LOCK = GLFW_MOD_CAPS_LOCK,
-    LAPIZ_MOD_NUM_LOCK  = GLFW_MOD_NUM_LOCK
-} LapizMod;
+#define LAPIZ_MOD_SHIFT     LAPIZ_MAKE_MOD(GLFW_MOD_SHIFT)
+#define LAPIZ_MOD_CONTROL   LAPIZ_MAKE_MOD(GLFW_MOD_CONTROL)
+#define LAPIZ_MOD_ALT       LAPIZ_MAKE_MOD(GLFW_MOD_ALT)
+#define LAPIZ_MOD_SUPER     LAPIZ_MAKE_MOD(GLFW_MOD_SUPER)
+#define LAPIZ_MOD_CAPS_LOCK LAPIZ_MAKE_MOD(GLFW_MOD_CAPS_LOCK)
+#define LAPIZ_MOD_NUM_LOCK  LAPIZ_MAKE_MOD(GLFW_MOD_NUM_LOCK)
 
-/* Mouse button */
-typedef enum LapizMouseButton {
-    LAPIZ_MOUSE_BUTTON_1    = GLFW_MOUSE_BUTTON_1,
-    LAPIZ_MOUSE_BUTTON_2    = GLFW_MOUSE_BUTTON_2,
-    LAPIZ_MOUSE_BUTTON_3    = GLFW_MOUSE_BUTTON_3,
-    LAPIZ_MOUSE_BUTTON_4    = GLFW_MOUSE_BUTTON_4,
-    LAPIZ_MOUSE_BUTTON_5    = GLFW_MOUSE_BUTTON_5,
-    LAPIZ_MOUSE_BUTTON_6    = GLFW_MOUSE_BUTTON_6,
-    LAPIZ_MOUSE_BUTTON_7    = GLFW_MOUSE_BUTTON_7,
-    LAPIZ_MOUSE_BUTTON_8    = GLFW_MOUSE_BUTTON_8,
-    LAPIZ_MOUSE_BUTTON_LAST = GLFW_MOUSE_BUTTON_LAST,
-    LAPIZ_MOUSE_BUTTON_LEFT   = GLFW_MOUSE_BUTTON_LEFT,
-    LAPIZ_MOUSE_BUTTON_RIGHT  = GLFW_MOUSE_BUTTON_RIGHT,
-    LAPIZ_MOUSE_BUTTON_MIDDLE = GLFW_MOUSE_BUTTON_MIDDLE
-} LapizMouseButton;
+/* Mouse buttons */
+#define LAPIZ_MOUSE_BUTTON_1        LAPIZ_MAKE_MOUSE_BUTTON(GLFW_MOUSE_BUTTON_1)
+#define LAPIZ_MOUSE_BUTTON_2        LAPIZ_MAKE_MOUSE_BUTTON(GLFW_MOUSE_BUTTON_2)
+#define LAPIZ_MOUSE_BUTTON_3        LAPIZ_MAKE_MOUSE_BUTTON(GLFW_MOUSE_BUTTON_3)
+#define LAPIZ_MOUSE_BUTTON_4        LAPIZ_MAKE_MOUSE_BUTTON(GLFW_MOUSE_BUTTON_4)
+#define LAPIZ_MOUSE_BUTTON_5        LAPIZ_MAKE_MOUSE_BUTTON(GLFW_MOUSE_BUTTON_5)
+#define LAPIZ_MOUSE_BUTTON_6        LAPIZ_MAKE_MOUSE_BUTTON(GLFW_MOUSE_BUTTON_6)
+#define LAPIZ_MOUSE_BUTTON_7        LAPIZ_MAKE_MOUSE_BUTTON(GLFW_MOUSE_BUTTON_7)
+#define LAPIZ_MOUSE_BUTTON_8        LAPIZ_MAKE_MOUSE_BUTTON(GLFW_MOUSE_BUTTON_8)
+#define LAPIZ_MOUSE_BUTTON_LAST     LAPIZ_MAKE_MOUSE_BUTTON(GLFW_MOUSE_BUTTON_LAST)
+#define LAPIZ_MOUSE_BUTTON_LEFT     LAPIZ_MAKE_MOUSE_BUTTON(GLFW_MOUSE_BUTTON_LEFT)
+#define LAPIZ_MOUSE_BUTTON_RIGHT    LAPIZ_MAKE_MOUSE_BUTTON(GLFW_MOUSE_BUTTON_RIGHT)
+#define LAPIZ_MOUSE_BUTTON_MIDDLE   LAPIZ_MAKE_MOUSE_BUTTON(GLFW_MOUSE_BUTTON_MIDDLE)
 
-/* Window hints: use with LapizWindowHint before LapizWindowCreate. Values match GLFW. */
-typedef enum LapizHint {
-    /* Window attributes */
-    LAPIZ_FOCUSED                  = GLFW_FOCUSED,
-    LAPIZ_ICONIFIED                = GLFW_ICONIFIED,
-    LAPIZ_RESIZABLE                = GLFW_RESIZABLE,
-    LAPIZ_VISIBLE                  = GLFW_VISIBLE,
-    LAPIZ_DECORATED                = GLFW_DECORATED,
-    LAPIZ_AUTO_ICONIFY             = GLFW_AUTO_ICONIFY,
-    LAPIZ_FLOATING                 = GLFW_FLOATING,
-    LAPIZ_MAXIMIZED                = GLFW_MAXIMIZED,
-    LAPIZ_CENTER_CURSOR            = GLFW_CENTER_CURSOR,
-    LAPIZ_TRANSPARENT_FRAMEBUFFER  = GLFW_TRANSPARENT_FRAMEBUFFER,
-    LAPIZ_HOVERED                  = GLFW_HOVERED,
-    LAPIZ_FOCUS_ON_SHOW            = GLFW_FOCUS_ON_SHOW,
-    /* Framebuffer hints */
-    LAPIZ_RED_BITS                 = GLFW_RED_BITS,
-    LAPIZ_GREEN_BITS               = GLFW_GREEN_BITS,
-    LAPIZ_BLUE_BITS                = GLFW_BLUE_BITS,
-    LAPIZ_ALPHA_BITS               = GLFW_ALPHA_BITS,
-    LAPIZ_DEPTH_BITS               = GLFW_DEPTH_BITS,
-    LAPIZ_STENCIL_BITS             = GLFW_STENCIL_BITS,
-    LAPIZ_ACCUM_RED_BITS           = GLFW_ACCUM_RED_BITS,
-    LAPIZ_ACCUM_GREEN_BITS         = GLFW_ACCUM_GREEN_BITS,
-    LAPIZ_ACCUM_BLUE_BITS          = GLFW_ACCUM_BLUE_BITS,
-    LAPIZ_ACCUM_ALPHA_BITS         = GLFW_ACCUM_ALPHA_BITS,
-    LAPIZ_AUX_BUFFERS              = GLFW_AUX_BUFFERS,
-    LAPIZ_STEREO                   = GLFW_STEREO,
-    LAPIZ_SAMPLES                  = GLFW_SAMPLES,
-    LAPIZ_SRGB_CAPABLE             = GLFW_SRGB_CAPABLE,
-    LAPIZ_REFRESH_RATE             = GLFW_REFRESH_RATE,
-    LAPIZ_DOUBLEBUFFER             = GLFW_DOUBLEBUFFER,
-    /* Context hints */
-    LAPIZ_CLIENT_API               = GLFW_CLIENT_API,
-    LAPIZ_CONTEXT_VERSION_MAJOR    = GLFW_CONTEXT_VERSION_MAJOR,
-    LAPIZ_CONTEXT_VERSION_MINOR    = GLFW_CONTEXT_VERSION_MINOR,
-    LAPIZ_CONTEXT_REVISION         = GLFW_CONTEXT_REVISION,
-    LAPIZ_CONTEXT_ROBUSTNESS       = GLFW_CONTEXT_ROBUSTNESS,
-    LAPIZ_OPENGL_FORWARD_COMPAT    = GLFW_OPENGL_FORWARD_COMPAT,
-    LAPIZ_OPENGL_DEBUG_CONTEXT     = GLFW_OPENGL_DEBUG_CONTEXT,
-    LAPIZ_OPENGL_PROFILE           = GLFW_OPENGL_PROFILE,
-    LAPIZ_CONTEXT_RELEASE_BEHAVIOR = GLFW_CONTEXT_RELEASE_BEHAVIOR,
-    LAPIZ_CONTEXT_NO_ERROR         = GLFW_CONTEXT_NO_ERROR,
-    LAPIZ_CONTEXT_CREATION_API     = GLFW_CONTEXT_CREATION_API,
-    LAPIZ_SCALE_TO_MONITOR         = GLFW_SCALE_TO_MONITOR,
-    /* Platform-specific (macOS) */
-    LAPIZ_COCOA_RETINA_FRAMEBUFFER = GLFW_COCOA_RETINA_FRAMEBUFFER,
-    LAPIZ_COCOA_FRAME_NAME         = GLFW_COCOA_FRAME_NAME,
-    LAPIZ_COCOA_GRAPHICS_SWITCHING = GLFW_COCOA_GRAPHICS_SWITCHING,
-    /* Platform-specific (X11) */
-    LAPIZ_X11_CLASS_NAME           = GLFW_X11_CLASS_NAME,
-    LAPIZ_X11_INSTANCE_NAME        = GLFW_X11_INSTANCE_NAME,
-} LapizHint;
+/* Window hints (LapizHint structs for LapizWindowHint - bit flags are in Ldefines as LAPIZ_WINDOW_*) */
+#define LAPIZ_FOCUSED                  LAPIZ_MAKE_HINT(GLFW_FOCUSED)
+#define LAPIZ_ICONIFIED                LAPIZ_MAKE_HINT(GLFW_ICONIFIED)
+#define LAPIZ_RESIZABLE                LAPIZ_MAKE_HINT(GLFW_RESIZABLE)
+#define LAPIZ_VISIBLE                  LAPIZ_MAKE_HINT(GLFW_VISIBLE)
+#define LAPIZ_DECORATED                LAPIZ_MAKE_HINT(GLFW_DECORATED)
+#define LAPIZ_AUTO_ICONIFY             LAPIZ_MAKE_HINT(GLFW_AUTO_ICONIFY)
+#define LAPIZ_FLOATING                 LAPIZ_MAKE_HINT(GLFW_FLOATING)
+#define LAPIZ_MAXIMIZED                LAPIZ_MAKE_HINT(GLFW_MAXIMIZED)
+#define LAPIZ_CENTER_CURSOR            LAPIZ_MAKE_HINT(GLFW_CENTER_CURSOR)
+#define LAPIZ_TRANSPARENT_FRAMEBUFFER  LAPIZ_MAKE_HINT(GLFW_TRANSPARENT_FRAMEBUFFER)
+#define LAPIZ_HOVERED                  LAPIZ_MAKE_HINT(GLFW_HOVERED)
+#define LAPIZ_FOCUS_ON_SHOW            LAPIZ_MAKE_HINT(GLFW_FOCUS_ON_SHOW)
+#define LAPIZ_CLIENT_API               LAPIZ_MAKE_HINT(GLFW_CLIENT_API)
+#define LAPIZ_CONTEXT_VERSION_MAJOR     LAPIZ_MAKE_HINT(GLFW_CONTEXT_VERSION_MAJOR)
+#define LAPIZ_CONTEXT_VERSION_MINOR    LAPIZ_MAKE_HINT(GLFW_CONTEXT_VERSION_MINOR)
+#define LAPIZ_OPENGL_PROFILE           LAPIZ_MAKE_HINT(GLFW_OPENGL_PROFILE)
 
-/* Common hint values (for LAPIZ_CLIENT_API, booleans, etc.) */
-typedef enum LapizHintValue {
-    LAPIZ_TRUE           = GLFW_TRUE,
-    LAPIZ_FALSE          = GLFW_FALSE,
-    LAPIZ_NO_API         = GLFW_NO_API,
-    LAPIZ_OPENGL_API     = GLFW_OPENGL_API,
-    LAPIZ_OPENGL_ES_API  = GLFW_OPENGL_ES_API,
-} LapizHintValue;
+/* Hint values */
+#define LAPIZ_TRUE           LAPIZ_MAKE_HINT_VALUE(GLFW_TRUE)
+#define LAPIZ_FALSE          LAPIZ_MAKE_HINT_VALUE(GLFW_FALSE)
+#define LAPIZ_NO_API         LAPIZ_MAKE_HINT_VALUE(GLFW_NO_API)
+#define LAPIZ_OPENGL_API     LAPIZ_MAKE_HINT_VALUE(GLFW_OPENGL_API)
+#define LAPIZ_OPENGL_ES_API  LAPIZ_MAKE_HINT_VALUE(GLFW_OPENGL_ES_API)
 
-/* Input mode (for LapizSetInputMode, see lapiz_core.h) */
-typedef enum LapizInputMode {
-    LAPIZ_CURSOR                = GLFW_CURSOR,
-    LAPIZ_STICKY_KEYS           = GLFW_STICKY_KEYS,
-    LAPIZ_STICKY_MOUSE_BUTTONS  = GLFW_STICKY_MOUSE_BUTTONS,
-    LAPIZ_LOCK_KEY_MODS         = GLFW_LOCK_KEY_MODS,
-    LAPIZ_RAW_MOUSE_MOTION      = GLFW_RAW_MOUSE_MOTION
-} LapizInputMode;
+/* Input modes */
+#define LAPIZ_CURSOR                LAPIZ_MAKE_INPUT_MODE(GLFW_CURSOR)
+#define LAPIZ_STICKY_KEYS           LAPIZ_MAKE_INPUT_MODE(GLFW_STICKY_KEYS)
+#define LAPIZ_STICKY_MOUSE_BUTTONS  LAPIZ_MAKE_INPUT_MODE(GLFW_STICKY_MOUSE_BUTTONS)
+#define LAPIZ_LOCK_KEY_MODS         LAPIZ_MAKE_INPUT_MODE(GLFW_LOCK_KEY_MODS)
+#define LAPIZ_RAW_MOUSE_MOTION      LAPIZ_MAKE_INPUT_MODE(GLFW_RAW_MOUSE_MOTION)
 
-/* Cursor mode (value for LAPIZ_CURSOR input mode) */
-typedef enum LapizCursorMode {
-    LAPIZ_CURSOR_NORMAL   = GLFW_CURSOR_NORMAL,
-    LAPIZ_CURSOR_HIDDEN   = GLFW_CURSOR_HIDDEN,
-    LAPIZ_CURSOR_DISABLED = GLFW_CURSOR_DISABLED,
-    LAPIZ_CURSOR_CAPTURED = GLFW_CURSOR_CAPTURED
-} LapizCursorMode;
+/* Cursor modes (use .value for LapizSetInputMode, or LAPIZ_CURSOR_MODE_* for int) */
+#define LAPIZ_CURSOR_NORMAL         LAPIZ_MAKE_CURSOR_MODE(GLFW_CURSOR_NORMAL)
+#define LAPIZ_CURSOR_HIDDEN         LAPIZ_MAKE_CURSOR_MODE(GLFW_CURSOR_HIDDEN)
+#define LAPIZ_CURSOR_DISABLED       LAPIZ_MAKE_CURSOR_MODE(GLFW_CURSOR_DISABLED)
+#define LAPIZ_CURSOR_CAPTURED       LAPIZ_MAKE_CURSOR_MODE(GLFW_CURSOR_CAPTURED)
+#define LAPIZ_CURSOR_MODE_NORMAL    GLFW_CURSOR_NORMAL
+#define LAPIZ_CURSOR_MODE_HIDDEN    GLFW_CURSOR_HIDDEN
+#define LAPIZ_CURSOR_MODE_DISABLED  GLFW_CURSOR_DISABLED
+#define LAPIZ_CURSOR_MODE_CAPTURED  GLFW_CURSOR_CAPTURED
 
-/* Input API (backend: take window). Use LapizGetKey/LapizGetMouseButton etc. from lapiz_core.h for window-less API. */
-LAPIZ_API LAPIZ_INLINE int LapizGetKey(LapizKey key)
+
+LAPIZ_HIDDEN LAPIZ_INLINE void glfw_api_init(LapizState *state)
 {
-    return glfwGetKey(LAPIZ_WINDOW_TO_GLFW(L_State.window), (int)key);
-}
+    if (!glfwInit()) LAPIZ_FAIL_RETURN(state, LAPIZ_ERROR_INIT_FAILED, "Failed to initialize GLFW");
 
-LAPIZ_API LAPIZ_INLINE int LapizGetMouseButton(LapizMouseButton button)
-{
-    return glfwGetMouseButton(LAPIZ_WINDOW_TO_GLFW(L_State.window), (int)button);
-}
-
-LAPIZ_API LAPIZ_INLINE void LapizGetCursorPos(double* xpos, double* ypos)
-{
-    glfwGetCursorPos(LAPIZ_WINDOW_TO_GLFW(L_State.window), xpos, ypos);
-}
-
-LAPIZ_API LAPIZ_INLINE void LapizSetInputMode(LapizInputMode mode, int value)
-{
-    glfwSetInputMode(LAPIZ_WINDOW_TO_GLFW(L_State.window), (int)mode, value);
+    #if defined(LAPIZ_METAL) || defined(LAPIZ_VULKAN)
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+    #elif defined(LAPIZ_OPENGL)
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_API);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, LAPIZ_GL_VERSION_MAJOR);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, LAPIZ_GL_VERSION_MINOR);
+        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    #endif
 }
 
 /* ---------------------------------------------------------------------------
- * Window API
+ * Window API implementations 
  * --------------------------------------------------------------------------- */
 
-/* Wrapper functions: type-safe, debuggable, single place to switch backend (e.g. #ifdef LAPIZ_USE_MWSL). */
-
-/* Lifecycle: internal GLFW init/terminate. Use LapizInit/LapizTerminate from Lcore.h for the public API. */
-LAPIZ_HIDDEN LAPIZ_INLINE int LapizGLFWInit(void)
+LAPIZ_API LAPIZ_INLINE void LapizSetWindowflags(unsigned int flags)
 {
-    return glfwInit();
+    /* Only set hints for flags the user specified; leave others at GLFW defaults. */
+    if (flags & LAPIZ_WINDOW_FOCUSED) glfwWindowHint(GLFW_FOCUSED, GLFW_TRUE);
+    if (flags & LAPIZ_WINDOW_ICONIFIED) glfwWindowHint(GLFW_ICONIFIED, GLFW_TRUE);
+    if (flags & LAPIZ_WINDOW_RESIZABLE) glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+    if (flags & LAPIZ_WINDOW_VISIBLE) glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
+    if (flags & LAPIZ_WINDOW_DECORATED) glfwWindowHint(GLFW_DECORATED, GLFW_TRUE);
+    if (flags & LAPIZ_WINDOW_AUTO_ICONIFY) glfwWindowHint(GLFW_AUTO_ICONIFY, GLFW_TRUE);
+    if (flags & LAPIZ_WINDOW_FLOATING) glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);
+    if (flags & LAPIZ_WINDOW_MAXIMIZED) glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
+    if (flags & LAPIZ_WINDOW_CENTER_CURSOR) glfwWindowHint(GLFW_CENTER_CURSOR, GLFW_TRUE);
+    if (flags & LAPIZ_WINDOW_TRANSPARENT) glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, GLFW_TRUE);
+    if (flags & LAPIZ_WINDOW_HOVERED) glfwWindowHint(GLFW_HOVERED, GLFW_TRUE);
+    if (flags & LAPIZ_WINDOW_FOCUS_ON_SHOW) glfwWindowHint(GLFW_FOCUS_ON_SHOW, GLFW_TRUE);
 }
 
-LAPIZ_HIDDEN LAPIZ_INLINE void LapizGLFWTerminate(void)
+LAPIZ_API LAPIZ_INLINE LapizWindow* LapizCreateWindow(UINT width, UINT height, const char* title, unsigned int flags)
 {
-    glfwTerminate();
+    LapizSetWindowflags(flags);
+    LapizWindow* win = glfwCreateWindow(width, height, title, NULL, NULL);
+    L_State.window = win;
+    return win;
 }
 
-/* Window hints: call before LapizWindowCreate. Use LAPIZ_* hints and values. */
-LAPIZ_API LAPIZ_INLINE void LapizWindowHint(LapizHint hint, int value)
+LAPIZ_API LAPIZ_INLINE void LapizDestroyWindow(LapizWindow *window)
 {
-    glfwWindowHint((int)hint, value);
+    if (window && window == L_State.window)
+    {
+#if defined(LAPIZ_OPENGL)
+        LapizGLShutdown();
+#elif defined(LAPIZ_VULKAN)
+        LapizVKShutdown();
+#endif
+        L_State.window = NULL;
+    }
+    glfwDestroyWindow(window);
 }
 
-LAPIZ_HIDDEN LAPIZ_INLINE LapizWindow* LapizWindowCreate(int width, int height, const char* title)
+LAPIZ_API LAPIZ_INLINE int LapizWindowIsOpen(LapizWindow *window)
 {
-    return glfwCreateWindow(width, height, title, NULL, NULL);
+    return !glfwWindowShouldClose(window);
 }
+
+LAPIZ_API LAPIZ_INLINE void LapizCloseWindow(LapizWindow *window, int value)
+{
+    glfwSetWindowShouldClose(window, value);
+}
+
 
 LAPIZ_HIDDEN LAPIZ_INLINE void LapizWindowMakeCurrent(LapizWindow* window)
 {
-    glfwMakeContextCurrent(LAPIZ_WINDOW_TO_GLFW(window));
-}
-
-LAPIZ_HIDDEN LAPIZ_INLINE void LapizWindowDestroy(LapizWindow* window)
-{
-    glfwDestroyWindow(LAPIZ_WINDOW_TO_GLFW(window));
+    glfwMakeContextCurrent(window);
 }
 
 LAPIZ_HIDDEN LAPIZ_INLINE void LapizWindowGetProcAddress(const char* name, void** proc)
@@ -284,63 +264,61 @@ LAPIZ_HIDDEN LAPIZ_INLINE void LapizWindowGetProcAddress(const char* name, void*
     *proc = glfwGetProcAddress(name);
 }
 
-LAPIZ_HIDDEN LAPIZ_INLINE void LapizSwapInterval(int interval)
+LAPIZ_API LAPIZ_INLINE void LapizGetWindowSize(LapizWindow *window, int* width, int* height)
 {
-    glfwSwapInterval(interval);
+    glfwGetWindowSize(window, width, height);
 }
 
-LAPIZ_API LAPIZ_INLINE int LapizWindowShouldClose(void)
+LAPIZ_API LAPIZ_INLINE void LapizSetWindowTitle(LapizWindow *window, const char* title)
 {
-    return glfwWindowShouldClose(LAPIZ_WINDOW_TO_GLFW(L_State.window));
+    glfwSetWindowTitle(window, title);
 }
 
-LAPIZ_API LAPIZ_INLINE void LapizSetWindowShouldClose(int value)
-{
-    glfwSetWindowShouldClose(LAPIZ_WINDOW_TO_GLFW(L_State.window), value);
-}
-
-LAPIZ_API LAPIZ_INLINE void LapizGetFramebufferSize(int* width, int* height)
-{
-    glfwGetFramebufferSize(LAPIZ_WINDOW_TO_GLFW(L_State.window), width, height);
-}
-
-LAPIZ_API LAPIZ_INLINE void LapizGetWindowSize(int* width, int* height)
-{
-    glfwGetWindowSize(LAPIZ_WINDOW_TO_GLFW(L_State.window), width, height);
-}
-
-LAPIZ_API LAPIZ_INLINE void LapizSetWindowTitle(const char* title)
-{
-    glfwSetWindowTitle(LAPIZ_WINDOW_TO_GLFW(L_State.window), title);
-}
-
-LAPIZ_API LAPIZ_INLINE void LapizSwapBuffers(void)
-{
-    glfwSwapBuffers(LAPIZ_WINDOW_TO_GLFW(L_State.window));
-}
-
-/* User callback type (no window param). Wrapper adapts to GLFW's signature. */
-static void (*Lapiz_s_key_callback)(int key, int scancode, int action, int mods);
-
-static void LapizKeyCallbackWrapper(GLFWwindow* win, int key, int scancode, int action, int mods)
-{
-    (void)win;
-    if (Lapiz_s_key_callback) Lapiz_s_key_callback(key, scancode, action, mods);
-}
-
-LAPIZ_API LAPIZ_INLINE void LapizSetKeyCallback(void (*callback)(int key, int scancode, int action, int mods))
-{
-    Lapiz_s_key_callback = callback;
-    glfwSetKeyCallback(LAPIZ_WINDOW_TO_GLFW(L_State.window), LapizKeyCallbackWrapper);
-}
-
-
-
-LAPIZ_API LAPIZ_INLINE void LapizWindowPollEvents(void)
+/* ---------------------------------------------------------------------------
+* Events API
+* --------------------------------------------------------------------------- */
+LAPIZ_API LAPIZ_INLINE void LapizPollEvents(void)
 {
     glfwPollEvents();
 }
 
+LAPIZ_API LAPIZ_INLINE void LapizWaitEvents(void)
+{
+    glfwWaitEvents();
+}
+
+LAPIZ_API LAPIZ_INLINE void LapizWaitEventsTimeout(double timeout)
+{
+    glfwWaitEventsTimeout(timeout);
+}
+
+LAPIZ_API LAPIZ_INLINE void LapizPostEmptyEvent(void)
+{
+    glfwPostEmptyEvent();
+}
+
+LAPIZ_API LAPIZ_INLINE int LapizGetKey(LapizWindow *window, LapizKey key)
+{
+    return glfwGetKey(window, key.value);
+}
+
+LAPIZ_API LAPIZ_INLINE int LapizGetMouseButton(LapizWindow *window, LapizMouseButton button)
+{
+    return glfwGetMouseButton(window, button.value);
+}
+
+LAPIZ_API LAPIZ_INLINE void LapizGetCursorPos(LapizWindow *window, double* xpos, double* ypos)
+{
+    glfwGetCursorPos(window, xpos, ypos);
+}
+
+LAPIZ_API LAPIZ_INLINE void LapizSetInputMode(LapizWindow *window, LapizInputMode mode, int value)
+{
+    glfwSetInputMode(window, mode.value, value);
+}
+/* ---------------------------------------------------------------------------
+* Time API
+* --------------------------------------------------------------------------- */
 LAPIZ_API LAPIZ_INLINE double LapizGetTime(void)
 {
     return glfwGetTime();
@@ -351,14 +329,30 @@ LAPIZ_API LAPIZ_INLINE void LapizSetTime(double time)
     glfwSetTime(time);
 }
 
-LAPIZ_API LAPIZ_INLINE void LapizPollEvents(void)
+
+LAPIZ_HIDDEN LAPIZ_INLINE void LapizSwapInterval(int interval)
 {
-    glfwPollEvents();
+    glfwSwapInterval(interval);
 }
 
-LAPIZ_API LAPIZ_INLINE void LapizSetFPS(int fps)
+LAPIZ_API LAPIZ_INLINE void LapizGetFramebufferSize(int* width, int* height)
 {
-    glfwSwapInterval(fps);
+    glfwGetFramebufferSize(L_State.window, width, height);
 }
 
-#endif // _LAPIZ_GLFW_BACKEND_H_
+LAPIZ_API LAPIZ_INLINE void LapizGetFramebufferSizeEx(LapizWindow *window, int* width, int* height)
+{
+    glfwGetFramebufferSize(window, width, height);
+}
+
+LAPIZ_API LAPIZ_INLINE void LapizSwapBuffers(void)
+{
+    glfwSwapBuffers(L_State.window);
+}
+
+LAPIZ_API LAPIZ_INLINE void LapizSwapBuffersEx(LapizWindow *window)
+{
+    glfwSwapBuffers(window);
+}
+
+#endif // _LAPIZ_USE_GLFW_H_
