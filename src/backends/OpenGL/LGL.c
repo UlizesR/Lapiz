@@ -1,13 +1,15 @@
-#include "Lapiz/backends/OpenGL/LGL.h"
 #include <glad/glad.h>
+#include "Lapiz/Ldefines.h"
+#include "Lapiz/core/Lerror.h"
+#include "Lapiz/backends/OpenGL/LGL.h"
 #include "Lapiz/backends/GLFW/glfw_backend.h"
 
 struct GLState* gl_s;
 
-LAPIZ_HIDDEN LapizResult LapizGLInit()
+LAPIZ_HIDDEN LapizResult LapizGLInit(LapizWindow *window)
 {
     // make context current
-    LapizWindowMakeCurrent(L_State.window);
+    glfwMakeContextCurrent(window);
 
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress))
     {

@@ -1,3 +1,4 @@
+#define LAPIZ_USE_GLFW 
 #include <Lapiz/lapiz.h>
 #include <stdio.h>
 
@@ -10,21 +11,37 @@ int main(void)
     #elif defined(LAPIZ_METAL)
         const char* title = "Lapiz Metal Example";
     #endif
-    LapizInit(800, 600, title);
 
-    while (!LapizWindowShouldClose())
+    LapizInit();
+    printf("Current working directory: %s\n", LapizGetExeDir());
+
+    LapizWindow* window = LapizCreateWindow(800, 600, title, 0);
+    if (!window)
     {
-        LapizWindowPollEvents();
+        printf("Failed to create window\n");
+        return 1;
+    }
+    if (LapizSetContext(window) != LAPIZ_ERROR_SUCCESS)
+    {
+        printf("Failed to set context\n");
+        LapizDestroyWindow(window);
+        return 1;
+    }
 
-        if (LapizGetKey(LAPIZ_KEY_ESCAPE) == LAPIZ_PRESS)
+    while (LapizWindowIsOpen(window))
+    {
+        LapizPollEvents();
+        if (LapizGetKey(window, LAPIZ_KEY_ESCAPE) == LAPIZ_ACTION_PRESS)
         {
-            LapizSetWindowShouldClose(TRUE);
+            LapizCloseWindow(window, TRUE);
         }
 
-        LapizClearColor(LAPIZ_COLOR_DARK_SLATE_GRAY);
         LapizBeginDraw();
+        LapizClearColor(LAPIZ_COLOR_DARK_SLATE_GRAY);
         LapizEndDraw();
     }
+
+    LapizDestroyWindow(window);
     LapizTerminate();
     return 0;
 }

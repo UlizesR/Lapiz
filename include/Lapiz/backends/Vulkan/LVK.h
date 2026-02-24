@@ -35,7 +35,7 @@ struct VKState {
 
 LAPIZ_HIDDEN extern struct VKState* vk_s;
 
-LAPIZ_HIDDEN LapizResult LapizVKInit(void);
+LAPIZ_HIDDEN LapizResult LapizVKInit(LapizWindow *window);
 LAPIZ_HIDDEN void LapizVKShutdown(void);
 LAPIZ_HIDDEN void LapizVKBeginDraw(void);
 LAPIZ_HIDDEN void LapizVKEndDraw(void);

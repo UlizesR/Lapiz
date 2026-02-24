@@ -14,7 +14,7 @@ struct GLState {
 
 LAPIZ_HIDDEN extern struct GLState* gl_s;
 
-LAPIZ_HIDDEN LapizResult LapizGLInit();
+LAPIZ_HIDDEN LapizResult LapizGLInit(LapizWindow *window);
 LAPIZ_HIDDEN LapizResult LapizGLShutdown();
 LAPIZ_HIDDEN void LapizGLBeginDraw();
 LAPIZ_HIDDEN void LapizGLEndDraw();

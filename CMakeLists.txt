@@ -80,6 +80,9 @@ list(APPEND SRCS ${BACKEND_SRCS})
 
 add_library(LAPIZ ${SRCS})
 
+# Window backend: GLFW is the default (set LAPIZ_USE_OTHER_WINDOW for future alternatives)
+target_compile_definitions(LAPIZ PUBLIC LAPIZ_USE_GLFW=1)
+
 target_include_directories(LAPIZ PUBLIC
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/external/glad/include>
