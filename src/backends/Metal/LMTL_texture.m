@@ -7,9 +7,11 @@
 
 LapizTexture* LapizMTLTextureCreateFromPixels(int width, int height, const unsigned char* pixels)
 {
-    if (width <= 0 || height <= 0) return NULL;
+    if (width <= 0 || height <= 0)
+        return NULL;
 
-    if (!mtl_s || !mtl_s->device) {
+    if (!mtl_s || !mtl_s->device) 
+    {
         LapizSetError(&L_State.error, LAPIZ_ERROR_FAILED, "Metal context not initialized");
         return NULL;
     }
@@ -22,7 +24,9 @@ LapizTexture* LapizMTLTextureCreateFromPixels(int width, int height, const unsig
     desc.storageMode = MTLStorageModeShared;
 
     id<MTLTexture> mtlTex = [mtl_s->device newTextureWithDescriptor:desc];
-    if (!mtlTex) {
+    
+    if (!mtlTex) 
+    {
         LapizSetError(&L_State.error, LAPIZ_ERROR_METAL_ERROR, "Failed to create Metal texture");
         return NULL;
     }
@@ -35,7 +39,9 @@ LapizTexture* LapizMTLTextureCreateFromPixels(int width, int height, const unsig
     }
 
     LapizTexture* tex = (LapizTexture*)calloc(1, sizeof(LapizTexture));
-    if (!tex) {
+    
+    if (!tex) 
+    {
         LapizSetError(&L_State.error, LAPIZ_ERROR_ALLOCATION_FAILED, "Failed to allocate texture");
         return NULL;
     }
@@ -48,12 +54,15 @@ LapizTexture* LapizMTLTextureCreateFromPixels(int width, int height, const unsig
 
 void LapizMTLTextureUnload(LapizTexture* texture)
 {
-    if (!texture) return;
+    if (!texture) 
+        return;
+
     if (texture->_backend)
     {
         id<MTLTexture> mtlTex = (__bridge_transfer id<MTLTexture>)texture->_backend;
         (void)mtlTex;
         texture->_backend = NULL;
     }
+
     texture->width = texture->height = 0;
 }

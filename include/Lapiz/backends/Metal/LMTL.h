@@ -32,6 +32,7 @@ struct MetalState {
     id<MTLTexture> msaaColor;
     id<MTLTexture> depth;
     LapizShader* default_shader;
+    LapizShader* current_shader;
 };
 
 extern struct MetalState* mtl_s;
@@ -49,5 +50,6 @@ LAPIZ_HIDDEN void LapizMTLBeginDraw(void);
 LAPIZ_HIDDEN void LapizMTLEndDraw(void);
 LAPIZ_HIDDEN void LapizMTLClearColor(LapizColor color);
 LAPIZ_HIDDEN void LapizMTLDrawFullscreen(void);
+LAPIZ_HIDDEN void LapizMTLGetRenderTargetSize(int* width, int* height);
 
 #endif // _LAPIZ_METAL_H_

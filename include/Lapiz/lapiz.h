@@ -10,7 +10,7 @@
 #include "core/Lcore.h"
 #include "core/Lerror.h"
 #include "core/Lio.h"
-#include "graphics/Lgraphics.h"
 #include "Lwindow.h"
+#include "graphics/Lgraphics.h"
 
 #endif // _LAPIZ_H_

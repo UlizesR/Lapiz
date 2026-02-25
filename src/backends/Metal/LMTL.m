@@ -1,4 +1,5 @@
 #import "Lapiz/backends/Metal/LMTL.h"
+#import "Lapiz/backends/window_api.h"
 #import "Lapiz/core/Lcore.h"
 #import "Lapiz/core/Lerror.h"
 #import "Lapiz/Lwindow.h"
@@ -9,9 +10,11 @@ struct MetalState* mtl_s;
 
 LapizResult LapizMTLInit(LapizWindow* window)
 {
-    if (!window) return LAPIZ_ERROR_FAILED;
+    if (!window) 
+        return LAPIZ_ERROR_FAILED;
 
     mtl_s = calloc(1, sizeof(struct MetalState));
+    
     if (!mtl_s) 
     {
         LapizSetError(&L_State.error, LAPIZ_ERROR_ALLOCATION_FAILED, "Failed to allocate Metal state");
@@ -19,6 +22,7 @@ LapizResult LapizMTLInit(LapizWindow* window)
     }
 
     mtl_s->device = MTLCreateSystemDefaultDevice();
+    
     if (!mtl_s->device) 
     {
         LapizSetError(&L_State.error, LAPIZ_ERROR_INIT_FAILED, "Failed to create Metal device");
@@ -28,6 +32,7 @@ LapizResult LapizMTLInit(LapizWindow* window)
     }
 
     mtl_s->commandQueue = [mtl_s->device newCommandQueue];
+    
     if (!mtl_s->commandQueue) 
     {
         LapizSetError(&L_State.error, LAPIZ_ERROR_INIT_FAILED, "Failed to create Metal command queue");
@@ -37,6 +42,7 @@ LapizResult LapizMTLInit(LapizWindow* window)
     }
 
     mtl_s->layer = [CAMetalLayer layer];
+    
     if (!mtl_s->layer) 
     {
         LapizSetError(&L_State.error, LAPIZ_ERROR_INIT_FAILED, "Failed to create Metal layer");
@@ -58,6 +64,7 @@ LapizResult LapizMTLInit(LapizWindow* window)
     mtl_s->layer.opaque = YES;
 
     mtl_s->has_active_frame = 0;
+    
     if (!LAPIZ_SEM_INIT(mtl_s)) {
         LapizSetError(&L_State.error, LAPIZ_ERROR_INIT_FAILED, "Failed to create Metal frame semaphore");
         LapizMTLShutdown();
@@ -69,6 +76,7 @@ LapizResult LapizMTLInit(LapizWindow* window)
         mtl_s->onscreenPassDesc[i] = [MTLRenderPassDescriptor renderPassDescriptor];
 
     NSWindow* nswindow = LapizGetNSWindow(window);
+    
     if (!nswindow) 
     {
         LapizSetError(&L_State.error, LAPIZ_ERROR_INIT_FAILED, "Failed to get NSWindow from GLFW");
@@ -80,20 +88,23 @@ LapizResult LapizMTLInit(LapizWindow* window)
     nswindow.contentView.layer = mtl_s->layer;
     nswindow.contentView.wantsLayer = YES;
 
-    mtl_s->default_shader = nil;  /* Created lazily when LapizMTLDrawFullscreen is first called */
+    mtl_s->default_shader = nil;
+    mtl_s->current_shader = nil;
 
     return LAPIZ_ERROR_SUCCESS;
 }
 
 void LapizMTLShutdown(void)
 {
-    if (!mtl_s) return;
+    if (!mtl_s) 
+        return;
 
     if (mtl_s->default_shader)
     {
         LapizMTLShaderUnload(mtl_s->default_shader);
         mtl_s->default_shader = nil;
     }
+
     mtl_s->drawable = nil;
     mtl_s->enc = nil;
     mtl_s->cmd = nil;
@@ -119,7 +130,8 @@ void LapizMTLShutdown(void)
 
 void LapizMTLBeginDraw(void)
 {
-    if (!mtl_s) return;
+    if (!mtl_s) 
+        return;
 
     @autoreleasepool 
     {
@@ -128,13 +140,16 @@ void LapizMTLBeginDraw(void)
 
         int w = 0, h = 0;
         LapizGetFramebufferSize(&w, &h);
-        if (w <= 0 || h <= 0) {
+        
+        if (w <= 0 || h <= 0) 
+        {
             LAPIZ_SEM_POST(mtl_s);
             return;
         }
 
         CGSize sz = CGSizeMake((CGFloat)w, (CGFloat)h);
         const BOOL sizeChanged = !CGSizeEqualToSize(sz, mtl_s->drawableSize);
+        
         if (sizeChanged)
         {
             mtl_s->drawableSize = sz;
@@ -156,6 +171,7 @@ void LapizMTLBeginDraw(void)
             msaaDesc.storageMode = MTLStorageModePrivate;
             mtl_s->msaaColor = [mtl_s->device newTextureWithDescriptor:msaaDesc];
             mtl_s->msaaColor.label = @"lapiz.msaa.color";
+
         } else if (!useMSAA) {
             mtl_s->msaaColor = nil;
         }
@@ -172,6 +188,7 @@ void LapizMTLBeginDraw(void)
             depthDesc.storageMode = MTLStorageModePrivate;
             mtl_s->depth = [mtl_s->device newTextureWithDescriptor:depthDesc];
             mtl_s->depth.label = @"lapiz.depth";
+
         } else if (!useDepth) {
             mtl_s->depth = nil;
         }
@@ -183,7 +200,9 @@ void LapizMTLBeginDraw(void)
         [mtl_s->cmd addCompletedHandler:^(__unused id<MTLCommandBuffer> cb) { LAPIZ_SEM_POST(m); }];
 
         id<CAMetalDrawable> drawable = [mtl_s->layer nextDrawable];
-        if (!drawable) {
+        
+        if (!drawable) 
+        {
             mtl_s->cmd = nil;
             LAPIZ_SEM_POST(mtl_s);
             return;
@@ -225,7 +244,8 @@ void LapizMTLBeginDraw(void)
 
 void LapizMTLEndDraw(void)
 {
-    if (!mtl_s || !mtl_s->cmd) return;
+    if (!mtl_s || !mtl_s->cmd) 
+        return;
 
     @autoreleasepool 
     {
@@ -235,9 +255,8 @@ void LapizMTLEndDraw(void)
             mtl_s->enc = nil;
         }
 
-        if (mtl_s->drawable) {
+        if (mtl_s->drawable) 
             [mtl_s->cmd presentDrawable:mtl_s->drawable];
-        }
 
         [mtl_s->cmd commit];
 
@@ -249,24 +268,57 @@ void LapizMTLEndDraw(void)
 
 void LapizMTLClearColor(LapizColor color)
 {
-    if (!mtl_s) return;
+    if (!mtl_s) 
+        return;
+
     mtl_s->clear_color[0] = color[0];
     mtl_s->clear_color[1] = color[1];
     mtl_s->clear_color[2] = color[2];
     mtl_s->clear_color[3] = color[3];
 }
 
+void LapizMTLGetRenderTargetSize(int* width, int* height)
+{
+    if (!width || !height) 
+        return;
+
+    *width = 0;
+    *height = 0;
+
+    if (!mtl_s) 
+        return;
+
+    if (mtl_s->drawable && mtl_s->drawable.texture) 
+    {
+        id<MTLTexture> tex = mtl_s->drawable.texture;
+        *width = (int)tex.width;
+        *height = (int)tex.height;
+    }
+    if (*width <= 0 || *height <= 0)
+        LapizGetFramebufferSize(width, height);
+}
+
 void LapizMTLDrawFullscreen(void)
 {
-    if (!mtl_s || !mtl_s->enc) return;
-    if (!mtl_s->default_shader)
+    if (!mtl_s || !mtl_s->enc) 
+        return;
+
+    LapizShader* shader = mtl_s->current_shader;
+
+    if (!shader)
     {
-        mtl_s->default_shader = LapizMTLShaderLoadDefault();
-        if (!mtl_s->default_shader) return;
+        if (!mtl_s->default_shader)
+        {
+            mtl_s->default_shader = LapizMTLShaderLoadDefault();
+            if (!mtl_s->default_shader) return;
+        }
+        shader = mtl_s->default_shader;
     }
-    LapizMTLShaderUse(mtl_s->default_shader);
-    int colorLoc = LapizMTLShaderGetDefaultLocation(mtl_s->default_shader, LAPIZ_SHADER_LOC_COLOR);
+    LapizMTLShaderUse(shader);
+    int colorLoc = LapizMTLShaderGetDefaultLocation(shader, LAPIZ_SHADER_LOC_COLOR);
+
     if (colorLoc >= 0)
-        LapizMTLShaderSetColor(mtl_s->default_shader, colorLoc, mtl_s->clear_color);
+        LapizMTLShaderSetColor(shader, colorLoc, mtl_s->clear_color);
+    
     [mtl_s->enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 }

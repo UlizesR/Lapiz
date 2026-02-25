@@ -8,32 +8,30 @@
 #include <stdint.h>
 
 #if defined(__APPLE__)
-    #if defined(LAPIZ_METAL)
-        #if !defined(__MAC_OS_X_VERSION_MIN_REQUIRED) || __MAC_OS_X_VERSION_MIN_REQUIRED >= 150000
-            #define LAPIZ_MTL_VERSION_MAJOR 4
-        #elif __MAC_OS_X_VERSION_MIN_REQUIRED >= 130000
-            #define LAPIZ_MTL_VERSION_MAJOR 3
-        #elif __MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
-            #define LAPIZ_MTL_VERSION_MAJOR 2
-        #elif __MAC_OS_X_VERSION_MIN_REQUIRED >= 101100
-            #define LAPIZ_MTL_VERSION_MAJOR 1
-        #else
-            #define LAPIZ_MTL_VERSION_MAJOR 1
-        #endif
-        #define LAPIZ_MTL_VERSION_MINOR 0
-    #elif defined(LAPIZ_OPENGL)
-        #define LAPIZ_GL_VERSION_MAJOR 4
-        #define LAPIZ_GL_VERSION_MINOR 1
-    #endif
-#elif defined(LAPIZ_OPENGL)
-    #define LAPIZ_GL_VERSION_MAJOR 4
-    #define LAPIZ_GL_VERSION_MINOR 6
-#elif defined(LAPIZ_VULKAN)
-    #define LAPIZ_VK_VERSION_MAJOR 1
-    #define LAPIZ_VK_VERSION_MINOR 3
+#if defined(LAPIZ_METAL)
+#if !defined(__MAC_OS_X_VERSION_MIN_REQUIRED) || __MAC_OS_X_VERSION_MIN_REQUIRED >= 150000
+#define LAPIZ_MTL_VERSION_MAJOR 4
+#elif __MAC_OS_X_VERSION_MIN_REQUIRED >= 130000
+#define LAPIZ_MTL_VERSION_MAJOR 3
+#elif __MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
+#define LAPIZ_MTL_VERSION_MAJOR 2
+#elif __MAC_OS_X_VERSION_MIN_REQUIRED >= 101100
+#define LAPIZ_MTL_VERSION_MAJOR 1
+#else
+#define LAPIZ_MTL_VERSION_MAJOR 1
 #endif
-
-
+#define LAPIZ_MTL_VERSION_MINOR 0
+#elif defined(LAPIZ_OPENGL)
+#define LAPIZ_GL_VERSION_MAJOR 4
+#define LAPIZ_GL_VERSION_MINOR 1
+#endif
+#elif defined(LAPIZ_OPENGL)
+#define LAPIZ_GL_VERSION_MAJOR 4
+#define LAPIZ_GL_VERSION_MINOR 6
+#elif defined(LAPIZ_VULKAN)
+#define LAPIZ_VK_VERSION_MAJOR 1
+#define LAPIZ_VK_VERSION_MINOR 3
+#endif
 
 #define LAPIZ_MAX_FRAMES_IN_FLIGHT 3
 #define LAPIZ_MAX_PATH 4096
@@ -58,12 +56,12 @@ typedef sem_t LapizSemaphore;
 #define LAPIZ_SEM_POST(gs_) sem_post(&(gs_)->inflight_semaphore)
 #endif
 
-// Create API visibility macros 
+// Create API visibility macros
 #if defined(_WIN32)
-#define LAPIZ_API    __declspec(dllexport)
+#define LAPIZ_API __declspec(dllexport)
 #define LAPIZ_HIDDEN __declspec(dllimport)
 #else
-#define LAPIZ_API    __attribute__((visibility("default")))
+#define LAPIZ_API __attribute__((visibility("default")))
 #define LAPIZ_HIDDEN __attribute__((visibility("hidden")))
 #endif
 
@@ -73,12 +71,11 @@ typedef sem_t LapizSemaphore;
 #elif defined(_MSC_VER)
 #define LAPIZ_INLINE static __inline
 #else
-#define LAPIZ_INLINE static inline  /* C99 fallback */
+#define LAPIZ_INLINE static inline /* C99 fallback */
 #endif
 
 /** FNV-1a hash for string keys. Shared by Metal/OpenGL uniform lookup. */
-LAPIZ_INLINE uint32_t LapizHashFNV1a(const char* name)
-{
+LAPIZ_INLINE uint32_t LapizHashFNV1a(const char *name) {
     uint32_t h = 2166136261u;
     for (; *name; name++)
         h = (h ^ (unsigned char)*name) * 16777619u;
@@ -106,37 +103,53 @@ typedef struct LapizWindow LapizWindow;
 #endif
 
 /* Window hint bit flags - OR together for LapizWindowHintFlags / glfw_api_hints */
-#define LAPIZ_WINDOW_FOCUSED                (1U << 0)
-#define LAPIZ_WINDOW_ICONIFIED              (1U << 1)
-#define LAPIZ_WINDOW_RESIZABLE              (1U << 2)
-#define LAPIZ_WINDOW_VISIBLE                (1U << 3)
-#define LAPIZ_WINDOW_DECORATED              (1U << 4)
-#define LAPIZ_WINDOW_AUTO_ICONIFY           (1U << 5)
-#define LAPIZ_WINDOW_FLOATING               (1U << 6)
-#define LAPIZ_WINDOW_MAXIMIZED              (1U << 7)
-#define LAPIZ_WINDOW_CENTER_CURSOR          (1U << 8)
-#define LAPIZ_WINDOW_TRANSPARENT            (1U << 9)
-#define LAPIZ_WINDOW_HOVERED                (1U << 10)
-#define LAPIZ_WINDOW_FOCUS_ON_SHOW          (1U << 11) 
+#define LAPIZ_WINDOW_FOCUSED (1U << 0)
+#define LAPIZ_WINDOW_ICONIFIED (1U << 1)
+#define LAPIZ_WINDOW_RESIZABLE (1U << 2)
+#define LAPIZ_WINDOW_VISIBLE (1U << 3)
+#define LAPIZ_WINDOW_DECORATED (1U << 4)
+#define LAPIZ_WINDOW_AUTO_ICONIFY (1U << 5)
+#define LAPIZ_WINDOW_FLOATING (1U << 6)
+#define LAPIZ_WINDOW_MAXIMIZED (1U << 7)
+#define LAPIZ_WINDOW_CENTER_CURSOR (1U << 8)
+#define LAPIZ_WINDOW_TRANSPARENT (1U << 9)
+#define LAPIZ_WINDOW_HOVERED (1U << 10)
+#define LAPIZ_WINDOW_FOCUS_ON_SHOW (1U << 11)
 
 /* Type-safe wrappers (values come from backend; use LAPIZ_MAKE_* in backend) */
-typedef struct LapizKey { int value; } LapizKey;
-typedef struct LapizAction { int value; } LapizAction;
-typedef struct LapizMod { int value; } LapizMod;
-typedef struct LapizMouseButton { int value; } LapizMouseButton;
-typedef struct LapizHint { int value; } LapizHint;
-typedef struct LapizHintValue { int value; } LapizHintValue;
-typedef struct LapizInputMode { int value; } LapizInputMode;
-typedef struct LapizCursorMode { int value; } LapizCursorMode;
+typedef struct LapizKey {
+    int value;
+} LapizKey;
+typedef struct LapizAction {
+    int value;
+} LapizAction;
+typedef struct LapizMod {
+    int value;
+} LapizMod;
+typedef struct LapizMouseButton {
+    int value;
+} LapizMouseButton;
+typedef struct LapizHint {
+    int value;
+} LapizHint;
+typedef struct LapizHintValue {
+    int value;
+} LapizHintValue;
+typedef struct LapizInputMode {
+    int value;
+} LapizInputMode;
+typedef struct LapizCursorMode {
+    int value;
+} LapizCursorMode;
 
-#define LAPIZ_MAKE_KEY(x)          ((LapizKey){.value = (x)})
-#define LAPIZ_MAKE_ACTION(x)       ((LapizAction){.value = (x)})
-#define LAPIZ_MAKE_MOD(x)          ((LapizMod){.value = (x)})
+#define LAPIZ_MAKE_KEY(x) ((LapizKey){.value = (x)})
+#define LAPIZ_MAKE_ACTION(x) ((LapizAction){.value = (x)})
+#define LAPIZ_MAKE_MOD(x) ((LapizMod){.value = (x)})
 #define LAPIZ_MAKE_MOUSE_BUTTON(x) ((LapizMouseButton){.value = (x)})
-#define LAPIZ_MAKE_HINT(x)         ((LapizHint){.value = (x)})
-#define LAPIZ_MAKE_HINT_VALUE(x)   ((LapizHintValue){.value = (x)})
-#define LAPIZ_MAKE_INPUT_MODE(x)   ((LapizInputMode){.value = (x)})
-#define LAPIZ_MAKE_CURSOR_MODE(x)  ((LapizCursorMode){.value = (x)})
+#define LAPIZ_MAKE_HINT(x) ((LapizHint){.value = (x)})
+#define LAPIZ_MAKE_HINT_VALUE(x) ((LapizHintValue){.value = (x)})
+#define LAPIZ_MAKE_INPUT_MODE(x) ((LapizInputMode){.value = (x)})
+#define LAPIZ_MAKE_CURSOR_MODE(x) ((LapizCursorMode){.value = (x)})
 
 typedef vec4 LapizColor;
 
@@ -172,22 +185,19 @@ typedef khronos_ssize_t SIZEPTR;
 typedef khronos_int64_t INT64;
 typedef khronos_uint64_t UINT64;
 
-typedef struct LapizState 
-{
-    char* exe_dir;  /* Directory containing the executable; paths relative to this */
+typedef struct LapizState {
+    char *exe_dir; /* Directory containing the executable; paths relative to this */
     BOOL isInitialized;
     BOOL isTerminated;
     BOOL isRunning;
     LapizError error;
-    LapizWindow* window;
-    int msaa_samples;   /* 0 or 1 = no MSAA; 2,4,8,16 = MSAA. Set before CreateWindow (OpenGL) or SetContext (Metal). */
-    int use_depth;      /* 0 = no depth buffer; non-zero = enabled. Set before CreateWindow (OpenGL) or SetContext (Metal). */
+    LapizWindow *window;
+    int msaa_samples; /* 0 or 1 = no MSAA; 2,4,8,16 = MSAA. Set before CreateWindow (OpenGL) or SetContext (Metal). */
+    int use_depth; /* 0 = no depth buffer; non-zero = enabled. Set before CreateWindow (OpenGL) or SetContext (Metal).
+                    */
 } LapizState;
 
 // The global state of the application (accessible to all modules) but not visible to the user
 LAPIZ_HIDDEN extern LapizState L_State;
-
-
-
 
 #endif /* _LAPIZ_DEFINES_H_ */
