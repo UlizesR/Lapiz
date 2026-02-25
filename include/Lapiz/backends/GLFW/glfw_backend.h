@@ -4,19 +4,23 @@
 /* Backend-agnostic window API. Implemented via GLFW for now; swap backend in one place below. */
 
 #include "../../Ldefines.h"
+#include "Lapiz/core/Lerror.h"
 #if defined(LAPIZ_VULKAN)
 #define GLFW_INCLUDE_VULKAN
 #include "Lapiz/backends/Vulkan/LVK.h"
 #elif defined(LAPIZ_OPENGL)
 #include "Lapiz/backends/OpenGL/LGL.h"
+#elif defined(LAPIZ_METAL)
+#include "Lapiz/backends/Metal/LMTL.h"
+#define GLFW_INCLUDE_NONE
+#define GLFW_EXPOSE_NATIVE_COCOA
+#include "GLFW/glfw3native.h"
 #else
 #define GLFW_INCLUDE_NONE
 #endif
 #include "GLFW/glfw3.h"
 
-
-
-#define LAPIZ_WINDOW_TO_GLFW(w) ((GLFWwindow*)(w))
+/* When LAPIZ_USE_GLFW, LapizWindow is typedef struct GLFWwindow - pass directly, no cast. */
 
 /* ---------------------------------------------------------------------------
  * Input: type-safe struct constants (values match GLFW; change when swapping backend)
@@ -186,9 +190,14 @@
 #define LAPIZ_CURSOR_MODE_CAPTURED  GLFW_CURSOR_CAPTURED
 
 
-LAPIZ_HIDDEN LAPIZ_INLINE void glfw_api_init(LapizState *state)
+/** Returns 0 on success, non-zero on failure. On failure, sets state->error. */
+LAPIZ_HIDDEN LAPIZ_INLINE int glfw_api_init(LapizState *state)
 {
-    if (!glfwInit()) LAPIZ_FAIL_RETURN(state, LAPIZ_ERROR_INIT_FAILED, "Failed to initialize GLFW");
+    if (!glfwInit()) {
+        if (state) LapizSetError(&state->error, LAPIZ_ERROR_INIT_FAILED, "Failed to initialize GLFW");
+        LAPIZ_PRINT_ERROR(LAPIZ_ERROR_INIT_FAILED, "Failed to initialize GLFW");
+        return 1;
+    }
 
     #if defined(LAPIZ_METAL) || defined(LAPIZ_VULKAN)
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
@@ -198,6 +207,7 @@ LAPIZ_HIDDEN LAPIZ_INLINE void glfw_api_init(LapizState *state)
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, LAPIZ_GL_VERSION_MINOR);
         glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     #endif
+    return 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -224,7 +234,16 @@ LAPIZ_API LAPIZ_INLINE void LapizSetWindowflags(unsigned int flags)
 LAPIZ_API LAPIZ_INLINE LapizWindow* LapizCreateWindow(UINT width, UINT height, const char* title, unsigned int flags)
 {
     LapizSetWindowflags(flags);
+#if defined(LAPIZ_OPENGL)
+    glfwWindowHint(GLFW_SAMPLES, L_State.msaa_samples > 0 ? L_State.msaa_samples : 0);
+    glfwWindowHint(GLFW_DEPTH_BITS, L_State.use_depth ? 24 : 0);
+#endif
     LapizWindow* win = glfwCreateWindow(width, height, title, NULL, NULL);
+    if (!win) {
+        LapizSetError(&L_State.error, LAPIZ_ERROR_WINDOW_CREATE_FAILED, "Failed to create window");
+        LAPIZ_PRINT_ERROR(LAPIZ_ERROR_WINDOW_CREATE_FAILED, "Failed to create window");
+        return NULL;
+    }
     L_State.window = win;
     return win;
 }
@@ -237,6 +256,8 @@ LAPIZ_API LAPIZ_INLINE void LapizDestroyWindow(LapizWindow *window)
         LapizGLShutdown();
 #elif defined(LAPIZ_VULKAN)
         LapizVKShutdown();
+#elif defined(LAPIZ_METAL)
+        LapizMTLShutdown();
 #endif
         L_State.window = NULL;
     }
@@ -254,15 +275,11 @@ LAPIZ_API LAPIZ_INLINE void LapizCloseWindow(LapizWindow *window, int value)
 }
 
 
-LAPIZ_HIDDEN LAPIZ_INLINE void LapizWindowMakeCurrent(LapizWindow* window)
-{
-    glfwMakeContextCurrent(window);
-}
+/* LapizWindowMakeCurrent, LapizWindowGetProcAddress, LapizGetFramebufferSize,
+   LapizGetFramebufferSizeEx, LapizSwapBuffers, LapizSwapBuffersEx, LapizSwapInterval
+   are declared in window_api.h and implemented in glfw_window.c */
 
-LAPIZ_HIDDEN LAPIZ_INLINE void LapizWindowGetProcAddress(const char* name, void** proc)
-{
-    *proc = glfwGetProcAddress(name);
-}
+#include "../window_api.h"
 
 LAPIZ_API LAPIZ_INLINE void LapizGetWindowSize(LapizWindow *window, int* width, int* height)
 {
@@ -273,6 +290,14 @@ LAPIZ_API LAPIZ_INLINE void LapizSetWindowTitle(LapizWindow *window, const char*
 {
     glfwSetWindowTitle(window, title);
 }
+
+#ifdef __OBJC__
+#import <Cocoa/Cocoa.h>
+LAPIZ_API LAPIZ_INLINE NSWindow* LapizGetNSWindow(LapizWindow *window)
+{
+    return glfwGetCocoaWindow(window);
+}
+#endif
 
 /* ---------------------------------------------------------------------------
 * Events API
@@ -329,30 +354,5 @@ LAPIZ_API LAPIZ_INLINE void LapizSetTime(double time)
     glfwSetTime(time);
 }
 
-
-LAPIZ_HIDDEN LAPIZ_INLINE void LapizSwapInterval(int interval)
-{
-    glfwSwapInterval(interval);
-}
-
-LAPIZ_API LAPIZ_INLINE void LapizGetFramebufferSize(int* width, int* height)
-{
-    glfwGetFramebufferSize(L_State.window, width, height);
-}
-
-LAPIZ_API LAPIZ_INLINE void LapizGetFramebufferSizeEx(LapizWindow *window, int* width, int* height)
-{
-    glfwGetFramebufferSize(window, width, height);
-}
-
-LAPIZ_API LAPIZ_INLINE void LapizSwapBuffers(void)
-{
-    glfwSwapBuffers(L_State.window);
-}
-
-LAPIZ_API LAPIZ_INLINE void LapizSwapBuffersEx(LapizWindow *window)
-{
-    glfwSwapBuffers(window);
-}
 
 #endif // _LAPIZ_USE_GLFW_H_

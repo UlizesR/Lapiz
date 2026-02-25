@@ -7,10 +7,11 @@
 #if defined(LAPIZ_VULKAN)
 #include "Lapiz/backends/Vulkan/LVK.h"
 #endif
-
-#ifdef LAPIZ_USE_GLFW
-#include "Lapiz/backends/GLFW/glfw_backend.h"
+#if defined(LAPIZ_METAL)
+#include "Lapiz/backends/Metal/LMTL.h"
 #endif
+
+#include "Lapiz/Lwindow.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,24 +79,41 @@ static void init_exe_dir(void)
     #endif
 }
 
-LAPIZ_API void LapizInit(void)
+LAPIZ_API LapizResult LapizInit(void)
 {
     L_State.error.result = LAPIZ_ERROR_SUCCESS;
     L_State.error.message = "No error";
     L_State.exe_dir = NULL;
 
     #if defined(LAPIZ_USE_GLFW)
-        glfw_api_init(&L_State);
+        if (glfw_api_init(&L_State) != 0)
+            return L_State.error.result;
     #endif
 
     init_exe_dir();
 
     L_State.isInitialized = TRUE;
     L_State.isRunning = TRUE;
-    L_State.isPaused = FALSE;
-    L_State.isResumed = FALSE;
     L_State.isTerminated = FALSE;
     L_State.window = NULL;
+    L_State.msaa_samples = 0;
+    L_State.use_depth = 0;
+    return LAPIZ_ERROR_SUCCESS;
+}
+
+LAPIZ_API const LapizError* LapizGetLastError(void)
+{
+    return &L_State.error;
+}
+
+LAPIZ_API void LapizSetMSAA(int samples)
+{
+    L_State.msaa_samples = (samples <= 1) ? 0 : samples;
+}
+
+LAPIZ_API void LapizSetDepthBuffer(int enabled)
+{
+    L_State.use_depth = enabled ? 1 : 0;
 }
 
 LAPIZ_API LapizResult LapizSetContext(LapizWindow* ctx)
@@ -108,8 +126,7 @@ LAPIZ_API LapizResult LapizSetContext(LapizWindow* ctx)
     #elif defined(LAPIZ_VULKAN)
         return LapizVKInit(ctx);
     #elif defined(LAPIZ_METAL)
-        (void)ctx;
-        return LAPIZ_ERROR_SUCCESS;
+        return LapizMTLInit(ctx);
     #else
         (void)ctx;
         return LAPIZ_ERROR_SUCCESS;
@@ -146,7 +163,5 @@ LAPIZ_API void LapizTerminate(void)
 
     L_State.isInitialized = FALSE;
     L_State.isRunning = FALSE;
-    L_State.isPaused = FALSE;
-    L_State.isResumed = FALSE;
     L_State.isTerminated = TRUE;
 }

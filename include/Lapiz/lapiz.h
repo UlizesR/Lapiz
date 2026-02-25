@@ -9,10 +9,8 @@
 #include "Ldefines.h"
 #include "core/Lcore.h"
 #include "core/Lerror.h"
+#include "core/Lio.h"
 #include "graphics/Lgraphics.h"
-
-#if defined(LAPIZ_USE_GLFW)
-#include "backends/GLFW/glfw_backend.h"
-#endif
+#include "Lwindow.h"
 
 #endif // _LAPIZ_H_

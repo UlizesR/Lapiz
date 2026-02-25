@@ -69,6 +69,9 @@ set(BACKEND_DIR ${SRC_DIR}/backends)
 
 file(GLOB_RECURSE SRCS "${SRC_DIR}/core/*.c" "${SRC_DIR}/graphics/*.c")
 
+# Window backend (GLFW) - always used
+list(APPEND SRCS "${BACKEND_DIR}/GLFW/glfw_window.c")
+
 if(LAPIZ_OPENGL)
     file(GLOB_RECURSE BACKEND_SRCS "${BACKEND_DIR}/OpenGL/*.c")
 elseif(LAPIZ_METAL)
@@ -87,7 +90,10 @@ target_include_directories(LAPIZ PUBLIC
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/external/glad/include>
 )
-target_include_directories(LAPIZ PRIVATE ${CMAKE_SOURCE_DIR}/external/assimp/contrib/stb)
+target_include_directories(LAPIZ PRIVATE
+    ${CMAKE_SOURCE_DIR}/external/assimp/contrib/stb
+    ${CMAKE_SOURCE_DIR}/external/assimp/contrib
+)
 
 target_link_libraries(LAPIZ PUBLIC glfw cglm assimp)
 

@@ -1,5 +1,5 @@
-#ifndef _LERROR_H_
-#define _LERROR_H_
+#ifndef _LAPIZ_ERROR_H_
+#define _LAPIZ_ERROR_H_
 
 #include <stdio.h>
 
@@ -14,6 +14,7 @@ typedef enum {
     LAPIZ_ERROR_VULKAN_ERROR = 7,
     LAPIZ_ERROR_BACKEND_ERROR = 8,
     LAPIZ_ERROR_BACKEND_INIT_FAILED = 9,
+    LAPIZ_ERROR_IO = 10,
 } LapizResult;
 
 typedef struct LapizError
@@ -41,8 +42,16 @@ typedef struct LapizError
         return; \
     } while (0)
 
+/* Fail and return NULL (for pointer-returning functions) */
+#define LAPIZ_FAIL_RETURN_NULL(state, type, msg) \
+    do { \
+        if (state) LapizSetError(&(state)->error, type, msg); \
+        LAPIZ_PRINT_ERROR(type, msg); \
+        return NULL; \
+    } while (0)
+
 #define LAPIZ_PRINT_STATE_ERROR(state) LAPIZ_PRINT_ERROR((state)->error.result, (state)->error.message)
 
 void LapizSetError(LapizError* error, LapizResult result, const char* message);
 
-#endif // _LERROR_H_
+#endif /* _LAPIZ_ERROR_H_ */

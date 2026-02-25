@@ -1,5 +1,5 @@
-#ifndef _LAPIZ_DEFINES_H
-#define _LAPIZ_DEFINES_H
+#ifndef _LAPIZ_DEFINES_H_
+#define _LAPIZ_DEFINES_H_
 
 #include "Lapiz/core/Lerror.h"
 
@@ -42,7 +42,11 @@
 #include <dispatch/dispatch.h>
 typedef dispatch_semaphore_t LapizSemaphore;
 #define LAPIZ_SEM_INIT(gs_) ((gs_)->inflight_semaphore = dispatch_semaphore_create(LAPIZ_MAX_FRAMES_IN_FLIGHT))
+#if __has_feature(objc_arc)
+#define LAPIZ_SEM_DESTROY(gs_) ((void)((gs_)->inflight_semaphore = nil))
+#else
 #define LAPIZ_SEM_DESTROY(gs_) dispatch_release((gs_)->inflight_semaphore)
+#endif
 #define LAPIZ_SEM_WAIT(gs_) dispatch_semaphore_wait((gs_)->inflight_semaphore, DISPATCH_TIME_FOREVER)
 #define LAPIZ_SEM_POST(gs_) dispatch_semaphore_signal((gs_)->inflight_semaphore)
 #else
@@ -71,6 +75,15 @@ typedef sem_t LapizSemaphore;
 #else
 #define LAPIZ_INLINE static inline  /* C99 fallback */
 #endif
+
+/** FNV-1a hash for string keys. Shared by Metal/OpenGL uniform lookup. */
+LAPIZ_INLINE uint32_t LapizHashFNV1a(const char* name)
+{
+    uint32_t h = 2166136261u;
+    for (; *name; name++)
+        h = (h ^ (unsigned char)*name) * 16777619u;
+    return h;
+}
 
 // Alignment macro for setting alignment of data types
 #if defined(_MSC_VER)
@@ -138,8 +151,12 @@ typedef vec4 LapizColor;
 #define LAPIZ_COLOR_CYAN (LapizColor){0.0f, 1.0f, 1.0f, 1.0f}
 #define LAPIZ_COLOR_DARK_SLATE_GRAY (LapizColor){0.18f, 0.31f, 0.31f, 1.0f}
 
-// boolean data type
+// boolean data type (on Apple use objc.h's BOOL to avoid conflict with Cocoa/GLFW)
+#if defined(__APPLE__)
+#include <objc/objc.h>
+#else
 typedef unsigned char BOOL;
+#endif
 #define TRUE 1
 #define FALSE 0
 
@@ -161,11 +178,10 @@ typedef struct LapizState
     BOOL isInitialized;
     BOOL isTerminated;
     BOOL isRunning;
-    BOOL isPaused;
-    BOOL isResumed;
-    UINT fps;
     LapizError error;
-    LapizWindow *window;
+    LapizWindow* window;
+    int msaa_samples;   /* 0 or 1 = no MSAA; 2,4,8,16 = MSAA. Set before CreateWindow (OpenGL) or SetContext (Metal). */
+    int use_depth;      /* 0 = no depth buffer; non-zero = enabled. Set before CreateWindow (OpenGL) or SetContext (Metal). */
 } LapizState;
 
 // The global state of the application (accessible to all modules) but not visible to the user
@@ -174,4 +190,4 @@ LAPIZ_HIDDEN extern LapizState L_State;
 
 
 
-#endif /* _LAPIZ_DEFINES_H */
+#endif /* _LAPIZ_DEFINES_H_ */

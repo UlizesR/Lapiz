@@ -1,5 +1,5 @@
-#ifndef LAPIZ_VULKAN_H
-#define LAPIZ_VULKAN_H
+#ifndef _LAPIZ_VULKAN_H_
+#define _LAPIZ_VULKAN_H_
 
 #include "../../Ldefines.h"
 #include "../../core/Lerror.h"
@@ -47,5 +47,6 @@ LAPIZ_HIDDEN LAPIZ_INLINE void LapizVKClearColor(LapizColor color) {
         vk_s->clear_color[3] = color[3];
     }
 }
+LAPIZ_HIDDEN void LapizVKDrawFullscreen(void);
 
-#endif /* LAPIZ_VULKAN_H */
+#endif /* _LAPIZ_VULKAN_H_ */

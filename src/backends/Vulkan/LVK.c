@@ -1,6 +1,5 @@
-#define GLFW_INCLUDE_VULKAN
 #include "Lapiz/backends/Vulkan/LVK.h"
-#include "Lapiz/backends/GLFW/glfw_backend.h"
+#include "Lapiz/backends/window_api.h"
 #include "Lapiz/core/Lerror.h"
 #include <stdlib.h>
 #include <string.h>
@@ -25,8 +24,8 @@ static VkResult create_instance(VkInstance* out)
         .apiVersion = VK_API_VERSION_1_3,
     };
 
-    UINT ext_count = 0;
-    const char* const* ext_names = glfwGetRequiredInstanceExtensions(&ext_count);
+    uint32_t ext_count = 0;
+    const char* const* ext_names = LapizWindowGetRequiredInstanceExtensions(&ext_count);
     #if defined(__APPLE__)
         const char* ext_list[16];
         UINT n = 0;
@@ -127,7 +126,7 @@ LapizResult LapizVKInit(LapizWindow *window)
         goto fail_instance;
     }
 
-    if (glfwCreateWindowSurface(vk_s->instance, window, NULL, &vk_s->surface) != VK_SUCCESS) 
+    if (LapizWindowCreateVulkanSurface(vk_s->instance, window, NULL, &vk_s->surface) != VK_SUCCESS) 
     {
         LapizSetError(&L_State.error, LAPIZ_ERROR_INIT_FAILED, "Failed to create window surface");
         LAPIZ_PRINT_STATE_ERROR(&L_State);
@@ -203,7 +202,7 @@ LapizResult LapizVKInit(LapizWindow *window)
     free(fmts);
 
     int w, h;
-    LapizGetFramebufferSize(window, &w, &h);
+    LapizGetFramebufferSizeEx(window, &w, &h);
     vk_s->swapchain_extent.width = (UINT)(w > 0 ? w : 800);
     vk_s->swapchain_extent.height = (UINT)(h > 0 ? h : 600);
     if (capabilities.currentExtent.width != UINT32_MAX)
@@ -307,19 +306,22 @@ LapizResult LapizVKInit(LapizWindow *window)
         .dependencyCount = 1,
         .pDependencies = &dependency,
     };
-    if (vkCreateRenderPass(vk_s->device, &rpinfo, NULL, &vk_s->render_pass) != VK_SUCCESS) {
+    if (vkCreateRenderPass(vk_s->device, &rpinfo, NULL, &vk_s->render_pass) != VK_SUCCESS) 
+    {
         LapizSetError(&L_State.error, LAPIZ_ERROR_INIT_FAILED, "Failed to create Vulkan render pass");
         LAPIZ_PRINT_STATE_ERROR(&L_State);
         goto fail_rp;
     }
 
     vk_s->framebuffers = calloc(vk_s->swapchain_image_count, sizeof(VkFramebuffer));
-    if (!vk_s->framebuffers) {
+    if (!vk_s->framebuffers) 
+    {
         LapizSetError(&L_State.error, LAPIZ_ERROR_ALLOCATION_FAILED, "Failed to allocate framebuffers array");
         LAPIZ_PRINT_STATE_ERROR(&L_State);
         goto fail_rp;
     }
-    for (UINT i = 0; i < vk_s->swapchain_image_count; i++) {
+    for (UINT i = 0; i < vk_s->swapchain_image_count; i++) 
+    {
         VkFramebufferCreateInfo fbinfo = {
             .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
             .renderPass = vk_s->render_pass,
@@ -329,7 +331,8 @@ LapizResult LapizVKInit(LapizWindow *window)
             .height = vk_s->swapchain_extent.height,
             .layers = 1,
         };
-        if (vkCreateFramebuffer(vk_s->device, &fbinfo, NULL, &vk_s->framebuffers[i]) != VK_SUCCESS) {
+        if (vkCreateFramebuffer(vk_s->device, &fbinfo, NULL, &vk_s->framebuffers[i]) != VK_SUCCESS) 
+        {
             LapizSetError(&L_State.error, LAPIZ_ERROR_INIT_FAILED, "Failed to create Vulkan framebuffer");
             LAPIZ_PRINT_STATE_ERROR(&L_State);
             goto fail_rp;
@@ -341,14 +344,16 @@ LapizResult LapizVKInit(LapizWindow *window)
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
         .queueFamilyIndex = vk_s->queue_family_index,
     };
-    if (vkCreateCommandPool(vk_s->device, &poolinfo, NULL, &vk_s->command_pool) != VK_SUCCESS) {
+    if (vkCreateCommandPool(vk_s->device, &poolinfo, NULL, &vk_s->command_pool) != VK_SUCCESS) 
+    {
         LapizSetError(&L_State.error, LAPIZ_ERROR_INIT_FAILED, "Failed to create Vulkan command pool");
         LAPIZ_PRINT_STATE_ERROR(&L_State);
         goto fail_pool;
     }
 
     vk_s->command_buffers = calloc(vk_s->swapchain_image_count, sizeof(VkCommandBuffer));
-    if (!vk_s->command_buffers) {
+    if (!vk_s->command_buffers) 
+    {
         LapizSetError(&L_State.error, LAPIZ_ERROR_ALLOCATION_FAILED, "Failed to allocate command buffers array");
         LAPIZ_PRINT_STATE_ERROR(&L_State);
         goto fail_pool;
@@ -365,8 +370,8 @@ LapizResult LapizVKInit(LapizWindow *window)
     vk_s->render_finished_semaphores = calloc(vk_s->max_frames_in_flight, sizeof(VkSemaphore));
     vk_s->in_flight_fences = calloc(vk_s->max_frames_in_flight, sizeof(VkFence));
     vk_s->image_fences = calloc(vk_s->swapchain_image_count, sizeof(VkFence));
-    if (!vk_s->image_available_semaphores || !vk_s->render_finished_semaphores ||
-        !vk_s->in_flight_fences || !vk_s->image_fences) {
+    if (!vk_s->image_available_semaphores || !vk_s->render_finished_semaphores || !vk_s->in_flight_fences || !vk_s->image_fences) 
+    {
         LapizSetError(&L_State.error, LAPIZ_ERROR_ALLOCATION_FAILED, "Failed to allocate Vulkan sync objects");
         LAPIZ_PRINT_STATE_ERROR(&L_State);
         goto fail_sync;
@@ -375,13 +380,14 @@ LapizResult LapizVKInit(LapizWindow *window)
 
     VkSemaphoreCreateInfo seminfo = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
     VkFenceCreateInfo fenceinfo = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT };
-    for (UINT i = 0; i < vk_s->max_frames_in_flight; i++) {
-        if (vkCreateSemaphore(vk_s->device, &seminfo, NULL, &vk_s->image_available_semaphores[i]) != VK_SUCCESS ||
-            vkCreateSemaphore(vk_s->device, &seminfo, NULL, &vk_s->render_finished_semaphores[i]) != VK_SUCCESS ||
-            vkCreateFence(vk_s->device, &fenceinfo, NULL, &vk_s->in_flight_fences[i]) != VK_SUCCESS) {
+    for (UINT i = 0; i < vk_s->max_frames_in_flight; i++) 
+    {
+        if (vkCreateSemaphore(vk_s->device, &seminfo, NULL, &vk_s->image_available_semaphores[i]) != VK_SUCCESS || vkCreateSemaphore(vk_s->device, &seminfo, NULL, &vk_s->render_finished_semaphores[i]) != VK_SUCCESS || vkCreateFence(vk_s->device, &fenceinfo, NULL, &vk_s->in_flight_fences[i]) != VK_SUCCESS) 
+        {
             LapizSetError(&L_State.error, LAPIZ_ERROR_INIT_FAILED, "Failed to create Vulkan sync objects");
             LAPIZ_PRINT_STATE_ERROR(&L_State);
-            for (UINT j = 0; j < i; j++) {
+            for (UINT j = 0; j < i; j++) 
+            {
                 vkDestroySemaphore(vk_s->device, vk_s->image_available_semaphores[j], NULL);
                 vkDestroySemaphore(vk_s->device, vk_s->render_finished_semaphores[j], NULL);
                 vkDestroyFence(vk_s->device, vk_s->in_flight_fences[j], NULL);
@@ -572,4 +578,10 @@ void LapizVKEndDraw(void)
         .pImageIndices = &vk_s->current_image_index,
     };
     vkQueuePresentKHR(vk_s->graphics_queue, &pres);
+}
+
+void LapizVKDrawFullscreen(void)
+{
+    /* TODO: Vulkan fullscreen triangle draw */
+    (void)0;
 }
