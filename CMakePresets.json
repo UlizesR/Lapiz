@@ -5,7 +5,7 @@
     {
       "name": "opengl",
       "displayName": "OpenGL",
-      "binaryDir": "${sourceDir}/build-opengl",
+      "binaryDir": "${sourceDir}/build-ogl",
       "cacheVariables": {
         "LAPIZ_OPENGL": "ON",
         "LAPIZ_VULKAN": "OFF",
@@ -15,7 +15,7 @@
     {
       "name": "vulkan",
       "displayName": "Vulkan",
-      "binaryDir": "${sourceDir}/build-vulkan",
+      "binaryDir": "${sourceDir}/build-vk",
       "cacheVariables": {
         "LAPIZ_OPENGL": "OFF",
         "LAPIZ_VULKAN": "ON",
@@ -25,11 +25,22 @@
     {
       "name": "metal",
       "displayName": "Metal",
-      "binaryDir": "${sourceDir}/build-metal",
+      "binaryDir": "${sourceDir}/build-mtl",
       "cacheVariables": {
         "LAPIZ_OPENGL": "OFF",
         "LAPIZ_VULKAN": "OFF",
         "LAPIZ_METAL": "ON"
+      }
+    },
+    {
+      "name": "sdl-opengl",
+      "displayName": "SDL + OpenGL",
+      "binaryDir": "${sourceDir}/build-sdl",
+      "cacheVariables": {
+        "LAPIZ_USE_SDL": "ON",
+        "LAPIZ_OPENGL": "ON",
+        "LAPIZ_VULKAN": "OFF",
+        "LAPIZ_METAL": "OFF"
       }
     }
   ],
@@ -45,6 +56,10 @@
     {
       "name": "metal",
       "configurePreset": "metal"
+    },
+    {
+      "name": "sdl-opengl",
+      "configurePreset": "sdl-opengl"
     }
   ]
 }
