@@ -13,7 +13,9 @@ typedef enum {
 typedef enum {
     LAPIZ_SUCCESS = 0,
     LAPIZ_ERROR_FAILED_ALLOCATION = -1,
-    LAPIZ_ERROR_FAILED_INITIALIZATION = -2
+    LAPIZ_ERROR_FAILED_INITIALIZATION = -2,
+    LAPIZ_ERROR_VK = -3,
+    LAPIZ_ERROR_METAL = -4,
 } LapizResult;
 
 LAPIZ_API void LpzLog(LapizLogLevel level, const char* format, ...);

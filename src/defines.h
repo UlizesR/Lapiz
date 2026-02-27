@@ -1,13 +1,35 @@
 #ifndef LAPIZ_DEFINES_H
 #define LAPIZ_DEFINES_H
 
-#include <KHR/khrplatform.h>
 #include <cglm/cglm.h>
 #include <stdint.h>
 
+#if defined(LAPIZ_VULKAN)
+    #include <vulkan/vulkan.h>
+#elif defined(LAPIZ_METAL) && defined(__OBJC__)
+    #include <Metal/Metal.h>
+    #include <MetalKit/MetalKit.h>
+    #include <QuartzCore/QuartzCore.h>
+#elif defined(LAPIZ_OPENGL)
+    #include <glad/glad.h>
+#endif
+
+#if defined(LAPIZ_USE_SDL)
+    #include <SDL3/SDL.h>
+#elif defined(LAPIZ_USE_GLFW)
+    #if defined(LAPIZ_VULKAN)
+        #define GLFW_INCLUDE_VULKAN
+    #else
+        #define GLFW_INCLUDE_NONE
+    #endif
+    #include <GLFW/glfw3.h>
+#endif
+
 #if defined(__APPLE__)
     #if defined(LAPIZ_METAL)
-        #if __MAC_OS_X_VERSION_MIN_REQUIRED >= 150000
+        #if !defined(__MAC_OS_X_VERSION_MIN_REQUIRED)
+            #define LAPIZ_MTL_VERSION_MAJOR 1
+        #elif __MAC_OS_X_VERSION_MIN_REQUIRED >= 150000
             #define LAPIZ_MTL_VERSION_MAJOR 4
         #elif __MAC_OS_X_VERSION_MIN_REQUIRED >= 130000
             #define LAPIZ_MTL_VERSION_MAJOR 3
@@ -22,9 +44,6 @@
     #elif defined(LAPIZ_OPENGL)
         #define LAPIZ_GL_VERSION_MAJOR 4
         #define LAPIZ_GL_VERSION_MINOR 1
-    #elif defined(LAPIZ_OPENGL)
-        #define LAPIZ_GL_VERSION_MAJOR 4
-        #define LAPIZ_GL_VERSION_MINOR 6
     #elif defined(LAPIZ_VULKAN)
         #define LAPIZ_VK_VERSION_MAJOR 1
         #define LAPIZ_VK_VERSION_MINOR 3
@@ -152,7 +171,106 @@ typedef enum {
     LAPIZ_MOUSE_BUTTON_MIDDLE  = 2,
 } LapizMouseButton;
 
+#define LAPIZ_MOUSE_BUTTON_COUNT 3
 
+// Window creation flags (pass to LpzCreateWindow)
+#define LAPIZ_FLAG_WINDOW_RESIZABLE   (1u << 0)
+#define LAPIZ_FLAG_WINDOW_UNDECORATED (1u << 1)
+#define LAPIZ_FLAG_WINDOW_HIDDEN      (1u << 2)
+#define LAPIZ_FLAG_WINDOW_HIGHDPI     (1u << 3)  /* Retina/HiDPI: high pixel density framebuffer */
+
+// Because I dont want to be dealing with void* and casting everytime I want to use a different graphics API
+#if defined(LAPIZ_METAL)
+    #if defined(__OBJC__)
+        typedef id<MTLDevice> LapizDevice;
+        typedef id<CAMetalDrawable> LapizSurface;
+        typedef id<MTLCommandQueue> LapizCommandQueue;
+        typedef CAMetalLayer* LapizSwapchain;
+        typedef MTLRenderPassDescriptor* LapizRenderPassDescriptor;
+        typedef id<MTLCommandBuffer> LapizCommandBuffer;
+        typedef id<MTLRenderCommandEncoder> LapizRenderCommandEncoder;
+    #else
+        typedef void* LapizDevice;
+        typedef void* LapizSurface;
+        typedef void* LapizCommandQueue;
+        typedef void* LapizSwapchain;
+        typedef void* LapizRenderPassDescriptor;
+        typedef void* LapizCommandBuffer;
+        typedef void* LapizRenderCommandEncoder;
+    #endif
+#elif defined(LAPIZ_VULKAN)
+    typedef VkSurfaceKHR LapizSurface;
+    typedef VkDevice LapizDevice;
+    typedef VkQueue LapizCommandQueue;
+    typedef VkSwapchainKHR LapizSwapchain;
+    typedef VkRenderPass LapizRenderPassDescriptor;
+    typedef void* LapizCommandBuffer;
+    typedef void* LapizRenderCommandEncoder;
+#else
+    typedef void* LapizDevice;
+    typedef void* LapizSurface;
+    typedef void* LapizCommandQueue;
+    typedef void* LapizSwapchain;
+    typedef void* LapizRenderPassDescriptor;
+    typedef void* LapizCommandBuffer;
+    typedef void* LapizRenderCommandEncoder;
+#endif
+
+typedef struct LapizWindow
+{
+    void* handle;
+    uint8_t key_last_action[LAPIZ_KEY_LAST + 1];
+    uint8_t should_close;
+    unsigned int flags;
+    unsigned int width;
+    unsigned int height;
+    LapizSurface surface;
+
+    /* Framebuffer size (updated by resize callback) */
+    int framebuffer_width;
+    int framebuffer_height;
+    unsigned char resized_last_frame;
+
+    /* Content scale / DPI (e.g. 2.0 on Retina). Scale framebuffer pixels to screen coords. */
+    float content_scale_x;
+    float content_scale_y;
+
+    /* Mouse state (updated by callbacks/poll) */
+    float mouse_x;
+    float mouse_y;
+    uint8_t mouse_buttons[LAPIZ_MOUSE_BUTTON_COUNT];
+
+    /* Scroll delta for current frame (reset each LpzGetPollEvents) */
+    float scroll_x;
+    float scroll_y;
+} LapizWindow;
+
+typedef struct LapizRenderer
+{
+    LapizSemaphore inflight_semaphore;
+    unsigned int frame_index;
+    int has_active_frame;
+    int use_depth;
+    int sample_count;
+    LapizColor clear_color;
+    float clear_depth;
+    LapizWindow* window;  /* Associated window for framebuffer size queries */
+
+    LapizDevice device;
+    LapizSurface surface;
+    LapizCommandQueue commandQueue;
+    LapizSwapchain swapchain;
+    LapizRenderPassDescriptor renderPassDescriptor[LAPIZ_MAX_FRAMES_IN_FLIGHT];
+#if defined(LAPIZ_METAL)
+    void* metal_surface;  /* Opaque platform surface, freed via LpzMetalDestroySurface */
+    void* metal_depth_texture;    /* Depth buffer (when use_depth) */
+    void* metal_msaa_color_texture; /* Multisample color target (when sample_count > 1) */
+#endif
+    /* Current frame state (between DrawBegin and DrawEnd) */
+    LapizCommandBuffer current_command_buffer;
+    LapizRenderCommandEncoder current_render_encoder;
+    LapizSurface current_drawable;  /* id<CAMetalDrawable> on Metal */
+} LapizRenderer;
 
 
 

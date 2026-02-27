@@ -7,19 +7,25 @@ int main(void)
     #else
         LpzLog(LAPIZ_LOG_LEVEL_INFO, "Using GLFW");
     #endif
-    
-    // Initialize Lapiz
+
     if (LpzPlatformInit() != LAPIZ_SUCCESS)
     {
-        LpzLog(LAPIZ_LOG_LEVEL_ERROR, "Failed to initialize Lapiz");
+        LpzLog(LAPIZ_LOG_LEVEL_ERROR, "Failed to initialize Lapiz: %s", LpzGetLastError());
         return 1;
     }
 
-    // Create window
-    LapizWindow* window = LpzCreateWindow("Lapiz Window", 800, 600, 0);
+    LapizWindow* window = LpzCreateWindow("Lapiz Window", 800, 600, LAPIZ_FLAG_WINDOW_HIGHDPI);
     if (!window)
     {
-        LpzLog(LAPIZ_LOG_LEVEL_ERROR, "Failed to create window");
+        LpzLog(LAPIZ_LOG_LEVEL_ERROR, "Failed to create window: %s", LpzGetLastError());
+        return 1;
+    }
+
+    LapizRenderer* renderer = LpzCreateRenderer(window);
+    if (!renderer)
+    {
+        LpzLog(LAPIZ_LOG_LEVEL_ERROR, "Failed to create renderer: %s", LpzGetLastError());
+        LpzDestroyWindow(window);
         return 1;
     }
 
@@ -31,12 +37,13 @@ int main(void)
         {
             LpzCloseWindow(window);
         }
+        LpzRendererDrawBegin(renderer);
+        LpzSetClearColor(renderer, LAPIZ_COLOR_DARK_SLATE_GRAY);
+        LpzRendererDrawEnd(renderer);
     }
 
-    // Destroy window
+    LpzDestroyRenderer(renderer);
     LpzDestroyWindow(window);
-
-    // Terminate Lapiz
     LpzPlatformTerminate();
 
     return 0;

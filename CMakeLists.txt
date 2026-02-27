@@ -23,13 +23,15 @@ set(CGLM_STATIC ON CACHE BOOL "" FORCE)
 set(CGLM_SHARED OFF CACHE BOOL "" FORCE)
 add_subdirectory(external/cglm)
 
-set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
-set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
-add_subdirectory(external/glfw)
-
-if(LAPIZ_USE_SDL)
+# GLFW
+if(NOT LAPIZ_USE_SDL)
+    set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+    add_subdirectory(external/glfw)
+else()
+    # SDL
     foreach(opt AUDIO CAMERA JOYSTICK HAPTIC HIDAPI POWER SENSOR DIALOG TRAY RENDER GPU)
         set(SDL_${opt} OFF CACHE BOOL "" FORCE)
     endforeach()
@@ -38,9 +40,6 @@ if(LAPIZ_USE_SDL)
     set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
     add_subdirectory(external/SDL)
 endif()
-
-# Glad (required for KHR/khrplatform.h in defines.h; linked only for OpenGL)
-add_subdirectory(external/glad)
 
 set(SRC_DIR ${CMAKE_SOURCE_DIR}/src)
 set(PLATFORM_DIR ${SRC_DIR}/Platform)
@@ -56,11 +55,16 @@ else()
     set(PLATFORM_SRCS ${PLATFORM_DIR}/platform_glfw.c)
 endif()
 
+# Metal backend
+if(LAPIZ_METAL)
+    list(APPEND PLATFORM_SRCS ${SRC_DIR}/metal.m)
+    list(APPEND PLATFORM_SRCS ${PLATFORM_DIR}/platform_metal.m)
+endif()
+
 add_library(LAPIZ ${CORE_SRCS} ${PLATFORM_SRCS})
 
 target_include_directories(LAPIZ PUBLIC
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src>
-    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/external/glad/include>
 )
 target_include_directories(LAPIZ PRIVATE ${CMAKE_SOURCE_DIR}/external/cglm)
 
@@ -73,6 +77,7 @@ else()
 endif()
 
 if(LAPIZ_OPENGL)
+    add_subdirectory(external/glad)
     find_package(OpenGL REQUIRED)
     target_compile_definitions(LAPIZ PUBLIC LAPIZ_OPENGL=1)
     target_link_libraries(LAPIZ PUBLIC OpenGL::GL glad)
