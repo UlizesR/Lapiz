@@ -1,119 +1,112 @@
 cmake_minimum_required(VERSION 3.16)
+project(Lapiz VERSION 1.0 LANGUAGES C CXX)
 
-project(LAPIZ VERSION 1.0.0 LANGUAGES C OBJC)
+# Only enable Objective-C if we are on Apple (for Metal)
+if(APPLE)
+    enable_language(OBJC)
+endif()
+
+# Require standard C11 and C++14
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Graphics backend
-option(LAPIZ_OPENGL "OpenGL backend" OFF)
-option(LAPIZ_METAL "Metal backend" OFF)
-option(LAPIZ_VULKAN "Vulkan backend" OFF)
-option(LAPIZ_USE_SDL "Use SDL window backend (default: GLFW)" OFF)
-if(NOT LAPIZ_OPENGL AND NOT LAPIZ_METAL AND NOT LAPIZ_VULKAN)
-    if(APPLE)
-        set(LAPIZ_METAL ON CACHE BOOL "" FORCE)
-    else()
-        set(LAPIZ_OPENGL ON CACHE BOOL "" FORCE)
-    endif()
-endif()
+# ------------------------------------------------------------------------------
+# 1. BUILD OPTIONS (Switch APIs easily without commenting code out!)
+# ------------------------------------------------------------------------------
+option(LAPIZ_BACKEND_VULKAN "Enable Vulkan Backend" ON)
+option(LAPIZ_BACKEND_METAL "Enable Metal Backend" ${APPLE}) # Defaults to ON if on Mac
 
-# Dependencies
-set(CGLM_USE_TEST OFF CACHE BOOL "" FORCE)
-set(CGLM_STATIC ON CACHE BOOL "" FORCE)
+# ------------------------------------------------------------------------------
+# 2. ADD SUBMODULES (GLFW & CGLM)
+# ------------------------------------------------------------------------------
+set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+add_subdirectory(external/glfw)
+
 set(CGLM_SHARED OFF CACHE BOOL "" FORCE)
+set(CGLM_STATIC ON CACHE BOOL "" FORCE)
 add_subdirectory(external/cglm)
 
-# GLFW
-if(NOT LAPIZ_USE_SDL)
-    set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
-    set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
-    add_subdirectory(external/glfw)
-else()
-    # SDL
-    foreach(opt AUDIO CAMERA JOYSTICK HAPTIC HIDAPI POWER SENSOR DIALOG TRAY RENDER GPU)
-        set(SDL_${opt} OFF CACHE BOOL "" FORCE)
-    endforeach()
-    set(SDL_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-    set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
-    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
-    add_subdirectory(external/SDL)
-endif()
-
-set(SRC_DIR ${CMAKE_SOURCE_DIR}/src)
-set(PLATFORM_DIR ${SRC_DIR}/Platform)
-set(CORE_DIR ${SRC_DIR}/Core)
-
-# Core + Platform sources
-set(CORE_SRCS ${CORE_DIR}/log.c)
-
-# Platform: GLFW or SDL
-if(LAPIZ_USE_SDL)
-    set(PLATFORM_SRCS ${PLATFORM_DIR}/platform_sdl.c)
-else()
-    set(PLATFORM_SRCS ${PLATFORM_DIR}/platform_glfw.c)
-endif()
-
-# Metal backend
-if(LAPIZ_METAL)
-    list(APPEND PLATFORM_SRCS ${SRC_DIR}/metal.m)
-    list(APPEND PLATFORM_SRCS ${PLATFORM_DIR}/platform_metal.m)
-endif()
-
-add_library(LAPIZ ${CORE_SRCS} ${PLATFORM_SRCS})
-
-target_include_directories(LAPIZ PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src>
+# ------------------------------------------------------------------------------
+# 3. CONFIGURE CORE ENGINE LIBRARY
+# ------------------------------------------------------------------------------
+set(LAPIZ_SOURCES
+    src/platform_glfw.c
+    src/LpzGeometry.c
 )
-target_include_directories(LAPIZ PRIVATE ${CMAKE_SOURCE_DIR}/external/cglm)
+set(LAPIZ_LIBS glfw cglm)
 
-if(LAPIZ_USE_SDL)
-    target_compile_definitions(LAPIZ PUBLIC LAPIZ_USE_SDL=1)
-    target_link_libraries(LAPIZ PUBLIC SDL3::SDL3 cglm)
-else()
-    target_compile_definitions(LAPIZ PUBLIC LAPIZ_USE_GLFW=1)
-    target_link_libraries(LAPIZ PUBLIC glfw cglm)
-endif()
-
-if(LAPIZ_OPENGL)
-    add_subdirectory(external/glad)
-    find_package(OpenGL REQUIRED)
-    target_compile_definitions(LAPIZ PUBLIC LAPIZ_OPENGL=1)
-    target_link_libraries(LAPIZ PUBLIC OpenGL::GL glad)
-elseif(LAPIZ_METAL)
-    target_compile_definitions(LAPIZ PUBLIC LAPIZ_METAL=1)
-elseif(LAPIZ_VULKAN)
+# --- VULKAN BACKEND ---
+if(LAPIZ_BACKEND_VULKAN)
     find_package(Vulkan REQUIRED)
-    target_compile_definitions(LAPIZ PUBLIC LAPIZ_VULKAN=1)
-    target_link_libraries(LAPIZ PUBLIC Vulkan::Vulkan)
+    
+    # --- macOS DYLD RPATH FIX FOR VULKAN ---
     if(APPLE)
         get_target_property(VK_LIB Vulkan::Vulkan IMPORTED_LOCATION)
         if(VK_LIB)
             get_filename_component(VK_LIB_DIR ${VK_LIB} DIRECTORY)
-            set(CMAKE_BUILD_RPATH "${VK_LIB_DIR}" CACHE STRING "")
-            set(CMAKE_INSTALL_RPATH "${VK_LIB_DIR}" CACHE STRING "")
+            set(CMAKE_BUILD_RPATH "${VK_LIB_DIR}")
+            set(CMAKE_INSTALL_RPATH "${VK_LIB_DIR}")
         else()
-            set(CMAKE_BUILD_RPATH "/usr/local/lib" CACHE STRING "")
-            set(CMAKE_INSTALL_RPATH "/usr/local/lib" CACHE STRING "")
+            set(CMAKE_BUILD_RPATH "/usr/local/lib")
+            set(CMAKE_INSTALL_RPATH "/usr/local/lib")
         endif()
     endif()
+
+    list(APPEND LAPIZ_SOURCES src/vulkan_types.c)
+    list(APPEND LAPIZ_LIBS Vulkan::Vulkan)
+    add_compile_definitions(LAPIZ_HAS_VULKAN)
 endif()
 
-if(APPLE)
-    set(CMAKE_OBJC_FLAGS "${CMAKE_OBJC_FLAGS} -fobjc-arc")
-    find_library(COCOA_FRAMEWORK Cocoa REQUIRED)
-    find_library(METAL_FRAMEWORK Metal REQUIRED)
-    find_library(QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
-    target_link_libraries(LAPIZ PUBLIC ${COCOA_FRAMEWORK} ${METAL_FRAMEWORK} ${QUARTZCORE_FRAMEWORK})
+# --- METAL BACKEND ---
+if(LAPIZ_BACKEND_METAL AND APPLE)
+    find_library(FOUNDATION_FRAMEWORK Foundation)
+    find_library(QUARTZCORE_FRAMEWORK QuartzCore)
+    find_library(APPKIT_FRAMEWORK AppKit)
+    find_library(METAL_FRAMEWORK Metal)
+    
+    list(APPEND LAPIZ_SOURCES src/metal_types.m)
+    list(APPEND LAPIZ_LIBS 
+        ${FOUNDATION_FRAMEWORK} 
+        ${QUARTZCORE_FRAMEWORK} 
+        ${APPKIT_FRAMEWORK} 
+        ${METAL_FRAMEWORK}
+    )
+    add_compile_definitions(LAPIZ_HAS_METAL)
 endif()
 
-option(LAPIZ_BUILD_EXAMPLES "Build example executables" ON)
-if(LAPIZ_BUILD_EXAMPLES)
-    file(GLOB EXAMPLE_SRCS "examples/*.c")
-    foreach(EXAMPLE_SRC ${EXAMPLE_SRCS})
-        get_filename_component(EXAMPLE_NAME ${EXAMPLE_SRC} NAME_WE)
-        add_executable(${EXAMPLE_NAME} ${EXAMPLE_SRC})
-        target_link_libraries(${EXAMPLE_NAME} PRIVATE LAPIZ)
-    endforeach()
+# ------------------------------------------------------------------------------
+# 4. FORMAT TARGET
+# Scopes to only src/, include/, and examples/ — never touches external/
+# or anything generated in the build directory.
+# ------------------------------------------------------------------------------
+find_program(CLANG_FORMAT clang-format)
+if(CLANG_FORMAT)
+    file(GLOB_RECURSE FORMAT_SOURCES
+        "${CMAKE_SOURCE_DIR}/src/*.c"
+        "${CMAKE_SOURCE_DIR}/src/*.m"
+        "${CMAKE_SOURCE_DIR}/src/*.h"
+        "${CMAKE_SOURCE_DIR}/include/*.h"
+        "${CMAKE_SOURCE_DIR}/examples/*.c"
+        "${CMAKE_SOURCE_DIR}/examples/*.h"
+    )
+    add_custom_target(format
+        COMMAND ${CLANG_FORMAT} -i ${FORMAT_SOURCES}
+        COMMENT "Running clang-format on src/, include/, examples/..."
+        VERBATIM
+    )
 endif()
+
+# --- CREATE LAPIZ TARGET ---
+add_library(Lapiz STATIC ${LAPIZ_SOURCES})
+target_include_directories(Lapiz PUBLIC include)
+target_link_libraries(Lapiz PUBLIC ${LAPIZ_LIBS})
+
+# ------------------------------------------------------------------------------
+# 5. EXECUTABLE
+# ------------------------------------------------------------------------------
+add_executable(main_app examples/main.c)
+target_link_libraries(main_app PRIVATE Lapiz)

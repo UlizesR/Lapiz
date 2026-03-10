@@ -1,0 +1,29 @@
+# Lapiz codebase style - 4 spaces, Allman braces
+# Applies to C, ObjC, and C++ uniformly
+BasedOnStyle: LLVM
+
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+
+# Allman style: opening brace on next line
+BreakBeforeBraces: Allman
+
+# Column limit
+ColumnLimit: 250
+
+# --- Short statement controls ---
+AllowShortBlocksOnASingleLine: Empty
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+
+# Switch: indent case labels and force body below case line
+IndentCaseLabels: true
+
+# Pointer alignment
+PointerAlignment: Right
+
+# Include sorting
+SortIncludes: false
