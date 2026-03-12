@@ -57,4 +57,33 @@ LpzMeshData LpzGeometry_GenerateTorus(uint32_t main_segments, uint32_t tube_segm
 // Frees the CPU memory allocated by the procedural generators.
 void LpzGeometry_FreeData(LpzMeshData *data);
 
+// ============================================================================
+// MESH LOADING (Assimp)
+// Supports OBJ, FBX, GLTF, DAE, and any other format Assimp can read.
+//
+// LpzGeometry_LoadMesh  - loads the first mesh found in the file.
+// LpzGeometry_LoadScene - loads every mesh in the file into a caller-allocated
+//                         array. Pass NULL for out_meshes to query the count.
+//
+// All returned LpzMeshData must be freed with LpzGeometry_FreeData().
+// Returns true on success, false on failure (check stderr for details).
+// ============================================================================
+
+// Flags that control how the mesh is post-processed on load.
+typedef enum
+{
+    LPZ_LOAD_DEFAULT = 0,           // triangulate + gen normals + gen UVs
+    LPZ_LOAD_FLIP_UVS = 1 << 0,     // flip V coordinate (OpenGL vs Vulkan convention)
+    LPZ_LOAD_FLIP_WINDING = 1 << 1, // reverse triangle winding order
+    LPZ_LOAD_OPTIMIZE = 1 << 2,     // run Assimp's mesh optimisation passes (slower load)
+    LPZ_LOAD_LEFT_HANDED = 1 << 3,  // convert to left-handed coordinate system
+} LpzLoadFlags;
+
+// Load the first mesh from a file. Returns false on failure.
+bool LpzGeometry_LoadMesh(const char *path, LpzLoadFlags flags, LpzMeshData *out_mesh);
+
+// Load all meshes from a file.
+// Call once with out_meshes=NULL to get the count, then allocate and call again.
+bool LpzGeometry_LoadScene(const char *path, LpzLoadFlags flags, LpzMeshData *out_meshes, uint32_t *out_count);
+
 #endif // LPZ_GEOMETRY_H

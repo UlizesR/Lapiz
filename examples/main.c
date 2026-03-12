@@ -1,597 +1,1030 @@
-#include "../include/LPZ/LpzTypes.h"
-#include "../include/LPZ/LpzGeometry.h"
-#include "../include/LPZ/LpzMath.h"
+// =============================================================================
+// main.c — Lapiz "Hello Shapes" demo
+//
+// What this program does:
+//   • Opens a 1280×720 window using GLFW as the windowing system.
+//   • Creates a Vulkan (or Metal on macOS) GPU device and a swap-chain surface.
+//   • Loads pre-compiled SPIR-V shaders (Vulkan) or MSL source (Metal).
+//   • Builds a render pipeline that can draw 3-D meshes with depth testing.
+//   • Uploads five coloured shapes (cube, prism, triangle, sphere, cylinder)
+//     to the GPU using vertex and index buffers.
+//   • Runs a main loop:
+//       ① Poll window events
+//       ② Update a first-person camera (WASD + right-click look)
+//       ③ Record a render pass that draws all shapes
+//       ④ Present the finished image
+//   • Cleans up every GPU object on exit.
+//
+// CONTROLS
+//   W A S D          — move camera
+//   Space / L-Shift  — move up / down
+//   Right mouse drag — look around
+//   Escape           — quit
+//
+// USAGE
+//   ./main            — Metal backend (default on macOS)
+//   ./main --vulkan   — Vulkan backend
+// =============================================================================
 
-// stb_image — drop stb_image.h next to this file (https://github.com/nothings/stb)
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
-
+// ---------- Standard library ----------
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
-// --- EXTERN API TABLES ---
-extern const LpzWindowAPI LpzWindow_GLFW;
-LpzAPI Lpz;
+// ---------- Lapiz library headers ----------
+// Lpz.h pulls in LpzTypes.h (all GPU types) and LpzGeometry.h (mesh helpers).
+#include "../include/LPZ/Lpz.h"
+#include "../include/LPZ/LpzMath.h" // LpzCamera3D, LpzMat4, cglm wrappers
 
-#ifdef LAPIZ_HAS_METAL
-extern const LpzAPI LpzMetal;
-#endif
+// ---------- Our own helpers ----------
+#include "shader_loader.h" // shader_load_spirv / shader_load_msl
+#include "app_camera.h"    // first-person camera
 
-#ifdef LAPIZ_HAS_VULKAN
-extern const LpzAPI LpzVulkan;
-#endif
+// =============================================================================
+// GLOBAL BACKEND DISPATCH TABLE
+//
+// LpzTypes.h declares   extern LpzAPI Lpz;
+// Exactly one translation unit must *define* it — that's us, the application.
+// The library only defines the const tables LpzVulkan / LpzMetal;
+// it deliberately leaves the mutable Lpz slot to the caller so multiple
+// apps can link against the same library and each pick their own backend.
+//
+// We zero-initialise here; main() immediately overwrites it with LpzVulkan
+// or LpzMetal before any Lpz.* calls are made.
+// =============================================================================
+LpzAPI Lpz = {0};
 
-// ============================================================================
-// HELPER: READ SPIR-V BINARY FILES (For Vulkan)
-// ============================================================================
-void *read_binary_file(const char *filepath, size_t *out_size)
+// =============================================================================
+// CONFIGURATION — tweak these to change the demo
+// =============================================================================
+#define WINDOW_TITLE "Lapiz — Hello Shapes"
+#define WINDOW_WIDTH 800
+#define WINDOW_HEIGHT 600
+#define CAMERA_SPEED 5.0f  // world units per second
+#define CAMERA_SENS 0.003f // radians per pixel
+#define FOV_Y 60.0f        // vertical field-of-view in degrees
+
+// =============================================================================
+// PUSH CONSTANT LAYOUT
+//
+// The GPU shader (mesh.vert / mesh.metal) reads these two values every draw.
+// They must match the layout declared in the shader files exactly:
+//   • mvp  — 64 bytes (4×4 float matrix, column-major)
+//   • tint — 16 bytes (RGBA float)
+//   Total  — 80 bytes
+//
+// We upload this struct with Lpz.renderer.PushConstants() before each draw.
+// =============================================================================
+typedef struct
 {
-    printf("DEBUG: Reading file: %s\n", filepath);
-    FILE *file = fopen(filepath, "rb");
-    if (!file)
-    {
-        printf("ERROR: Failed to open %s! Did you compile your shaders with glslc?\n", filepath);
-        return NULL;
-    }
-    fseek(file, 0, SEEK_END);
-    *out_size = ftell(file);
-    fseek(file, 0, SEEK_SET);
+    float mvp[4][4]; // Model-View-Projection matrix
+    float tint[4];   // R, G, B, A
+} PushConstants;
 
-    void *buffer = malloc(*out_size);
-    if (!buffer)
-    {
-        printf("ERROR: Memory allocation failed for shader buffer\n");
-        fclose(file);
-        return NULL;
-    }
-    fread(buffer, 1, *out_size, file);
-    fclose(file);
-    printf("DEBUG: Successfully loaded %zu bytes from %s\n", *out_size, filepath);
-    return buffer;
+// =============================================================================
+// SHAPE DESCRIPTION
+//
+// Everything we need to draw one object in the scene:
+//   gpu_vb    — vertex buffer on the GPU
+//   gpu_ib    — index  buffer on the GPU
+//   idx_count — how many indices to pass to DrawIndexed
+//   idx_type  — uint16 or uint32
+//   tint      — colour used in the push constant
+//   model     — 4×4 model matrix (position + rotation)
+// =============================================================================
+typedef struct
+{
+    lpz_buffer_t gpu_vb;
+    lpz_buffer_t gpu_ib;
+    uint32_t idx_count;
+    LpzIndexType idx_type;
+    float tint[4]; // RGBA
+    LpzMat4 model; // world-space transform
+} Shape;
+
+// =============================================================================
+// APPLICATION STATE
+//
+// Rather than scattering GPU handles across global variables, we collect
+// everything into one struct.  The main() function fills this in step-by-step
+// and tears it all down at the end.
+// =============================================================================
+typedef struct
+{
+    lpz_window_t window;
+    lpz_device_t device;
+    lpz_surface_t surface;
+    lpz_renderer_t renderer;
+
+    lpz_shader_t vert_shader;
+    lpz_shader_t frag_shader;
+    lpz_pipeline_t pipeline;
+    lpz_depth_stencil_state_t depth_stencil_state;
+
+    // Depth buffer — we own this texture and must recreate it on resize
+    lpz_texture_t depth_texture;
+    uint32_t fb_width;
+    uint32_t fb_height;
+
+    // Shapes to draw in the scene
+    Shape shapes[5];
+    uint32_t shape_count;
+
+    // Camera
+    AppCamera camera;
+
+    // Used for delta-time calculation
+    double last_time;
+
+    // Set by the resize callback so the main loop knows to rebuild the depth buffer
+    bool needs_resize;
+} AppState;
+
+// We declare app as a file-scope variable so the resize callback (which only
+// receives a window pointer) can reach it.
+static AppState g_app;
+
+// =============================================================================
+// RESIZE CALLBACK
+//
+// Lapiz calls this whenever the framebuffer changes size (e.g. the user drags
+// the window edge).  We record the new size and set a flag; the actual GPU
+// resources are recreated at the start of the next frame so we are never
+// resizing while the GPU is actively rendering.
+// =============================================================================
+static void on_window_resize(lpz_window_t window, uint32_t w, uint32_t h, void *userdata)
+{
+    (void)window;
+    (void)userdata;
+    g_app.fb_width = w;
+    g_app.fb_height = h;
+    g_app.needs_resize = true;
 }
 
-// ============================================================================
-// RAW MSL SHADER SOURCE CODE (For Metal)
-// Now samples a texture at binding 0 in the fragment stage.
-// ============================================================================
-// The Metal backend binds resources via argument buffers:
-//   BindBindGroup(renderer, set=0, group) calls:
-//     setFragmentBuffer(group->argumentBuffer, offset:0, atIndex:0)
+// =============================================================================
+// HELPER: create_depth_texture
 //
-// Inside that argument buffer the encoder wrote:
-//   index 0 -> texture  (via [encoder setTexture:tex  atIndex:0])
-//   index 1 -> sampler  (via [encoder setSamplerState:s atIndex:1])
+// Creates a depth-only texture sized to match the current framebuffer.
+// Called once at startup and again whenever the window is resized.
 //
-// MSL argument buffer structs must match that exact layout.
-const char *shader_source = "#include <metal_stdlib>\n"
-                            "using namespace metal;\n"
-                            "\n"
-                            "struct MaterialArgs {\n"
-                            "    texture2d<float> albedo [[id(0)]];\n"
-                            "    sampler          samp   [[id(1)]];\n"
-                            "};\n"
-                            "\n"
-                            "struct VertexIn {\n"
-                            "    float3 position [[attribute(0)]];\n"
-                            "    float3 normal   [[attribute(1)]];\n"
-                            "    float2 uv       [[attribute(2)]];\n"
-                            "    float4 color    [[attribute(3)]];\n"
-                            "};\n"
-                            "\n"
-                            "struct VertexOut {\n"
-                            "    float4 position [[position]];\n"
-                            "    float2 uv;\n"
-                            "};\n"
-                            "\n"
-                            "struct PushConstants {\n"
-                            "    float4x4 mvp_matrix;\n"
-                            "};\n"
-                            "\n"
-                            "vertex VertexOut vertex_main(\n"
-                            "    VertexIn in [[stage_in]],\n"
-                            "    constant PushConstants& push [[buffer(7)]])\n"
-                            "{\n"
-                            "    VertexOut out;\n"
-                            "    out.position = push.mvp_matrix * float4(in.position, 1.0);\n"
-                            "    out.uv       = in.uv;\n"
-                            "    return out;\n"
-                            "}\n"
-                            "\n"
-                            "fragment float4 fragment_main(\n"
-                            "    VertexOut          in      [[stage_in]],\n"
-                            "    constant MaterialArgs& mat [[buffer(0)]])\n"
-                            "{\n"
-                            "    return mat.albedo.sample(mat.samp, in.uv);\n"
-                            "}\n";
-
-// ============================================================================
-// GLSL SHADERS FOR VULKAN — compile with glslc then place .spv in examples/
-//
-// shader.vert:
-// -----------------------------------------------------------------------
-//   #version 450
-//   layout(location=0) in vec3 inPosition;
-//   layout(location=1) in vec3 inNormal;
-//   layout(location=2) in vec2 inUV;
-//   layout(location=3) in vec4 inColor;
-//   layout(location=0) out vec2 fragUV;
-//   layout(location=1) out vec4 fragColor;
-//   layout(push_constant) uniform PC { mat4 mvp; } push;
-//   void main() {
-//       gl_Position = push.mvp * vec4(inPosition, 1.0);
-//       fragUV    = inUV;
-//       fragColor = inColor;
-//   }
-//
-// shader.frag:
-// -----------------------------------------------------------------------
-//   #version 450
-//   layout(location=0) in vec2 fragUV;
-//   layout(location=1) in vec4 fragColor;
-//   layout(location=0) out vec4 outColor;
-//   layout(set=0, binding=0) uniform texture2D albedoTex;
-//   layout(set=0, binding=1) uniform sampler   albedoSamp;
-//   void main() {
-//       outColor = texture(sampler2D(albedoTex, albedoSamp), fragUV) * fragColor;
-//   }
-//
-// Compile:
-//   glslc shader.vert -o shader.vert.spv
-//   glslc shader.frag -o shader.frag.spv
-// ============================================================================
-
-// ============================================================================
-// HELPER: LOAD TEXTURE FROM FILE
-// Returns the lpz_texture_t and lpz_sampler_t via out-params.
-// path  – PNG/JPG/BMP/TGA path (anything stb_image supports)
-// ============================================================================
-static bool load_texture(lpz_device_t device, const char *path, lpz_texture_t *out_texture, lpz_sampler_t *out_sampler)
+// Why do we need a depth texture?
+//   Without depth testing, shapes drawn later always appear on top of shapes
+//   drawn earlier, regardless of 3-D position.  By attaching a depth buffer
+//   to the render pass, the GPU keeps track of the closest fragment at each
+//   pixel and discards fragments that are behind already-drawn geometry.
+// =============================================================================
+static lpz_texture_t create_depth_texture(lpz_device_t device, uint32_t w, uint32_t h)
 {
-    printf("DEBUG: Loading texture: %s\n", path);
-
-    // 1. Decode image to raw RGBA8 on the CPU
-    int w, h, channels;
-    stbi_set_flip_vertically_on_load(1);                           // flip so UV origin matches GPU convention
-    unsigned char *pixels = stbi_load(path, &w, &h, &channels, 4); // force RGBA
-    if (!pixels)
-    {
-        printf("ERROR: stbi_load failed for '%s': %s\n", path, stbi_failure_reason());
-        return false;
-    }
-    printf("DEBUG: Image loaded %dx%d (%d source channels)\n", w, h, channels);
-
-    // 2. Create the GPU texture
-    texture_desc_t tex_desc = {
-        .width = (uint32_t)w,
-        .height = (uint32_t)h,
-        .depth = 0,        // treated as 1
-        .array_layers = 0, // treated as 1
-        .sample_count = 1,
-        .mip_levels = 1,
-        .format = LPZ_FORMAT_RGBA8_UNORM,
-        .usage = LPZ_TEXTURE_USAGE_SAMPLED_BIT | LPZ_TEXTURE_USAGE_TRANSFER_DST_BIT,
+    LpzTextureDesc desc = {
+        .width = w,
+        .height = h,
+        .depth = 0,        // 0 → treated as 1 (2-D texture)
+        .array_layers = 0, // 0 → treated as 1
+        .sample_count = 1, // no MSAA
+        .mip_levels = 1,   // depth buffers don't need mip-maps
+        .format = LPZ_FORMAT_DEPTH32_FLOAT,
+        .usage = LPZ_TEXTURE_USAGE_DEPTH_ATTACHMENT_BIT,
         .texture_type = LPZ_TEXTURE_TYPE_2D,
+        .heap = NULL, // let the driver allocate its own memory
     };
-    if (Lpz.device.CreateTexture(device, &tex_desc, out_texture) != LPZ_SUCCESS)
+
+    lpz_texture_t tex = NULL;
+    if (Lpz.device.CreateTexture(device, &desc, &tex) != LPZ_SUCCESS)
     {
-        printf("ERROR: CreateTexture failed\n");
-        stbi_image_free(pixels);
+        fprintf(stderr, "Failed to create depth texture (%u × %u)\n", w, h);
+    }
+    return tex;
+}
+
+// =============================================================================
+// HELPER: upload_mesh
+//
+// Copies CPU mesh data into a pair of GPU buffers (vertex + index).
+// This uses a two-step process:
+//
+//   1. Allocate a CPU-visible "staging" buffer.
+//   2. Copy the mesh bytes into the staging buffer (memcpy via MapMemory).
+//   3. Open a Transfer pass and call CopyBufferToBuffer to move the data to
+//      a GPU-only buffer for fast vertex-fetch performance.
+//   4. Free the staging buffer.
+//
+// For a learning example we do this synchronously: we call WaitIdle after
+// the transfer to ensure the copy is complete before the first frame.
+// A production engine would manage a transfer queue and use fences instead.
+// =============================================================================
+static bool upload_mesh(const LpzVertex *vertices, uint32_t vert_count, const void *indices, uint32_t idx_count, LpzIndexType idx_type, lpz_buffer_t *out_vb, lpz_buffer_t *out_ib)
+{
+    size_t vb_size = vert_count * sizeof(LpzVertex);
+    size_t idx_elem = (idx_type == LPZ_INDEX_TYPE_UINT16) ? sizeof(uint16_t) : sizeof(uint32_t);
+    size_t ib_size = idx_count * idx_elem;
+
+    // -------------------------------------------------------------------------
+    // Create GPU-side (device-local) buffers.
+    // LPZ_MEMORY_USAGE_GPU_ONLY means fastest GPU reads, but no CPU access.
+    // We must use staging buffers to upload data into them.
+    // -------------------------------------------------------------------------
+    LpzBufferDesc vb_desc = {
+        .size = vb_size,
+        .usage = LPZ_BUFFER_USAGE_VERTEX_BIT | LPZ_BUFFER_USAGE_TRANSFER_DST,
+        .memory_usage = LPZ_MEMORY_USAGE_GPU_ONLY,
+        .ring_buffered = false,
+        .heap = NULL,
+    };
+    LpzBufferDesc ib_desc = {
+        .size = ib_size,
+        .usage = LPZ_BUFFER_USAGE_INDEX_BIT | LPZ_BUFFER_USAGE_TRANSFER_DST,
+        .memory_usage = LPZ_MEMORY_USAGE_GPU_ONLY,
+        .ring_buffered = false,
+        .heap = NULL,
+    };
+
+    if (Lpz.device.CreateBuffer(g_app.device, &vb_desc, out_vb) != LPZ_SUCCESS || Lpz.device.CreateBuffer(g_app.device, &ib_desc, out_ib) != LPZ_SUCCESS)
+    {
+        fprintf(stderr, "Failed to create GPU vertex/index buffers\n");
         return false;
     }
 
-    // 3. Upload: WriteTexture handles the staging buffer internally
-    Lpz.device.WriteTexture(device, *out_texture, pixels, (uint32_t)w, (uint32_t)h, 4);
-    stbi_image_free(pixels);
+    // -------------------------------------------------------------------------
+    // Create CPU→GPU staging buffers (one for vertices, one for indices).
+    // LPZ_MEMORY_USAGE_CPU_TO_GPU = host-visible memory; we can memcpy into it.
+    // -------------------------------------------------------------------------
+    lpz_buffer_t staging_vb = NULL, staging_ib = NULL;
 
-    // 4. Create a basic bilinear sampler
-    sampler_desc_t samp_desc = {
-        .mag_filter_linear = true,
-        .min_filter_linear = true,
-        .mip_filter_linear = false,
-        .address_mode_u = LPZ_SAMPLER_ADDRESS_MODE_REPEAT,
-        .address_mode_v = LPZ_SAMPLER_ADDRESS_MODE_REPEAT,
-        .address_mode_w = LPZ_SAMPLER_ADDRESS_MODE_REPEAT,
-        .max_anisotropy = 0.0f, // disabled
-        .min_lod = 0.0f,
-        .max_lod = 0.0f, // treated as FLT_MAX (all mips)
+    LpzBufferDesc sv_desc = {
+        .size = vb_size,
+        .usage = LPZ_BUFFER_USAGE_TRANSFER_SRC,
+        .memory_usage = LPZ_MEMORY_USAGE_CPU_TO_GPU,
+        .ring_buffered = false,
+        .heap = NULL,
     };
-    *out_sampler = Lpz.device.CreateSampler(device, &samp_desc);
+    LpzBufferDesc si_desc = {
+        .size = ib_size,
+        .usage = LPZ_BUFFER_USAGE_TRANSFER_SRC,
+        .memory_usage = LPZ_MEMORY_USAGE_CPU_TO_GPU,
+        .ring_buffered = false,
+        .heap = NULL,
+    };
 
-    printf("DEBUG: Texture ready (%dx%d)\n", w, h);
+    if (Lpz.device.CreateBuffer(g_app.device, &sv_desc, &staging_vb) != LPZ_SUCCESS || Lpz.device.CreateBuffer(g_app.device, &si_desc, &staging_ib) != LPZ_SUCCESS)
+    {
+        fprintf(stderr, "Failed to create staging buffers\n");
+        return false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Map → memcpy → Unmap the staging buffers.
+    // frame_index 0 is fine here because staging buffers are not ring-buffered.
+    // -------------------------------------------------------------------------
+    void *vb_ptr = Lpz.device.MapMemory(g_app.device, staging_vb, 0);
+    void *ib_ptr = Lpz.device.MapMemory(g_app.device, staging_ib, 0);
+
+    memcpy(vb_ptr, vertices, vb_size);
+    memcpy(ib_ptr, indices, ib_size);
+
+    Lpz.device.UnmapMemory(g_app.device, staging_vb, 0);
+    Lpz.device.UnmapMemory(g_app.device, staging_ib, 0);
+
+    // -------------------------------------------------------------------------
+    // Kick off a GPU transfer pass to copy staging → device-local buffers.
+    // A transfer pass issues DMA commands; no drawing happens inside it.
+    // -------------------------------------------------------------------------
+    Lpz.renderer.BeginTransferPass(g_app.renderer);
+    Lpz.renderer.CopyBufferToBuffer(g_app.renderer, staging_vb, 0, *out_vb, 0, vb_size);
+    Lpz.renderer.CopyBufferToBuffer(g_app.renderer, staging_ib, 0, *out_ib, 0, ib_size);
+    Lpz.renderer.EndTransferPass(g_app.renderer);
+
+    // Flush all pending GPU work so the data is ready before we start rendering.
+    // (In a real engine you would overlap uploads with rendering using fences.)
+    Lpz.device.WaitIdle(g_app.device);
+
+    // Release the staging memory — the GPU no longer needs it
+    Lpz.device.DestroyBuffer(staging_vb);
+    Lpz.device.DestroyBuffer(staging_ib);
+
     return true;
 }
 
-// ============================================================================
-// HELPER: MSAA & DEPTH TEXTURE RECREATION
-// ============================================================================
-const uint32_t MSAA_SAMPLES = 4;
-lpz_texture_t g_msaa_texture = NULL;
-lpz_texture_t g_depth_texture = NULL;
-
-void RecreateRenderTargets(lpz_device_t device, uint32_t width, uint32_t height)
+// =============================================================================
+// HELPER: make_translation_matrix
+//
+// Returns a 4×4 identity matrix with the translation column set to (tx, ty, tz).
+// We use this to position each shape at a different place in the world.
+// =============================================================================
+static void make_translation_matrix(float tx, float ty, float tz, LpzMat4 out)
 {
-    printf("DEBUG: Recreating Render Targets (%ux%u)\n", width, height);
-    if (g_msaa_texture)
-        Lpz.device.DestroyTexture(g_msaa_texture);
-    if (g_depth_texture)
-        Lpz.device.DestroyTexture(g_depth_texture);
-
-    texture_desc_t msaa_desc = {
-        .width = width,
-        .height = height,
-        .sample_count = MSAA_SAMPLES,
-        .mip_levels = 1,
-        .format = LPZ_FORMAT_BGRA8_UNORM,
-        .usage = LPZ_TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | LPZ_TEXTURE_USAGE_TRANSIENT_BIT,
-    };
-    if (Lpz.device.CreateTexture(device, &msaa_desc, &g_msaa_texture) != LPZ_SUCCESS)
-    {
-        printf("ERROR: Failed to create MSAA color texture (%ux%u, %u samples)!\n", width, height, MSAA_SAMPLES);
-        g_msaa_texture = NULL;
-    }
-
-    texture_desc_t depth_desc = {
-        .width = width,
-        .height = height,
-        .sample_count = MSAA_SAMPLES,
-        .mip_levels = 1,
-        .format = LPZ_FORMAT_DEPTH32_FLOAT,
-        .usage = LPZ_TEXTURE_USAGE_DEPTH_ATTACHMENT_BIT | LPZ_TEXTURE_USAGE_TRANSIENT_BIT,
-    };
-    if (Lpz.device.CreateTexture(device, &depth_desc, &g_depth_texture) != LPZ_SUCCESS)
-    {
-        printf("ERROR: Failed to create depth texture (%ux%u, %u samples)!\n", width, height, MSAA_SAMPLES);
-        g_depth_texture = NULL;
-    }
+    glm_mat4_identity(out); // fills out with the 4×4 identity
+    out[3][0] = tx;
+    out[3][1] = ty;
+    out[3][2] = tz;
 }
 
-// ============================================================================
-// MAIN ENGINE ENTRY
-// ============================================================================
+// =============================================================================
+// HELPER: draw_shape
+//
+// Called inside the render pass for each shape.  It:
+//   1. Computes the final MVP = view_proj × model
+//   2. Uploads the MVP + colour via push constants (cheapest GPU upload path)
+//   3. Binds the vertex and index buffers for this shape
+//   4. Issues the indexed draw call
+// =============================================================================
+static void draw_shape(const Shape *s, const LpzMat4 view_proj)
+{
+    // Combine the camera VP with the shape's model matrix
+    PushConstants pc;
+    LpzMat4 mvp;
+    glm_mat4_mul((vec4 *)view_proj, (vec4 *)s->model, mvp);
+    memcpy(pc.mvp, mvp, sizeof(pc.mvp));
+    memcpy(pc.tint, s->tint, sizeof(pc.tint));
+
+    // Push constants are the fastest way to send small per-draw data to the
+    // shader.  They live in a small region of memory directly on the GPU command
+    // buffer — no separate descriptor set or buffer binding needed.
+    Lpz.renderer.PushConstants(g_app.renderer, LPZ_SHADER_STAGE_ALL_GRAPHICS,
+                               0, // byte offset into push constant block
+                               sizeof(PushConstants), &pc);
+
+    // Bind the vertex buffer.  The '0' is the "binding slot" — matches
+    // the binding index in the vertex attribute descriptors set up during
+    // pipeline creation.
+    uint64_t vb_offset = 0;
+    Lpz.renderer.BindVertexBuffers(g_app.renderer, 0, 1, &s->gpu_vb, &vb_offset);
+
+    // Bind the index buffer so DrawIndexed knows which indices to read
+    Lpz.renderer.BindIndexBuffer(g_app.renderer, s->gpu_ib, 0, s->idx_type);
+
+    // Draw!  Parameters: index_count, instance_count=1, first_index=0, vertex_offset=0
+    Lpz.renderer.DrawIndexed(g_app.renderer, s->idx_count, 1, 0, 0, 0);
+}
+
+// =============================================================================
+// HELPER: handle_resize
+//
+// Recreates the swap-chain surface and depth texture to match the new window
+// size.  Called at the start of a frame when g_app.needs_resize is true.
+// =============================================================================
+static void handle_resize(void)
+{
+    // Wait until the GPU has finished all in-flight work before destroying
+    // any resources — destroying objects the GPU is still using is undefined.
+    Lpz.device.WaitIdle(g_app.device);
+
+    // Resize the swap chain (tells the driver about the new dimensions)
+    Lpz.surface.Resize(g_app.surface, g_app.fb_width, g_app.fb_height);
+
+    // Recreate the depth texture at the new size
+    Lpz.device.DestroyTexture(g_app.depth_texture);
+    g_app.depth_texture = create_depth_texture(g_app.device, g_app.fb_width, g_app.fb_height);
+    g_app.needs_resize = false;
+}
+
+// =============================================================================
+// main()
+//
+// The entry point.  Structured in five phases:
+//   1. Init   — window, device, surface, renderer
+//   2. Shaders & Pipeline
+//   3. Geometry upload
+//   4. Main loop
+//   5. Cleanup
+// =============================================================================
 int main(int argc, char **argv)
 {
-    bool use_vulkan = false;
+    memset(&g_app, 0, sizeof(g_app));
 
-    if (argc > 1 && strcmp(argv[1], "--vulkan") == 0)
+    // =========================================================================
+    // PHASE 1 — INIT
+    // =========================================================================
+
+    // -------------------------------------------------------------------------
+    // 1a. Choose the backend
+    //
+    // The backend is selected at runtime via a command-line flag rather than
+    // at compile time, so you can switch without recompiling.
+    //
+    //   ./main            → Metal  (default on macOS)
+    //   ./main --vulkan   → Vulkan
+    //
+    // We walk argv looking for "--vulkan".  Any unrecognised argument prints a
+    // usage hint and exits so the user isn't silently ignored.
+    //
+    // Lapiz ships two full API tables: LpzVulkan and LpzMetal.
+    // Assigning one to the global `Lpz` variable routes every subsequent
+    // Lpz.* call through that backend.
+    //
+    // We also need to tell the library which windowing system to use for the
+    // window.* functions.  Here we use GLFW regardless of backend.
+    // -------------------------------------------------------------------------
+    bool use_metal = true; // Metal is the default on macOS
+
+#if !defined(LAPIZ_HAS_METAL)
+    // If the library was built without the Metal backend, force Vulkan.
+    use_metal = false;
+#endif
+
+    for (int i = 1; i < argc; ++i)
     {
-        use_vulkan = true;
+        if (strcmp(argv[i], "--vulkan") == 0)
+        {
+#if defined(LAPIZ_HAS_VULKAN)
+            use_metal = false;
+#else
+            fprintf(stderr, "This build was compiled without Vulkan support.\n");
+            return 1;
+#endif
+        }
+        else if (strcmp(argv[i], "--metal") == 0)
+        {
+#if defined(LAPIZ_HAS_METAL)
+            use_metal = true;
+#else
+            fprintf(stderr, "This build was compiled without Metal support.\n");
+            return 1;
+#endif
+        }
+        else
+        {
+            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
+            fprintf(stderr, "Usage: %s [--vulkan | --metal]\n", argv[0]);
+            return 1;
+        }
     }
 
-    if (use_vulkan)
+    if (use_metal)
     {
-#ifdef LAPIZ_HAS_VULKAN
-        printf("DEBUG: Backend choice -> Vulkan\n");
-        Lpz = LpzVulkan;
-#else
-        printf("ERROR: Vulkan backend not compiled!\n");
-        return -1;
-#endif
+        Lpz = LpzMetal;
+        printf("Backend: Metal\n");
     }
     else
     {
-#ifdef LAPIZ_HAS_METAL
-        printf("DEBUG: Backend choice -> Metal\n");
-        Lpz = LpzMetal;
-#else
-        printf("ERROR: Metal backend not compiled!\n");
-        return -1;
-#endif
+        Lpz = LpzVulkan;
+        printf("Backend: Vulkan\n");
     }
+    Lpz.window = LpzWindow_GLFW; // swap in the GLFW window implementation
 
-    Lpz.window = LpzWindow_GLFW;
-
-    printf("DEBUG: Initializing Window API...\n");
+    // -------------------------------------------------------------------------
+    // 1b. Initialise the windowing system
+    //
+    // This calls glfwInit() under the hood.  It must be the first window call.
+    // -------------------------------------------------------------------------
     if (!Lpz.window.Init())
     {
-        printf("ERROR: Failed to initialize Window API\n");
-        return -1;
+        fprintf(stderr, "Failed to initialise the window system\n");
+        return 1;
     }
 
-    uint32_t win_width = 800;
-    uint32_t win_height = 600;
-
-    const char *win_title = use_vulkan ? "Lpz Engine - Vulkan" : "Lpz Engine - Metal";
-    printf("DEBUG: Creating Window: %s\n", win_title);
-    lpz_window_t window = Lpz.window.CreateWindow(win_title, win_width, win_height);
-    if (!window)
+    // -------------------------------------------------------------------------
+    // 1c. Create the OS window
+    //
+    // Returns an opaque lpz_window_t handle.  We store it in g_app so the
+    // rest of the program can use it.
+    // -------------------------------------------------------------------------
+    g_app.window = Lpz.window.CreateWindow(WINDOW_TITLE, WINDOW_WIDTH, WINDOW_HEIGHT);
+    if (!g_app.window)
     {
-        printf("ERROR: Failed to create window\n");
-        return -1;
+        fprintf(stderr, "Failed to create window\n");
+        return 1;
     }
 
-    printf("DEBUG: Creating Device...\n");
-    lpz_device_t device;
-    if (Lpz.device.Create(&device) != LPZ_SUCCESS)
+    // Record the initial framebuffer size
+    Lpz.window.GetFramebufferSize(g_app.window, &g_app.fb_width, &g_app.fb_height);
+
+    // Register our resize callback so we know when the window changes size
+    Lpz.window.SetResizeCallback(g_app.window, on_window_resize, NULL);
+
+    // -------------------------------------------------------------------------
+    // 1d. Create the GPU device
+    //
+    // The device is the logical representation of your GPU.  It is used to
+    // create and destroy all other GPU objects (buffers, textures, shaders …).
+    // -------------------------------------------------------------------------
+    if (Lpz.device.Create(&g_app.device) != LPZ_SUCCESS)
     {
-        printf("ERROR: Failed to create device\n");
-        return -1;
+        fprintf(stderr, "Failed to create GPU device\n");
+        return 1;
+    }
+    printf("GPU: %s\n", Lpz.device.GetName(g_app.device));
+
+    // -------------------------------------------------------------------------
+    // 1e. Create the swap-chain surface
+    //
+    // The surface is the link between the GPU and the OS window.  It manages
+    // a ring of "swap images" — textures the GPU renders into and the OS
+    // displays on screen.
+    // -------------------------------------------------------------------------
+    LpzSurfaceDesc surf_desc = {
+        .window = g_app.window,
+        .width = g_app.fb_width,
+        .height = g_app.fb_height,
+        .present_mode = LPZ_PRESENT_MODE_FIFO, // vsync (tear-free, always available)
+    };
+    g_app.surface = Lpz.surface.CreateSurface(g_app.device, &surf_desc);
+    if (!g_app.surface)
+    {
+        fprintf(stderr, "Failed to create surface\n");
+        return 1;
     }
 
-    printf("DEBUG: Creating Renderer...\n");
-    lpz_renderer_t renderer = Lpz.renderer.CreateRenderer(device);
-
-    printf("DEBUG: Creating Surface...\n");
-    surface_desc_t surf_desc = {.window = window, .width = win_width, .height = win_height};
-    lpz_surface_t surface = Lpz.surface.CreateSurface(device, &surf_desc);
-
-    // NOTE: We do NOT register a resize callback here.
-    // Render target recreation must happen AFTER BeginFrame (which waits on the GPU fence).
-    // Firing it from a GLFW callback during PollEvents destroys images the GPU is still using.
-    RecreateRenderTargets(device, win_width, win_height);
-
-    // =========================================================================
-    // TEXTURE LOADING
-    // Change "texture.png" to your actual image path.
-    // The file can live next to the binary or use a relative/absolute path.
-    // =========================================================================
-    printf("DEBUG: Loading texture...\n");
-    lpz_texture_t albedo_texture = NULL;
-    lpz_sampler_t albedo_sampler = NULL;
-    if (!load_texture(device, "../examples/texture.png", &albedo_texture, &albedo_sampler))
+    // -------------------------------------------------------------------------
+    // 1f. Create the renderer
+    //
+    // The renderer records GPU commands each frame.  Think of it as a "command
+    // buffer manager" — you call Begin/End functions on it to record draw calls,
+    // then Submit() sends all recorded work to the GPU.
+    // -------------------------------------------------------------------------
+    g_app.renderer = Lpz.renderer.CreateRenderer(g_app.device);
+    if (!g_app.renderer)
     {
-        printf("ERROR: Could not load texture, aborting.\n");
-        return -1;
+        fprintf(stderr, "Failed to create renderer\n");
+        return 1;
     }
 
-    // =========================================================================
-    // BIND GROUP LAYOUT
-    // Two entries to match the MSL argument buffer struct:
-    //   id(0) = texture2d  (TEXTURE, fragment-visible)
-    //   id(1) = sampler     (SAMPLER, fragment-visible)
-    // Vulkan COMBINED_IMAGE_SAMPLER collapses both into one descriptor, but
-    // Metal argument buffers need them as separate indexed slots.
-    // =========================================================================
-    bind_group_layout_entry_t layout_entries[] = {
-        {
-            .binding_index = 0,
-            .type = LPZ_BINDING_TYPE_TEXTURE,
-            .visibility = LPZ_SHADER_STAGE_FRAGMENT,
-        },
-        {
-            .binding_index = 1,
-            .type = LPZ_BINDING_TYPE_SAMPLER,
-            .visibility = LPZ_SHADER_STAGE_FRAGMENT,
-        },
-    };
-    bind_group_layout_desc_t bgl_desc = {
-        .entries = layout_entries,
-        .entry_count = 2,
-    };
-    lpz_bind_group_layout_t bind_group_layout = Lpz.device.CreateBindGroupLayout(device, &bgl_desc);
+    // -------------------------------------------------------------------------
+    // 1g. Create the depth texture
+    //
+    // We need a depth buffer the same size as the framebuffer.
+    // -------------------------------------------------------------------------
+    g_app.depth_texture = create_depth_texture(g_app.device, g_app.fb_width, g_app.fb_height);
+    if (!g_app.depth_texture)
+        return 1;
 
     // =========================================================================
-    // BIND GROUP
+    // PHASE 2 — SHADERS & PIPELINE
     // =========================================================================
-    bind_group_entry_t bg_entries[] = {
-        {.binding_index = 0, .texture = albedo_texture},
-        {.binding_index = 1, .sampler = albedo_sampler},
-    };
-    bind_group_desc_t bg_desc = {
-        .layout = bind_group_layout,
-        .entries = bg_entries,
-        .entry_count = 2,
-    };
-    lpz_bind_group_t bind_group = Lpz.device.CreateBindGroup(device, &bg_desc);
 
-    // =========================================================================
-    // GEOMETRY BUFFERS (unchanged)
-    // =========================================================================
-    printf("DEBUG: Setting up Geometry Buffers...\n");
-    buffer_desc_t vbo_gpu_desc = {.size = sizeof(LPZ_GEO_CUBE_VERTICES), .usage = LPZ_BUFFER_USAGE_VERTEX_BIT | LPZ_BUFFER_USAGE_TRANSFER_DST, .memory_usage = LPZ_MEMORY_USAGE_GPU_ONLY};
-    lpz_buffer_t vertex_buffer;
-    Lpz.device.CreateBuffer(device, &vbo_gpu_desc, &vertex_buffer);
+    // -------------------------------------------------------------------------
+    // 2a. Load shader bytecode from disk
+    //
+    // Vulkan needs pre-compiled SPIR-V binaries (.spv files).
+    //   Compile them with glslc:
+    //     glslc shaders/mesh.vert -o shaders/mesh.vert.spv
+    //     glslc shaders/mesh.frag -o shaders/mesh.frag.spv
+    //
+    // Metal reads MSL source directly — no pre-compilation step needed.
+    // Which path we take is determined by the use_metal flag set in phase 1a.
+    // -------------------------------------------------------------------------
+    LpzShaderBlob vs_blob = {NULL, 0};
+    LpzShaderBlob fs_blob = {NULL, 0};
 
-    buffer_desc_t ibo_gpu_desc = {.size = sizeof(LPZ_GEO_CUBE_INDICES), .usage = LPZ_BUFFER_USAGE_INDEX_BIT | LPZ_BUFFER_USAGE_TRANSFER_DST, .memory_usage = LPZ_MEMORY_USAGE_GPU_ONLY};
-    lpz_buffer_t index_buffer;
-    Lpz.device.CreateBuffer(device, &ibo_gpu_desc, &index_buffer);
-
-    buffer_desc_t staging_desc = {.size = sizeof(LPZ_GEO_CUBE_VERTICES), .usage = LPZ_BUFFER_USAGE_TRANSFER_SRC, .memory_usage = LPZ_MEMORY_USAGE_CPU_TO_GPU};
-    lpz_buffer_t staging_vbo;
-    Lpz.device.CreateBuffer(device, &staging_desc, &staging_vbo);
-    staging_desc.size = sizeof(LPZ_GEO_CUBE_INDICES);
-    lpz_buffer_t staging_ibo;
-    Lpz.device.CreateBuffer(device, &staging_desc, &staging_ibo);
-
-    printf("DEBUG: Mapping Staging Memory...\n");
-    void *v_map = Lpz.device.MapMemory(device, staging_vbo, 0);
-    memcpy(v_map, LPZ_GEO_CUBE_VERTICES, sizeof(LPZ_GEO_CUBE_VERTICES));
-    Lpz.device.UnmapMemory(device, staging_vbo, 0);
-
-    void *i_map = Lpz.device.MapMemory(device, staging_ibo, 0);
-    memcpy(i_map, LPZ_GEO_CUBE_INDICES, sizeof(LPZ_GEO_CUBE_INDICES));
-    Lpz.device.UnmapMemory(device, staging_ibo, 0);
-
-    printf("DEBUG: Executing Transfer Pass...\n");
-    Lpz.renderer.BeginTransferPass(renderer);
-    Lpz.renderer.CopyBufferToBuffer(renderer, staging_vbo, 0, vertex_buffer, 0, sizeof(LPZ_GEO_CUBE_VERTICES));
-    Lpz.renderer.CopyBufferToBuffer(renderer, staging_ibo, 0, index_buffer, 0, sizeof(LPZ_GEO_CUBE_INDICES));
-    Lpz.renderer.EndTransferPass(renderer);
-
-    Lpz.device.WaitIdle(device);
-    Lpz.device.DestroyBuffer(staging_vbo);
-    Lpz.device.DestroyBuffer(staging_ibo);
-
-    // =========================================================================
-    // SHADER LOADING
-    // =========================================================================
-    printf("DEBUG: Loading Shaders...\n");
-    shader_desc_t vs_desc, fs_desc;
-    void *vs_bytes = NULL, *fs_bytes = NULL;
-    size_t vs_size = 0, fs_size = 0;
-
-    if (use_vulkan)
+    if (use_metal)
     {
-        vs_bytes = read_binary_file("../examples/shader.vert.spv", &vs_size);
-        fs_bytes = read_binary_file("../examples/shader.frag.spv", &fs_size);
-        if (!vs_bytes || !fs_bytes)
-        {
-            printf("ERROR: Vulkan shader files missing or empty!\n");
-            return -1;
-        }
-        vs_desc = (shader_desc_t){.bytecode = vs_bytes, .bytecode_size = vs_size, .is_source_code = false, .entry_point = "main", .stage = LPZ_SHADER_STAGE_VERTEX};
-        fs_desc = (shader_desc_t){.bytecode = fs_bytes, .bytecode_size = fs_size, .is_source_code = false, .entry_point = "main", .stage = LPZ_SHADER_STAGE_FRAGMENT};
+        // Single .metal file holds both vertex and fragment functions
+        vs_blob = shader_load_msl("../shaders/mesh.metal");
+        fs_blob = vs_blob;
     }
     else
     {
-        vs_desc = (shader_desc_t){.bytecode = shader_source, .bytecode_size = strlen(shader_source), .is_source_code = true, .entry_point = "vertex_main", .stage = LPZ_SHADER_STAGE_VERTEX};
-        fs_desc = (shader_desc_t){.bytecode = shader_source, .bytecode_size = strlen(shader_source), .is_source_code = true, .entry_point = "fragment_main", .stage = LPZ_SHADER_STAGE_FRAGMENT};
+        vs_blob = shader_load_spirv("../shaders/spv/mesh.vert.spv");
+        fs_blob = shader_load_spirv("../shaders/spv/mesh.frag.spv");
     }
 
-    lpz_shader_t vertex_shader;
-    Lpz.device.CreateShader(device, &vs_desc, &vertex_shader);
-    lpz_shader_t fragment_shader;
-    Lpz.device.CreateShader(device, &fs_desc, &fragment_shader);
+    if (!vs_blob.data || !fs_blob.data)
+    {
+        fprintf(stderr, "Failed to load shader files\n");
+        return 1;
+    }
 
-    if (vs_bytes)
-        free(vs_bytes);
-    if (fs_bytes)
-        free(fs_bytes);
+    // -------------------------------------------------------------------------
+    // 2b. Create shader objects on the GPU
+    //
+    // LpzShaderDesc tells the driver which stage this shader belongs to and
+    // what the entry-point function is called.
+    // -------------------------------------------------------------------------
+    LpzShaderDesc vert_desc = {
+        .bytecode = vs_blob.data,
+        .bytecode_size = vs_blob.size,
+        .is_source_code = false,
+        .entry_point = "main",
+        .stage = LPZ_SHADER_STAGE_VERTEX,
+    };
+    LpzShaderDesc frag_desc = {
+        .bytecode = fs_blob.data,
+        .bytecode_size = fs_blob.size,
+        .is_source_code = false,
+        .entry_point = "main",
+        .stage = LPZ_SHADER_STAGE_FRAGMENT,
+    };
 
-    // =========================================================================
-    // PIPELINE  — add the bind group layout so the texture slot is visible
-    // =========================================================================
-    printf("DEBUG: Creating Pipeline...\n");
-    vertex_binding_desc_t binding_desc = {.binding = 0, .stride = sizeof(LpzVertex), .input_rate = LPZ_VERTEX_INPUT_RATE_VERTEX};
-    vertex_attribute_desc_t attributes[] = {{.location = 0, .binding = 0, .format = LPZ_FORMAT_RGB32_FLOAT, .offset = offsetof(LpzVertex, position)},
-                                            {.location = 1, .binding = 0, .format = LPZ_FORMAT_RGB32_FLOAT, .offset = offsetof(LpzVertex, normal)},
-                                            {.location = 2, .binding = 0, .format = LPZ_FORMAT_RG32_FLOAT, .offset = offsetof(LpzVertex, uv)},
-                                            {.location = 3, .binding = 0, .format = LPZ_FORMAT_RGBA32_FLOAT, .offset = offsetof(LpzVertex, color)}};
+    if (use_metal)
+    {
+        // Metal takes MSL source text; entry points are named functions in the file
+        vert_desc.is_source_code = true;
+        vert_desc.entry_point = "vertex_main";
+        frag_desc.is_source_code = true;
+        frag_desc.entry_point = "fragment_main";
+    }
 
-    pipeline_desc_t pipe_desc = {
-        .vertex_shader = vertex_shader,
-        .fragment_shader = fragment_shader,
-        .color_attachment_format = Lpz.surface.GetFormat(surface),
+    if (Lpz.device.CreateShader(g_app.device, &vert_desc, &g_app.vert_shader) != LPZ_SUCCESS || Lpz.device.CreateShader(g_app.device, &frag_desc, &g_app.frag_shader) != LPZ_SUCCESS)
+    {
+        fprintf(stderr, "Failed to create shaders\n");
+        return 1;
+    }
+
+    // Free the CPU-side blobs — the driver has copied what it needs.
+    // For Metal both stages share the same blob, so only free vs_blob once.
+    shader_free(&vs_blob);
+    if (!use_metal)
+        shader_free(&fs_blob);
+
+    // -------------------------------------------------------------------------
+    // 2c. Describe the vertex layout
+    //
+    // The pipeline needs to know how the bytes in the vertex buffer map onto
+    // shader input attributes.
+    //
+    // LpzVertex layout (from LpzGeometry.h):
+    //   offset  0 → position[3]  = 12 bytes
+    //   offset 12 → normal[3]    = 12 bytes
+    //   offset 24 → uv[2]        =  8 bytes
+    //   offset 32 → color[4]     = 16 bytes
+    //   stride  48 bytes
+    // -------------------------------------------------------------------------
+    LpzVertexBindingDesc binding = {
+        .binding = 0,
+        .stride = sizeof(LpzVertex),
+        .input_rate = LPZ_VERTEX_INPUT_RATE_VERTEX,
+    };
+
+    LpzVertexAttributeDesc attributes[4] = {
+        // location 0: position (XYZ float)
+        {.location = 0, .binding = 0, .format = LPZ_FORMAT_RGB32_FLOAT, .offset = offsetof(LpzVertex, position)},
+        // location 1: normal (XYZ float)
+        {.location = 1, .binding = 0, .format = LPZ_FORMAT_RGB32_FLOAT, .offset = offsetof(LpzVertex, normal)},
+        // location 2: texture coords (UV float)
+        {.location = 2, .binding = 0, .format = LPZ_FORMAT_RG32_FLOAT, .offset = offsetof(LpzVertex, uv)},
+        // location 3: per-vertex colour (RGBA float)
+        {.location = 3, .binding = 0, .format = LPZ_FORMAT_RGBA32_FLOAT, .offset = offsetof(LpzVertex, color)},
+    };
+
+    // -------------------------------------------------------------------------
+    // 2d. Create the render pipeline
+    //
+    // The pipeline bakes together:
+    //   • Which shaders to use
+    //   • The vertex attribute layout (how to interpret vertex buffers)
+    //   • Attachment formats (what colour/depth formats the render pass uses)
+    //   • Rasterizer settings (culling, winding order)
+    //   • Blend state (alpha blending for transparency)
+    //
+    // Creating a pipeline is expensive — do it once at startup and reuse it
+    // every frame.
+    // -------------------------------------------------------------------------
+    LpzFormat swapchain_format = Lpz.surface.GetFormat(g_app.surface);
+
+    LpzPipelineDesc pipe_desc = {
+        .vertex_shader = g_app.vert_shader,
+        .fragment_shader = g_app.frag_shader,
+
+        // Tell the pipeline what colour format the render target uses.
+        // This must exactly match the format of the texture we render into.
+        .color_attachment_format = swapchain_format,
+        .color_attachment_formats = NULL,
+        .color_attachment_count = 0, // 0 → use the single format above
+
+        // Depth buffer format — must match the texture we created in 1g
         .depth_attachment_format = LPZ_FORMAT_DEPTH32_FLOAT,
-        .sample_count = MSAA_SAMPLES,
+
+        .sample_count = 1, // no MSAA
+
         .topology = LPZ_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-        .vertex_bindings = &binding_desc,
+        .vertex_bindings = &binding,
         .vertex_binding_count = 1,
         .vertex_attributes = attributes,
         .vertex_attribute_count = 4,
-        // Tell the pipeline about the texture binding so it can build the layout
-        .bind_group_layouts = &bind_group_layout,
-        .bind_group_layout_count = 1,
-        .rasterizer_state = {.cull_mode = LPZ_CULL_MODE_BACK, .front_face = LPZ_FRONT_FACE_CLOCKWISE, .wireframe = false},
-    };
-    lpz_pipeline_t pipeline;
-    Lpz.device.CreatePipeline(device, &pipe_desc, &pipeline);
 
-    // =========================================================================
-    // DEPTH / STENCIL STATE (unchanged)
-    // =========================================================================
-    printf("DEBUG: Creating Depth/Stencil State...\n");
-    depth_stencil_state_desc_t ds_desc = {.depth_test_enable = true, .depth_write_enable = true, .depth_compare_op = LPZ_COMPARE_OP_LESS};
-    lpz_depth_stencil_state_t depth_state;
-    Lpz.device.CreateDepthStencilState(device, &ds_desc, &depth_state);
+        // No bind groups: all per-draw data goes through push constants
+        .bind_group_layouts = NULL,
+        .bind_group_layout_count = 0,
 
-    // =========================================================================
-    // MAIN LOOP
-    // =========================================================================
-    printf("DEBUG: Entering Main Loop...\n");
-    float cam_yaw = 0.0f, cam_pitch = 0.5f, cam_radius = 4.0f;
-    LpzCamera3D camera = {.target = {0.0f, 0.0f, 0.0f}, .up = {0.0f, 1.0f, 0.0f}, .fov_y = 60.0f, .aspect_ratio = (float)win_width / (float)win_height, .near_plane = 0.1f, .far_plane = 100.0f};
-    double last_time = Lpz.window.GetTime();
-
-    while (!Lpz.window.ShouldClose(window))
-    {
-        Lpz.window.PollEvents();
-        if (Lpz.window.GetKey(window, LAPIZ_KEY_ESCAPE) == LPZ_KEY_PRESS)
-            break;
-
-        // 1. BEGIN FRAME — waits on GPU fence for this slot, safe to free GPU resources after this
-        Lpz.renderer.BeginFrame(renderer);
-
-        // 2. LOGIC & CAMERA
-        double current_time = Lpz.window.GetTime();
-        float dt = (float)(current_time - last_time);
-        last_time = current_time;
-        (void)dt;
-
-        cam_yaw += 0.5f * dt;
-
-        // Handle resize AFTER BeginFrame — the fence wait above guarantees the GPU is done
-        // with all resources from the previous frame, so it's safe to destroy and recreate.
-        if (Lpz.window.WasResized(window))
-        {
-            Lpz.window.GetFramebufferSize(window, &win_width, &win_height);
-            if (win_width > 0 && win_height > 0)
+        .rasterizer_state =
             {
-                Lpz.surface.Resize(surface, win_width, win_height);
-                RecreateRenderTargets(device, win_width, win_height);
-                camera.aspect_ratio = (float)win_width / (float)win_height;
-            }
-        }
+                .cull_mode = LPZ_CULL_MODE_BACK, // skip back-facing triangles
+                .front_face = LPZ_FRONT_FACE_COUNTER_CLOCKWISE,
+                .wireframe = false,
+            },
 
-        camera.position[0] = cam_radius * cosf(cam_pitch) * sinf(cam_yaw);
-        camera.position[1] = cam_radius * sinf(cam_pitch);
-        camera.position[2] = cam_radius * cosf(cam_pitch) * cosf(cam_yaw);
+        // Opaque blending — src replaces dst (no transparency)
+        .blend_state =
+            {
+                .blend_enable = false,
+                .write_mask = LPZ_COLOR_COMPONENT_ALL,
+            },
+    };
 
-        // 3. ACQUIRE IMAGE
-        if (!Lpz.surface.AcquireNextImage(surface))
-            continue;
-        lpz_texture_t target_texture = Lpz.surface.GetCurrentTexture(surface);
-        if (!g_msaa_texture || !g_depth_texture)
-            continue;
+    if (Lpz.device.CreatePipeline(g_app.device, &pipe_desc, &g_app.pipeline) != LPZ_SUCCESS)
+    {
+        fprintf(stderr, "Failed to create render pipeline\n");
+        return 1;
+    }
 
-        // 4. RENDER PASS SETUP
-        render_pass_color_attachment_t color_att = {.texture = g_msaa_texture, .resolve_texture = target_texture, .load_op = LPZ_LOAD_OP_CLEAR, .store_op = LPZ_STORE_OP_DONT_CARE, .clear_color = {0.1f, 0.1f, 0.1f, 1.0f}};
-        render_pass_depth_attachment_t depth_att = {.texture = g_depth_texture, .load_op = LPZ_LOAD_OP_CLEAR, .store_op = LPZ_STORE_OP_DONT_CARE, .clear_depth = 1.0f};
-        render_pass_desc_t pass_desc = {.color_attachments = &color_att, .color_attachment_count = 1, .depth_attachment = &depth_att};
-
-        LpzMat4 mvp_matrix;
-        LpzMath_GetCameraMatrix(&camera, mvp_matrix);
-
-        // 5. DRAW
-        Lpz.renderer.BeginRenderPass(renderer, &pass_desc);
-        Lpz.renderer.SetViewport(renderer, 0.0f, 0.0f, (float)win_width, (float)win_height, 0.0f, 1.0f);
-        Lpz.renderer.SetScissor(renderer, 0, 0, win_width, win_height);
-
-        Lpz.renderer.BindPipeline(renderer, pipeline);
-        Lpz.renderer.BindDepthStencilState(renderer, depth_state);
-
-        // Bind the texture at set=0 — must happen after BindPipeline
-        Lpz.renderer.BindBindGroup(renderer, 0, bind_group);
-
-        uint64_t offset = 0;
-        Lpz.renderer.BindVertexBuffers(renderer, 0, 1, &vertex_buffer, &offset);
-        Lpz.renderer.BindIndexBuffer(renderer, index_buffer, 0, LPZ_INDEX_TYPE_UINT16);
-        Lpz.renderer.PushConstants(renderer, LPZ_SHADER_STAGE_VERTEX, 0, sizeof(LpzMat4), mvp_matrix);
-        Lpz.renderer.DrawIndexed(renderer, 36, 1, 0, 0, 0);
-
-        Lpz.renderer.EndRenderPass(renderer);
-
-        // 6. SUBMIT
-        Lpz.renderer.Submit(renderer, surface);
+    // -------------------------------------------------------------------------
+    // 2e. Create the depth-stencil state
+    //
+    // Even though the pipeline was created with a depth attachment, Lapiz's
+    // Vulkan backend marks VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE as dynamic.
+    // That means the driver will NOT use the pipeline's baked depth settings;
+    // instead you must call BindDepthStencilState inside every render pass
+    // before any draw call so the driver knows depth testing is active.
+    //
+    // LPZ_COMPARE_OP_LESS: a fragment passes the depth test only if its depth
+    // value is strictly closer than the value already in the depth buffer.
+    // -------------------------------------------------------------------------
+    LpzDepthStencilStateDesc ds_desc = {
+        .depth_test_enable = true,
+        .depth_write_enable = true,
+        .depth_compare_op = LPZ_COMPARE_OP_LESS,
+        .stencil_test_enable = false,
+    };
+    if (Lpz.device.CreateDepthStencilState(g_app.device, &ds_desc, &g_app.depth_stencil_state) != LPZ_SUCCESS)
+    {
+        fprintf(stderr, "Failed to create depth-stencil state\n");
+        return 1;
     }
 
     // =========================================================================
-    // CLEANUP
+    // PHASE 3 — GEOMETRY UPLOAD
+    //
+    // Each shape gets its vertex and index data copied to the GPU.
+    // We use the predefined static arrays from LpzGeometry.h for simple shapes,
+    // and the procedural generators for the sphere and cylinder.
+    //
+    // Shapes and their colours:
+    //   [0] Cube      at (-3,  0, -5)  — coral red
+    //   [1] Prism     at ( 0,  0, -5)  — soft green
+    //   [2] Triangle  at ( 3,  0, -5)  — sky blue
+    //   [3] Sphere    at (-1.5, 2, -5) — golden yellow
+    //   [4] Cylinder  at ( 1.5, 2, -5) — violet
     // =========================================================================
-    printf("DEBUG: Shutting down...\n");
-    Lpz.device.WaitIdle(device);
+    g_app.shape_count = 5;
 
-    Lpz.device.DestroyBindGroup(bind_group);
-    Lpz.device.DestroyBindGroupLayout(bind_group_layout);
-    Lpz.device.DestroySampler(albedo_sampler);
-    Lpz.device.DestroyTexture(albedo_texture);
+    // -------------------------------------------------------------------------
+    // Shape 0: Cube (coral red)
+    // -------------------------------------------------------------------------
+    {
+        Shape *s = &g_app.shapes[0];
+        s->tint[0] = 0.96f;
+        s->tint[1] = 0.36f;
+        s->tint[2] = 0.26f;
+        s->tint[3] = 1.0f;
+        make_translation_matrix(-3.0f, 0.0f, -5.0f, s->model);
+        s->idx_count = 36;
+        s->idx_type = LPZ_INDEX_TYPE_UINT16;
 
-    Lpz.device.DestroyDepthStencilState(depth_state);
-    Lpz.device.DestroyTexture(g_msaa_texture);
-    Lpz.device.DestroyTexture(g_depth_texture);
-    Lpz.device.DestroyPipeline(pipeline);
-    Lpz.device.DestroyShader(vertex_shader);
-    Lpz.device.DestroyShader(fragment_shader);
-    Lpz.device.DestroyBuffer(vertex_buffer);
-    Lpz.device.DestroyBuffer(index_buffer);
+        if (!upload_mesh(LPZ_GEO_CUBE_VERTICES, 24, LPZ_GEO_CUBE_INDICES, 36, LPZ_INDEX_TYPE_UINT16, &s->gpu_vb, &s->gpu_ib))
+            return 1;
+    }
 
-    Lpz.surface.DestroySurface(surface);
-    Lpz.renderer.DestroyRenderer(renderer);
-    Lpz.device.Destroy(device);
+    // -------------------------------------------------------------------------
+    // Shape 1: Triangular prism (soft green)
+    // -------------------------------------------------------------------------
+    {
+        Shape *s = &g_app.shapes[1];
+        s->tint[0] = 0.38f;
+        s->tint[1] = 0.83f;
+        s->tint[2] = 0.44f;
+        s->tint[3] = 1.0f;
+        make_translation_matrix(0.0f, 0.0f, -5.0f, s->model);
+        s->idx_count = 24;
+        s->idx_type = LPZ_INDEX_TYPE_UINT16;
 
-    Lpz.window.DestroyWindow(window);
+        if (!upload_mesh(LPZ_GEO_PRISM_VERTICES, 6, LPZ_GEO_PRISM_INDICES, 24, LPZ_INDEX_TYPE_UINT16, &s->gpu_vb, &s->gpu_ib))
+            return 1;
+    }
+
+    // -------------------------------------------------------------------------
+    // Shape 2: Triangle (sky blue)
+    // -------------------------------------------------------------------------
+    {
+        Shape *s = &g_app.shapes[2];
+        s->tint[0] = 0.26f;
+        s->tint[1] = 0.65f;
+        s->tint[2] = 0.96f;
+        s->tint[3] = 1.0f;
+        make_translation_matrix(3.0f, 0.0f, -5.0f, s->model);
+        s->idx_count = 3;
+        s->idx_type = LPZ_INDEX_TYPE_UINT16;
+
+        if (!upload_mesh(LPZ_GEO_TRIANGLE_VERTICES, 3, LPZ_GEO_TRIANGLE_INDICES, 3, LPZ_INDEX_TYPE_UINT16, &s->gpu_vb, &s->gpu_ib))
+            return 1;
+    }
+
+    // -------------------------------------------------------------------------
+    // Shape 3: Procedural sphere (golden yellow)
+    // The sphere generator allocates heap memory — we must call FreeData after
+    // uploading to the GPU.
+    // -------------------------------------------------------------------------
+    {
+        Shape *s = &g_app.shapes[3];
+        s->tint[0] = 0.98f;
+        s->tint[1] = 0.76f;
+        s->tint[2] = 0.16f;
+        s->tint[3] = 1.0f;
+        make_translation_matrix(-1.5f, 2.0f, -5.0f, s->model);
+
+        LpzMeshData sphere = LpzGeometry_GenerateSphere(18, 36); // rings, sectors
+        s->idx_count = sphere.index_count;
+        s->idx_type = sphere.index_type;
+
+        if (!upload_mesh(sphere.vertices, sphere.vertex_count, sphere.indices, sphere.index_count, sphere.index_type, &s->gpu_vb, &s->gpu_ib))
+            return 1;
+
+        LpzGeometry_FreeData(&sphere); // release the CPU copy
+    }
+
+    // -------------------------------------------------------------------------
+    // Shape 4: Procedural cylinder (violet)
+    // -------------------------------------------------------------------------
+    {
+        Shape *s = &g_app.shapes[4];
+        s->tint[0] = 0.70f;
+        s->tint[1] = 0.32f;
+        s->tint[2] = 0.96f;
+        s->tint[3] = 1.0f;
+        make_translation_matrix(1.5f, 2.0f, -5.0f, s->model);
+
+        LpzMeshData cylinder = LpzGeometry_GenerateCylinder(32);
+        s->idx_count = cylinder.index_count;
+        s->idx_type = cylinder.index_type;
+
+        if (!upload_mesh(cylinder.vertices, cylinder.vertex_count, cylinder.indices, cylinder.index_count, cylinder.index_type, &s->gpu_vb, &s->gpu_ib))
+            return 1;
+
+        LpzGeometry_FreeData(&cylinder);
+    }
+
+    // =========================================================================
+    // PHASE 4 — CAMERA SETUP
+    // =========================================================================
+    //
+    // Place the camera 3 units above the origin, a couple of units back,
+    // looking slightly downward at the shapes.
+    g_app.camera = app_camera_create(0.0f, 2.0f, 2.0f, CAMERA_SPEED, CAMERA_SENS);
+    g_app.camera.pitch = -0.25f; // tilt slightly downward to see the shapes
+
+    g_app.last_time = Lpz.window.GetTime();
+
+    printf("Controls: WASD = move, Space/LShift = up/down, RMB drag = look, Esc = quit\n");
+    printf("Tip: run with --vulkan or --metal to switch backends\n");
+
+    // =========================================================================
+    // PHASE 5 — MAIN LOOP
+    //
+    // Each iteration of this loop is one rendered frame.
+    // The loop runs until the user closes the window or presses Escape.
+    // =========================================================================
+    while (!Lpz.window.ShouldClose(g_app.window))
+    {
+        // ── 5a. Poll OS events ──────────────────────────────────────────────
+        //
+        // This processes all pending window events (keyboard, mouse, resize …)
+        // and fires any callbacks we have registered.  Call it once per frame,
+        // before reading any input state.
+        Lpz.window.PollEvents();
+
+        // Exit cleanly when Escape is pressed
+        if (Lpz.window.GetKey(g_app.window, LPZ_KEY_ESCAPE) == LPZ_KEY_PRESS)
+            break;
+
+        // ── 5b. Compute delta time ───────────────────────────────────────────
+        //
+        // Delta time (dt) is the elapsed wall-clock time since the last frame,
+        // measured in seconds.  Multiplying movement speeds by dt makes the
+        // camera move at the same world-space rate regardless of frame rate.
+        double now = Lpz.window.GetTime();
+        float dt = (float)(now - g_app.last_time);
+        g_app.last_time = now;
+
+        // ── 5c. Handle window resize ─────────────────────────────────────────
+        //
+        // The resize callback sets needs_resize = true and stores the new size.
+        // We handle it here, at the start of a frame, when no GPU work is in
+        // flight, which keeps the resize logic simple and race-condition-free.
+        if (g_app.needs_resize)
+            handle_resize();
+
+        // ── 5d. Update camera ────────────────────────────────────────────────
+        //
+        // Reads input and updates the camera's position and orientation.
+        // Defined in app_camera.c — see that file for the full implementation.
+        app_camera_update(&g_app.camera, g_app.window, &Lpz.window, dt);
+
+        // Build the view-projection matrix for this frame
+        float aspect = (float)g_app.fb_width / (float)g_app.fb_height;
+        LpzMat4 view_proj;
+        app_camera_vp(&g_app.camera, aspect, FOV_Y, view_proj);
+
+        // ── 5e. Begin a new frame ────────────────────────────────────────────
+        //
+        // BeginFrame() advances the renderer's internal frame index and waits
+        // if the GPU still has work in flight from LPZ_MAX_FRAMES_IN_FLIGHT
+        // frames ago.  This implements "frames in flight" pipelining.
+        Lpz.renderer.BeginFrame(g_app.renderer);
+
+        // Ask the swap chain for the next image we can render into
+        if (!Lpz.surface.AcquireNextImage(g_app.surface))
+        {
+            // The surface became invalid (can happen on some drivers after a
+            // resize).  Skip this frame; the next PollEvents+resize will fix it.
+            continue;
+        }
+
+        // Retrieve the texture that corresponds to the acquired swap-chain image
+        lpz_texture_t swapchain_tex = Lpz.surface.GetCurrentTexture(g_app.surface);
+
+        // ── 5f. Describe the render pass ─────────────────────────────────────
+        //
+        // A render pass declares:
+        //   • Which textures to render into (colour attachments)
+        //   • What to do at the start (load_op): CLEAR wipes the texture,
+        //     LOAD preserves its previous contents, DONT_CARE is undefined.
+        //   • What to do at the end (store_op): STORE keeps the result,
+        //     DONT_CARE discards it (good for depth buffers).
+
+        LpzColorAttachment colour_att = {
+            .texture = swapchain_tex,
+            .resolve_texture = NULL, // no MSAA resolve
+            .load_op = LPZ_LOAD_OP_CLEAR,
+            .store_op = LPZ_STORE_OP_STORE,
+            .clear_color = {0.12f, 0.12f, 0.18f, 1.0f}, // dark navy background
+        };
+
+        LpzDepthAttachment depth_att = {
+            .texture = g_app.depth_texture,
+            .load_op = LPZ_LOAD_OP_CLEAR,
+            .store_op = LPZ_STORE_OP_DONT_CARE, // depth is not read after the pass
+            .clear_depth = 1.0f,                // 1.0 = far plane (clear to "infinity")
+            .clear_stencil = 0,
+        };
+
+        LpzRenderPassDesc pass_desc = {
+            .color_attachments = &colour_att,
+            .color_attachment_count = 1,
+            .depth_attachment = &depth_att,
+        };
+
+        // ── 5g. Record draw commands ─────────────────────────────────────────
+        Lpz.renderer.BeginRenderPass(g_app.renderer, &pass_desc);
+
+        // Set the viewport to fill the entire window.
+        // (0, 0) is the top-left corner; depth range [0, 1] is standard.
+        Lpz.renderer.SetViewport(g_app.renderer, 0.0f, 0.0f, (float)g_app.fb_width, (float)g_app.fb_height, 0.0f, 1.0f);
+
+        // Set the scissor rectangle (clips rasterisation to this region)
+        Lpz.renderer.SetScissor(g_app.renderer, 0, 0, g_app.fb_width, g_app.fb_height);
+
+        // Bind the pipeline — this sets the shaders, vertex layout, blend state,
+        // etc.  Every draw call after this uses the same pipeline until you
+        // call BindPipeline again with a different one.
+        Lpz.renderer.BindPipeline(g_app.renderer, g_app.pipeline);
+
+        // Bind the depth-stencil state so the Vulkan backend emits the required
+        // vkCmdSetDepthTestEnable (and related) dynamic-state commands before
+        // any draw.  Without this call the validation layer fires VUID-07843
+        // every frame because VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE is dynamic.
+        Lpz.renderer.BindDepthStencilState(g_app.renderer, g_app.depth_stencil_state);
+
+        // Draw each shape using the shared helper
+        for (uint32_t i = 0; i < g_app.shape_count; ++i)
+            draw_shape(&g_app.shapes[i], view_proj);
+
+        Lpz.renderer.EndRenderPass(g_app.renderer);
+
+        // ── 5h. Submit and present ───────────────────────────────────────────
+        //
+        // Submit() sends all recorded commands to the GPU and presents
+        // the finished image to the screen.
+        Lpz.renderer.Submit(g_app.renderer, g_app.surface);
+    }
+
+    // =========================================================================
+    // PHASE 6 — CLEANUP
+    //
+    // Always destroy GPU objects in roughly the reverse order of creation.
+    // WaitIdle() ensures no GPU work is still in flight before we start
+    // destroying objects — reading from a destroyed resource is undefined.
+    // =========================================================================
+    Lpz.device.WaitIdle(g_app.device);
+
+    // Free the per-shape GPU buffers
+    for (uint32_t i = 0; i < g_app.shape_count; ++i)
+    {
+        Lpz.device.DestroyBuffer(g_app.shapes[i].gpu_vb);
+        Lpz.device.DestroyBuffer(g_app.shapes[i].gpu_ib);
+    }
+
+    Lpz.device.DestroyTexture(g_app.depth_texture);
+    Lpz.device.DestroyDepthStencilState(g_app.depth_stencil_state);
+    Lpz.device.DestroyPipeline(g_app.pipeline);
+    Lpz.device.DestroyShader(g_app.vert_shader);
+    Lpz.device.DestroyShader(g_app.frag_shader);
+
+    Lpz.renderer.DestroyRenderer(g_app.renderer);
+    Lpz.surface.DestroySurface(g_app.surface);
+    Lpz.device.Destroy(g_app.device);
+
+    Lpz.window.DestroyWindow(g_app.window);
     Lpz.window.Terminate();
 
+    printf("Clean exit.\n");
     return 0;
 }

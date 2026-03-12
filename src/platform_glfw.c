@@ -21,7 +21,9 @@
 
 #define CHAR_QUEUE_SIZE 256
 
-// --- PRIVATE STRUCT ---
+// ============================================================================
+// PRIVATE STRUCT
+// ============================================================================
 struct window_t
 {
     GLFWwindow *handle;
@@ -39,7 +41,9 @@ struct window_t
     void *resize_userdata;
 };
 
-// --- CALLBACKS ---
+// ============================================================================
+// CALLBACKS
+// ============================================================================
 static void key_callback(GLFWwindow *gw, int key, int scancode, int action, int mods)
 {
     struct window_t *win = (struct window_t *)glfwGetWindowUserPointer(gw);
@@ -88,7 +92,9 @@ static void char_callback(GLFWwindow *gw, unsigned int codepoint)
     }
 }
 
-// --- IMPLEMENTATIONS ---
+// ============================================================================
+// IMPLEMENTATIONS
+// ============================================================================
 static bool lpz_glfw_init(void)
 {
     return glfwInit() == GLFW_TRUE;
@@ -175,7 +181,9 @@ static void lpz_glfw_get_mouse_position(lpz_window_t window, float *x, float *y)
         *y = window->mouse_y;
 }
 
-// --- NEW ADVANCED WINDOW FEATURES ---
+// ============================================================================
+// ADVANCED WINDOW FEATURES
+// ============================================================================
 static uint32_t lpz_glfw_pop_typed_char(lpz_window_t window)
 {
     if (!window || window->char_head == window->char_tail)
@@ -198,7 +206,9 @@ static double lpz_glfw_get_time(void)
     return glfwGetTime();
 }
 
-// --- NATIVE HANDLES ---
+// ============================================================================
+// NATIVE HANDLES
+// ============================================================================
 static void *lpz_glfw_get_native_handle(lpz_window_t window)
 {
     if (!window)
@@ -216,10 +226,11 @@ static void *lpz_glfw_get_native_handle(lpz_window_t window)
 #endif
     return NULL;
 }
-// --- VULKAN SURFACE HELPERS ---
-// These are the only functions that know about GLFW's Vulkan integration.
+// ============================================================================
+// VULKAN SURFACE HELPERS
 // The Vulkan backend calls these through the window API so it never needs
 // to include GLFW headers or link against GLFW's Vulkan extension loader.
+// ============================================================================
 
 static const char **lpz_glfw_get_required_vulkan_extensions(lpz_window_t window, uint32_t *out_count)
 {

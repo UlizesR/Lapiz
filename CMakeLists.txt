@@ -24,11 +24,32 @@ option(LAPIZ_BACKEND_METAL "Enable Metal Backend" ${APPLE}) # Defaults to ON if 
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
 add_subdirectory(external/glfw)
 
-set(CGLM_SHARED OFF CACHE BOOL "" FORCE)
+set(CGLM_USE_TEST OFF CACHE BOOL "" FORCE)
 set(CGLM_STATIC ON CACHE BOOL "" FORCE)
+set(CGLM_SHARED OFF CACHE BOOL "" FORCE)
+set(CGLM_USE_C99 OFF CACHE BOOL "" FORCE)
 add_subdirectory(external/cglm)
+
+set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_ALL_IMPORTERS_BY_DEFAULT OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_OBJ_IMPORTER ON CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_FBX_IMPORTER ON CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_GLTF_IMPORTER ON CACHE BOOL "" FORCE)
+set(ASSIMP_IGNORE_GIT_HASH ON CACHE BOOL "" FORCE)
+set(ASSIMP_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+add_subdirectory(external/assimp)
+
+set(FT_DISABLE_ZLIB ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_BZIP2 ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_PNG ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_HARFBUZZ ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_BROTLI ON CACHE BOOL "" FORCE)
+add_subdirectory(external/freetype)
 
 # ------------------------------------------------------------------------------
 # 3. CONFIGURE CORE ENGINE LIBRARY
@@ -37,7 +58,7 @@ set(LAPIZ_SOURCES
     src/platform_glfw.c
     src/LpzGeometry.c
 )
-set(LAPIZ_LIBS glfw cglm)
+set(LAPIZ_LIBS glfw cglm assimp freetype)
 
 # --- VULKAN BACKEND ---
 if(LAPIZ_BACKEND_VULKAN)
@@ -106,7 +127,63 @@ target_include_directories(Lapiz PUBLIC include)
 target_link_libraries(Lapiz PUBLIC ${LAPIZ_LIBS})
 
 # ------------------------------------------------------------------------------
-# 5. EXECUTABLE
+# 5. EXAMPLE HELPER LIBRARY
+#
+# app_camera.c and shader_loader.c live in examples/ but are shared utilities,
+# not standalone programs.  We compile them once into a small OBJECT library so
+# every example executable can link against them without recompiling.
+#
+# Add any future shared helper files to EXAMPLE_HELPER_SOURCES here.
 # ------------------------------------------------------------------------------
-add_executable(main_app examples/main.c)
-target_link_libraries(main_app PRIVATE Lapiz)
+set(EXAMPLE_HELPER_SOURCES
+    "${CMAKE_SOURCE_DIR}/examples/app_camera.c"
+    "${CMAKE_SOURCE_DIR}/examples/shader_loader.c"
+)
+
+# OBJECT libraries are not linked as archives — their compiled .o files are
+# merged directly into any target that links against $<TARGET_OBJECTS:...>.
+# This avoids the linker dropping "unused" translation units from a static lib.
+add_library(LapizExampleHelpers OBJECT ${EXAMPLE_HELPER_SOURCES})
+target_link_libraries(LapizExampleHelpers PUBLIC Lapiz)
+
+# ------------------------------------------------------------------------------
+# 6. EXECUTABLES
+#
+# Glob every .c file in examples/, strip out the shared helper sources, then
+# build each remaining file as a standalone executable.
+#
+# Output directory rules:
+#   main*.c  →  examples/bin/   (quick-launch binaries next to the source)
+#   all others  →  default CMake build tree (e.g. build/examples/shadertoy)
+# ------------------------------------------------------------------------------
+set(EXAMPLE_BIN_DIR "${CMAKE_SOURCE_DIR}/examples/bin")
+
+file(GLOB EXAMPLE_SOURCES "${CMAKE_SOURCE_DIR}/examples/*.c")
+
+# Remove shared helper files — they are not entry points
+list(REMOVE_ITEM EXAMPLE_SOURCES
+    "${CMAKE_SOURCE_DIR}/examples/app_camera.c"
+    "${CMAKE_SOURCE_DIR}/examples/shader_loader.c"
+)
+
+foreach(EXAMPLE_SRC ${EXAMPLE_SOURCES})
+    get_filename_component(EXAMPLE_NAME ${EXAMPLE_SRC} NAME_WE)
+
+    add_executable(${EXAMPLE_NAME} ${EXAMPLE_SRC})
+
+    target_link_libraries(${EXAMPLE_NAME} PRIVATE
+        Lapiz
+        LapizExampleHelpers
+    )
+
+    # Route main*.c executables to examples/bin/; leave all others in the
+    # default build tree. The MATCHES check uses a CMake regex: "^main"
+    # anchors to the start of the filename (without extension).
+    if(EXAMPLE_NAME MATCHES "^main")
+        set_target_properties(${EXAMPLE_NAME} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY         "${EXAMPLE_BIN_DIR}"
+            RUNTIME_OUTPUT_DIRECTORY_DEBUG   "${EXAMPLE_BIN_DIR}"
+            RUNTIME_OUTPUT_DIRECTORY_RELEASE "${EXAMPLE_BIN_DIR}"
+        )
+    endif()
+endforeach()
