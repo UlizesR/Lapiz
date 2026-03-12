@@ -223,11 +223,13 @@ struct mesh_pipeline_t
 
 struct bind_group_entry_t
 {
-    uint32_t index;
+    uint32_t index;       // Vulkan binding_index (used for layout lookup only)
+    uint32_t metal_slot;  // Metal type-namespace slot: 0th buffer→0, 0th texture→0, 0th sampler→0, etc.
     id<MTLTexture> texture;
     id<MTLSamplerState> sampler;
     id<MTLBuffer> buffer;
     uint64_t buffer_offset;
+    LpzShaderStage visibility; // which stage(s) this resource is bound to
 };
 
 // ----------------------------------------------------------------------------
@@ -268,6 +270,10 @@ struct io_command_queue_t
 struct bind_group_layout_t
 {
     uint32_t entry_count;
+    // Per-entry visibility and binding index, populated by CreateBindGroupLayout
+    // so CreateBindGroup can look up which stage each binding targets.
+    LpzShaderStage visibility[LPZ_MTL_MAX_BIND_ENTRIES];
+    uint32_t       binding_indices[LPZ_MTL_MAX_BIND_ENTRIES];
 };
 
 // LPZ_MTL_MAX_BIND_ENTRIES and bind_group_entry_t defined above.
@@ -1781,7 +1787,16 @@ static lpz_bind_group_layout_t lpz_device_create_bind_group_layout(lpz_device_t 
 {
     struct bind_group_layout_t *layout = (struct bind_group_layout_t *)calloc(1, sizeof(*layout));
     if (layout && desc)
-        layout->entry_count = desc->entry_count;
+    {
+        uint32_t count = (desc->entry_count < LPZ_MTL_MAX_BIND_ENTRIES)
+                         ? desc->entry_count : LPZ_MTL_MAX_BIND_ENTRIES;
+        layout->entry_count = count;
+        for (uint32_t i = 0; i < count; i++)
+        {
+            layout->binding_indices[i] = desc->entries[i].binding_index;
+            layout->visibility[i]      = desc->entries[i].visibility;
+        }
+    }
     return (lpz_bind_group_layout_t)layout;
 }
 
@@ -1798,22 +1813,52 @@ static lpz_bind_group_t lpz_device_create_bind_group(lpz_device_t device, const 
 
     uint32_t count = (desc->entry_count < LPZ_MTL_MAX_BIND_ENTRIES) ? desc->entry_count : LPZ_MTL_MAX_BIND_ENTRIES;
 
+    // Metal has independent slot namespaces for buffers, textures, and samplers.
+    // A binding_index of 2 on a sampler means "3rd Vulkan binding" — but Metal
+    // expects it in "sampler slot 0" if it's the first sampler in the group.
+    // We compute metal_slot as the ordinal position within each type.
+    uint32_t nextBufferSlot  = 0;
+    uint32_t nextTextureSlot = 0;
+    uint32_t nextSamplerSlot = 0;
+
     for (uint32_t i = 0; i < count; i++)
     {
         const LpzBindGroupEntry *e = &desc->entries[i];
         struct bind_group_entry_t *g = &group->entries[i];
         g->index = e->binding_index;
 
+        // Look up the visibility for this binding_index from the layout.
+        // Defaults to ALL if not found (safe fallback — binds to both stages).
+        g->visibility = LPZ_SHADER_STAGE_ALL;
+        if (desc->layout)
+        {
+            for (uint32_t j = 0; j < desc->layout->entry_count; j++)
+            {
+                if (desc->layout->binding_indices[j] == e->binding_index)
+                {
+                    g->visibility = desc->layout->visibility[j];
+                    break;
+                }
+            }
+        }
+
         if (e->texture && e->texture->texture)
-            g->texture = [e->texture->texture retain];
+        {
+            g->texture    = [e->texture->texture retain];
+            g->metal_slot = nextTextureSlot++;
+        }
         else if (e->sampler && e->sampler->sampler)
-            g->sampler = [e->sampler->sampler retain];
+        {
+            g->sampler    = [e->sampler->sampler retain];
+            g->metal_slot = nextSamplerSlot++;
+        }
         else if (e->buffer)
         {
             id<MTLBuffer> mb = lpz_buffer_get_mtl(e->buffer, 0);
             if (mb)
                 g->buffer = [mb retain];
             g->buffer_offset = 0;
+            g->metal_slot    = nextBufferSlot++;
         }
     }
     group->entry_count = count;
@@ -1927,18 +1972,18 @@ static struct argument_table_t *lpz_device_create_argument_table(lpz_device_t de
             const struct bind_group_entry_t *e = &table->entries[i];
             if (e->texture)
             {
-                [table->vertexTable setTexture:e->texture atIndex:e->index];
-                [table->fragmentTable setTexture:e->texture atIndex:e->index];
+                [table->vertexTable setTexture:e->texture atIndex:e->metal_slot];
+                [table->fragmentTable setTexture:e->texture atIndex:e->metal_slot];
             }
             else if (e->sampler)
             {
-                [table->vertexTable setSamplerState:e->sampler atIndex:e->index];
-                [table->fragmentTable setSamplerState:e->sampler atIndex:e->index];
+                [table->vertexTable setSamplerState:e->sampler atIndex:e->metal_slot];
+                [table->fragmentTable setSamplerState:e->sampler atIndex:e->metal_slot];
             }
             else if (e->buffer)
             {
-                [table->vertexTable setBuffer:e->buffer offset:(NSUInteger)e->buffer_offset atIndex:e->index];
-                [table->fragmentTable setBuffer:e->buffer offset:(NSUInteger)e->buffer_offset atIndex:e->index];
+                [table->vertexTable setBuffer:e->buffer offset:(NSUInteger)e->buffer_offset atIndex:e->metal_slot];
+                [table->fragmentTable setBuffer:e->buffer offset:(NSUInteger)e->buffer_offset atIndex:e->metal_slot];
             }
         }
     }
@@ -2606,12 +2651,30 @@ static void lpz_renderer_bind_bind_group(lpz_renderer_t renderer, uint32_t set, 
         for (uint32_t i = 0; i < bind_group->entry_count; i++)
         {
             const struct bind_group_entry_t *e = &bind_group->entries[i];
+            bool toVert = (e->visibility == LPZ_SHADER_STAGE_NONE)
+                       || (e->visibility & LPZ_SHADER_STAGE_VERTEX)
+                       || (e->visibility == LPZ_SHADER_STAGE_ALL_GRAPHICS)
+                       || (e->visibility == LPZ_SHADER_STAGE_ALL);
+            bool toFrag = (e->visibility == LPZ_SHADER_STAGE_NONE)
+                       || (e->visibility & LPZ_SHADER_STAGE_FRAGMENT)
+                       || (e->visibility == LPZ_SHADER_STAGE_ALL_GRAPHICS)
+                       || (e->visibility == LPZ_SHADER_STAGE_ALL);
+
             if (e->texture)
-                [renderer->currentEncoder setFragmentTexture:e->texture atIndex:e->index];
+            {
+                if (toVert) [renderer->currentEncoder setVertexTexture:e->texture   atIndex:e->metal_slot];
+                if (toFrag) [renderer->currentEncoder setFragmentTexture:e->texture atIndex:e->metal_slot];
+            }
             else if (e->sampler)
-                [renderer->currentEncoder setFragmentSamplerState:e->sampler atIndex:e->index];
+            {
+                if (toVert) [renderer->currentEncoder setVertexSamplerState:e->sampler   atIndex:e->metal_slot];
+                if (toFrag) [renderer->currentEncoder setFragmentSamplerState:e->sampler atIndex:e->metal_slot];
+            }
             else if (e->buffer)
-                [renderer->currentEncoder setFragmentBuffer:e->buffer offset:(NSUInteger)e->buffer_offset atIndex:e->index];
+            {
+                if (toVert) [renderer->currentEncoder setVertexBuffer:e->buffer   offset:(NSUInteger)e->buffer_offset atIndex:e->metal_slot];
+                if (toFrag) [renderer->currentEncoder setFragmentBuffer:e->buffer offset:(NSUInteger)e->buffer_offset atIndex:e->metal_slot];
+            }
         }
     }
     else if (renderer->currentComputeEncoder)
@@ -2620,11 +2683,11 @@ static void lpz_renderer_bind_bind_group(lpz_renderer_t renderer, uint32_t set, 
         {
             const struct bind_group_entry_t *e = &bind_group->entries[i];
             if (e->texture)
-                [renderer->currentComputeEncoder setTexture:e->texture atIndex:e->index];
+                [renderer->currentComputeEncoder setTexture:e->texture atIndex:e->metal_slot];
             else if (e->sampler)
-                [renderer->currentComputeEncoder setSamplerState:e->sampler atIndex:e->index];
+                [renderer->currentComputeEncoder setSamplerState:e->sampler atIndex:e->metal_slot];
             else if (e->buffer)
-                [renderer->currentComputeEncoder setBuffer:e->buffer offset:(NSUInteger)e->buffer_offset atIndex:e->index];
+                [renderer->currentComputeEncoder setBuffer:e->buffer offset:(NSUInteger)e->buffer_offset atIndex:e->metal_slot];
         }
     }
 }
@@ -2760,12 +2823,29 @@ static void lpz_renderer_bind_argument_table(lpz_renderer_t renderer, struct arg
         for (uint32_t i = 0; i < table->entry_count; i++)
         {
             const struct bind_group_entry_t *e = &table->entries[i];
+            bool toVert = (e->visibility == LPZ_SHADER_STAGE_NONE)
+                       || (e->visibility & LPZ_SHADER_STAGE_VERTEX)
+                       || (e->visibility == LPZ_SHADER_STAGE_ALL_GRAPHICS)
+                       || (e->visibility == LPZ_SHADER_STAGE_ALL);
+            bool toFrag = (e->visibility == LPZ_SHADER_STAGE_NONE)
+                       || (e->visibility & LPZ_SHADER_STAGE_FRAGMENT)
+                       || (e->visibility == LPZ_SHADER_STAGE_ALL_GRAPHICS)
+                       || (e->visibility == LPZ_SHADER_STAGE_ALL);
             if (e->texture)
-                [renderer->currentEncoder setFragmentTexture:e->texture atIndex:e->index];
+            {
+                if (toVert) [renderer->currentEncoder setVertexTexture:e->texture   atIndex:e->metal_slot];
+                if (toFrag) [renderer->currentEncoder setFragmentTexture:e->texture atIndex:e->metal_slot];
+            }
             else if (e->sampler)
-                [renderer->currentEncoder setFragmentSamplerState:e->sampler atIndex:e->index];
+            {
+                if (toVert) [renderer->currentEncoder setVertexSamplerState:e->sampler   atIndex:e->metal_slot];
+                if (toFrag) [renderer->currentEncoder setFragmentSamplerState:e->sampler atIndex:e->metal_slot];
+            }
             else if (e->buffer)
-                [renderer->currentEncoder setFragmentBuffer:e->buffer offset:(NSUInteger)e->buffer_offset atIndex:e->index];
+            {
+                if (toVert) [renderer->currentEncoder setVertexBuffer:e->buffer   offset:(NSUInteger)e->buffer_offset atIndex:e->metal_slot];
+                if (toFrag) [renderer->currentEncoder setFragmentBuffer:e->buffer offset:(NSUInteger)e->buffer_offset atIndex:e->metal_slot];
+            }
         }
     }
     else if (renderer->currentComputeEncoder)
@@ -2774,11 +2854,11 @@ static void lpz_renderer_bind_argument_table(lpz_renderer_t renderer, struct arg
         {
             const struct bind_group_entry_t *e = &table->entries[i];
             if (e->texture)
-                [renderer->currentComputeEncoder setTexture:e->texture atIndex:e->index];
+                [renderer->currentComputeEncoder setTexture:e->texture atIndex:e->metal_slot];
             else if (e->sampler)
-                [renderer->currentComputeEncoder setSamplerState:e->sampler atIndex:e->index];
+                [renderer->currentComputeEncoder setSamplerState:e->sampler atIndex:e->metal_slot];
             else if (e->buffer)
-                [renderer->currentComputeEncoder setBuffer:e->buffer offset:(NSUInteger)e->buffer_offset atIndex:e->index];
+                [renderer->currentComputeEncoder setBuffer:e->buffer offset:(NSUInteger)e->buffer_offset atIndex:e->metal_slot];
         }
     }
 }

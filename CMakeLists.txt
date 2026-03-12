@@ -57,6 +57,7 @@ add_subdirectory(external/freetype)
 set(LAPIZ_SOURCES
     src/platform_glfw.c
     src/LpzGeometry.c
+    src/LpzText.c
 )
 set(LAPIZ_LIBS glfw cglm assimp freetype)
 

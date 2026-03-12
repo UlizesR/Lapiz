@@ -160,6 +160,10 @@ struct bind_group_layout_t
     VkDescriptorSetLayout layout;
     lpz_device_t device;
     uint32_t binding_count;
+    // Stored so CreateBindGroup can choose the correct VkDescriptorType for
+    // both the pool and the write without heuristics.
+    LpzBindingType binding_types[32];
+    uint32_t       binding_indices[32];
 };
 
 struct bind_group_t
@@ -1946,6 +1950,16 @@ static lpz_bind_group_layout_t lpz_vk_device_create_bind_group_layout(lpz_device
     VkDescriptorSetLayoutCreateInfo info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = desc->entry_count, .pBindings = bindings};
     vkCreateDescriptorSetLayout(device->device, &info, NULL, &layout->layout);
     free(bindings);
+
+    // Store binding types and indices so CreateBindGroup can use them
+    // without relying on heuristics about which resource is bound where.
+    uint32_t store_count = (desc->entry_count < 32) ? desc->entry_count : 32;
+    for (uint32_t i = 0; i < store_count; i++)
+    {
+        layout->binding_indices[i] = desc->entries[i].binding_index;
+        layout->binding_types[i]   = desc->entries[i].type;
+    }
+
     return layout;
 }
 
@@ -1962,33 +1976,46 @@ static lpz_bind_group_t lpz_vk_device_create_bind_group(lpz_device_t device, con
     struct bind_group_t *group = calloc(1, sizeof(struct bind_group_t));
     group->device = device;
 
-    // The layout was already built with correct types in create_bind_group_layout.
-    // Count pool sizes by scanning the descriptor set layout's bindings via the
-    // bind_group_desc entries (which mirror the layout entries).
+    // Count pool sizes by walking the layout's stored binding types rather than
+    // guessing from which resource handle is non-null.  Guessing always treats
+    // buffers as UNIFORM_BUFFER which breaks storage buffers (e.g. the glyph SSBO).
     uint32_t count = desc->entry_count;
 
     uint32_t numUniformBuffer = 0, numStorageBuffer = 0;
     uint32_t numSampledImage = 0, numStorageImage = 0;
     uint32_t numSampler = 0, numCombinedImageSampler = 0;
 
+    // Helper: look up the layout type for a given binding_index.
+    // Returns LPZ_BINDING_TYPE_UNIFORM_BUFFER as a safe default.
+    struct bind_group_layout_t *bgl = desc->layout;
+
     for (uint32_t i = 0; i < count; i++)
     {
         const LpzBindGroupEntry *entry = &desc->entries[i];
-        if (entry->texture && entry->sampler)
+
+        // Find this entry's type from the layout.
+        LpzBindingType btype = LPZ_BINDING_TYPE_UNIFORM_BUFFER;
+        if (bgl)
         {
-            numCombinedImageSampler++;
+            for (uint32_t j = 0; j < bgl->binding_count; j++)
+            {
+                if (bgl->binding_indices[j] == entry->binding_index)
+                {
+                    btype = bgl->binding_types[j];
+                    break;
+                }
+            }
         }
-        else if (entry->texture)
+
+        switch (btype)
         {
-            numSampledImage++;
-        }
-        else if (entry->sampler)
-        {
-            numSampler++;
-        }
-        else if (entry->buffer)
-        {
-            numUniformBuffer++;
+            case LPZ_BINDING_TYPE_UNIFORM_BUFFER:          numUniformBuffer++;         break;
+            case LPZ_BINDING_TYPE_STORAGE_BUFFER:          numStorageBuffer++;         break;
+            case LPZ_BINDING_TYPE_TEXTURE:                 numSampledImage++;          break;
+            case LPZ_BINDING_TYPE_STORAGE_TEXTURE:         numStorageImage++;          break;
+            case LPZ_BINDING_TYPE_SAMPLER:                 numSampler++;               break;
+            case LPZ_BINDING_TYPE_COMBINED_IMAGE_SAMPLER:  numCombinedImageSampler++;  break;
+            default:                                        numUniformBuffer++;         break;
         }
     }
 
@@ -2033,28 +2060,62 @@ static lpz_bind_group_t lpz_vk_device_create_bind_group(lpz_device_t device, con
         writes[i].dstArrayElement = 0;
         writes[i].descriptorCount = 1;
 
-        if (entry->texture && entry->sampler)
+        // Look up the authoritative type from the layout.
+        LpzBindingType btype = LPZ_BINDING_TYPE_UNIFORM_BUFFER;
+        if (bgl)
+        {
+            for (uint32_t j = 0; j < bgl->binding_count; j++)
+            {
+                if (bgl->binding_indices[j] == entry->binding_index)
+                {
+                    btype = bgl->binding_types[j];
+                    break;
+                }
+            }
+        }
+
+        if (btype == LPZ_BINDING_TYPE_COMBINED_IMAGE_SAMPLER)
         {
             writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            imgInfos[i] = (VkDescriptorImageInfo){.imageView = entry->texture->imageView, .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, .sampler = entry->sampler->sampler};
+            imgInfos[i] = (VkDescriptorImageInfo){
+                .imageView   = entry->texture ? entry->texture->imageView : VK_NULL_HANDLE,
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                .sampler     = entry->sampler ? entry->sampler->sampler   : VK_NULL_HANDLE,
+            };
             writes[i].pImageInfo = &imgInfos[i];
         }
-        else if (entry->texture)
+        else if (btype == LPZ_BINDING_TYPE_TEXTURE)
         {
             writes[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
             imgInfos[i] = (VkDescriptorImageInfo){
-                .imageView = entry->texture->imageView,
+                .imageView   = entry->texture->imageView,
                 .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             };
             writes[i].pImageInfo = &imgInfos[i];
         }
-        else if (entry->sampler)
+        else if (btype == LPZ_BINDING_TYPE_STORAGE_TEXTURE)
+        {
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            imgInfos[i] = (VkDescriptorImageInfo){
+                .imageView   = entry->texture->imageView,
+                .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            };
+            writes[i].pImageInfo = &imgInfos[i];
+        }
+        else if (btype == LPZ_BINDING_TYPE_SAMPLER)
         {
             writes[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
             imgInfos[i] = (VkDescriptorImageInfo){.sampler = entry->sampler->sampler};
             writes[i].pImageInfo = &imgInfos[i];
         }
-        else if (entry->buffer)
+        else if (btype == LPZ_BINDING_TYPE_STORAGE_BUFFER)
+        {
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            VkBuffer vkBuf = entry->buffer->buffers[0];
+            bufInfos[i] = (VkDescriptorBufferInfo){.buffer = vkBuf, .offset = 0, .range = entry->buffer->size};
+            writes[i].pBufferInfo = &bufInfos[i];
+        }
+        else // UNIFORM_BUFFER (default)
         {
             writes[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             VkBuffer vkBuf = entry->buffer->buffers[0];
