@@ -57,3 +57,5 @@ dkms.conf
 build/
 build-*/
 .DS_Store
+old/
+examples/bin/

@@ -1,51 +1,38 @@
 cmake_minimum_required(VERSION 3.16)
+project(Lapiz VERSION 1.0 LANGUAGES C CXX)
 
-project(LAPIZ
-    VERSION 1.0.0
-    DESCRIPTION "Cross-platform C graphics library"
-    LANGUAGES C OBJC
-)
+# Only enable Objective-C if we are on Apple (for Metal)
+if(APPLE)
+    enable_language(OBJC)
+endif()
 
+# Require standard C11 and C++14
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Backend selection
-option(LAPIZ_OPENGL "Build with OpenGL backend" OFF)
-option(LAPIZ_METAL "Build with Metal backend" OFF)
-option(LAPIZ_VULKAN "Build with Vulkan backend" OFF)
+# ------------------------------------------------------------------------------
+# 1. BUILD OPTIONS (Switch APIs easily without commenting code out!)
+# ------------------------------------------------------------------------------
+option(LAPIZ_BACKEND_VULKAN "Enable Vulkan Backend" ON)
+option(LAPIZ_BACKEND_METAL "Enable Metal Backend" ${APPLE}) # Defaults to ON if on Mac
 
-# Default to one backend only if none explicitly chosen
-if(NOT LAPIZ_OPENGL AND NOT LAPIZ_METAL AND NOT LAPIZ_VULKAN)
-    if(APPLE)
-        set(LAPIZ_METAL ON CACHE BOOL "" FORCE)
-    else()
-        set(LAPIZ_OPENGL ON CACHE BOOL "" FORCE)
-    endif()
-endif()
-
-if(NOT LAPIZ_OPENGL AND NOT LAPIZ_METAL AND NOT LAPIZ_VULKAN)
-    message(FATAL_ERROR "Enable at least one backend: -DLAPIZ_OPENGL=ON, -DLAPIZ_METAL=ON, or -DLAPIZ_VULKAN=ON")
-endif()
-
-#-----------------------------------------------------------------------------
-# Dependencies
-#-----------------------------------------------------------------------------
-
-# cglm
-set(CGLM_USE_TEST OFF CACHE BOOL "" FORCE)
-set(CGLM_STATIC ON CACHE BOOL "" FORCE)
-set(CGLM_SHARED OFF CACHE BOOL "" FORCE)
-set(CGLM_USE_C99 OFF CACHE BOOL "" FORCE)
-add_subdirectory(external/cglm)
-
-# glfw
+# ------------------------------------------------------------------------------
+# 2. ADD SUBMODULES (GLFW & CGLM)
+# ------------------------------------------------------------------------------
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
 add_subdirectory(external/glfw)
 
-# assimp
+set(CGLM_USE_TEST OFF CACHE BOOL "" FORCE)
+set(CGLM_STATIC ON CACHE BOOL "" FORCE)
+set(CGLM_SHARED OFF CACHE BOOL "" FORCE)
+set(CGLM_USE_C99 OFF CACHE BOOL "" FORCE)
+add_subdirectory(external/cglm)
+
 set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_DOCS OFF CACHE BOOL "" FORCE)
@@ -57,159 +44,147 @@ set(ASSIMP_IGNORE_GIT_HASH ON CACHE BOOL "" FORCE)
 set(ASSIMP_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
 add_subdirectory(external/assimp)
 
-# glad (OpenGL loader + KHR/khrplatform.h)
-add_subdirectory(external/glad)
+set(FT_DISABLE_ZLIB ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_BZIP2 ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_PNG ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_HARFBUZZ ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_BROTLI ON CACHE BOOL "" FORCE)
+add_subdirectory(external/freetype)
 
-#-----------------------------------------------------------------------------
-# LAPIZ library
-#-----------------------------------------------------------------------------
-
-set(SRC_DIR ${CMAKE_SOURCE_DIR}/src)
-set(BACKEND_DIR ${SRC_DIR}/backends)
-
-file(GLOB_RECURSE SRCS "${SRC_DIR}/core/*.c" "${SRC_DIR}/graphics/*.c")
-
-# Window backend (GLFW) - always used
-list(APPEND SRCS "${BACKEND_DIR}/GLFW/glfw_window.c")
-
-if(LAPIZ_OPENGL)
-    file(GLOB_RECURSE BACKEND_SRCS "${BACKEND_DIR}/OpenGL/*.c")
-elseif(LAPIZ_METAL)
-    file(GLOB_RECURSE BACKEND_SRCS "${BACKEND_DIR}/Metal/*.c" "${BACKEND_DIR}/Metal/*.m")
-elseif(LAPIZ_VULKAN)
-    file(GLOB_RECURSE BACKEND_SRCS "${BACKEND_DIR}/Vulkan/*.c")
-endif()
-list(APPEND SRCS ${BACKEND_SRCS})
-
-add_library(LAPIZ ${SRCS})
-
-# Window backend: GLFW is the default (set LAPIZ_USE_OTHER_WINDOW for future alternatives)
-target_compile_definitions(LAPIZ PUBLIC LAPIZ_USE_GLFW=1)
-
-target_include_directories(LAPIZ PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
-    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/external/glad/include>
+# ------------------------------------------------------------------------------
+# 3. CONFIGURE CORE ENGINE LIBRARY
+# ------------------------------------------------------------------------------
+set(LAPIZ_SOURCES
+    src/platform_glfw.c
+    src/LpzGeometry.c
+    src/LpzText.c
 )
-target_include_directories(LAPIZ PRIVATE
-    ${CMAKE_SOURCE_DIR}/external/assimp/contrib/stb
-    ${CMAKE_SOURCE_DIR}/external/assimp/contrib
-)
+set(LAPIZ_LIBS glfw cglm assimp freetype)
 
-target_link_libraries(LAPIZ PUBLIC glfw cglm assimp)
-
-# Default shaders for library (OpenGL + Vulkan)
-if(LAPIZ_OPENGL OR LAPIZ_VULKAN)
-    find_program(GLSLC glslc)
-    find_program(PYTHON3 python3)
-    if(GLSLC AND PYTHON3)
-        file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/gen)
-        add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/gen/vk_default_shaders.h
-                           ${CMAKE_BINARY_DIR}/gen/default_shaders_gl.h
-            COMMAND ${PYTHON3} ${CMAKE_SOURCE_DIR}/scripts/compile_shaders.py
-                ${GLSLC} ${CMAKE_SOURCE_DIR}/shaders ${CMAKE_BINARY_DIR}/gen --default-only
-            DEPENDS ${CMAKE_SOURCE_DIR}/shaders/default.vert
-                   ${CMAKE_SOURCE_DIR}/shaders/default.frag
-            COMMENT "Compiling default shaders (OpenGL + Vulkan)"
-        )
-        add_custom_target(lapiz_shaders ALL DEPENDS
-            ${CMAKE_BINARY_DIR}/gen/vk_default_shaders.h
-            ${CMAKE_BINARY_DIR}/gen/default_shaders_gl.h
-        )
-        add_dependencies(LAPIZ lapiz_shaders)
-    endif()
-    target_include_directories(LAPIZ PRIVATE ${CMAKE_BINARY_DIR}/gen)
-endif()
-
-if(LAPIZ_OPENGL)
-    find_package(OpenGL REQUIRED)
-    target_compile_definitions(LAPIZ PUBLIC LAPIZ_OPENGL=1)
-    target_link_libraries(LAPIZ PUBLIC OpenGL::GL glad)
-    target_include_directories(LAPIZ PRIVATE ${CMAKE_SOURCE_DIR}/src/backends/OpenGL)
-elseif(LAPIZ_METAL)
-    target_compile_definitions(LAPIZ PUBLIC LAPIZ_METAL=1)
-elseif(LAPIZ_VULKAN)
+# --- VULKAN BACKEND ---
+if(LAPIZ_BACKEND_VULKAN)
     find_package(Vulkan REQUIRED)
-    option(LAPIZ_VK_VALIDATION "Enable Vulkan validation layers (debug)" ON)
-    target_compile_definitions(LAPIZ PUBLIC LAPIZ_VULKAN=1)
-    if(LAPIZ_VK_VALIDATION)
-        target_compile_definitions(LAPIZ PUBLIC LAPIZ_VK_VALIDATION=1)
-    endif()
-    target_link_libraries(LAPIZ PUBLIC Vulkan::Vulkan)
-    target_include_directories(LAPIZ PRIVATE
-        ${CMAKE_SOURCE_DIR}/src/backends/Vulkan
-        ${CMAKE_BINARY_DIR}/gen
-    )
-    # Vulkan uses vk_default_shaders.h from shared shader compilation above
-    if(NOT GLSLC OR NOT PYTHON3)
-        if(NOT EXISTS ${CMAKE_BINARY_DIR}/gen/vk_default_shaders.h)
-            message(WARNING "Vulkan shaders not found. Run: python3 scripts/compile_shaders.py $(which glslc) shaders build/gen")
-        endif()
-    endif()
+    
+    # --- macOS DYLD RPATH FIX FOR VULKAN ---
     if(APPLE)
-        # Vulkan links with @rpath; add library dir so dyld finds libvulkan.1.dylib
         get_target_property(VK_LIB Vulkan::Vulkan IMPORTED_LOCATION)
         if(VK_LIB)
             get_filename_component(VK_LIB_DIR ${VK_LIB} DIRECTORY)
-            set(CMAKE_BUILD_RPATH "${VK_LIB_DIR}" CACHE STRING "")
-            set(CMAKE_INSTALL_RPATH "${VK_LIB_DIR}" CACHE STRING "")
+            set(CMAKE_BUILD_RPATH "${VK_LIB_DIR}")
+            set(CMAKE_INSTALL_RPATH "${VK_LIB_DIR}")
         else()
-            set(CMAKE_BUILD_RPATH "/usr/local/lib" CACHE STRING "")
-            set(CMAKE_INSTALL_RPATH "/usr/local/lib" CACHE STRING "")
+            set(CMAKE_BUILD_RPATH "/usr/local/lib")
+            set(CMAKE_INSTALL_RPATH "/usr/local/lib")
         endif()
     endif()
+
+    list(APPEND LAPIZ_SOURCES src/vulkan_types.c)
+    list(APPEND LAPIZ_LIBS Vulkan::Vulkan)
+    add_compile_definitions(LAPIZ_HAS_VULKAN)
 endif()
 
-if(APPLE)
-    set(CMAKE_OBJC_FLAGS "${CMAKE_OBJC_FLAGS} -fobjc-arc -fno-objc-exceptions")
-    target_compile_options(glfw PRIVATE -fno-objc-arc)
-    find_library(COCOA_FRAMEWORK Cocoa REQUIRED)
-    find_library(METAL_FRAMEWORK Metal REQUIRED)
-    find_library(QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
-    target_link_libraries(LAPIZ PUBLIC ${COCOA_FRAMEWORK} ${METAL_FRAMEWORK} ${QUARTZCORE_FRAMEWORK})
+# --- METAL BACKEND ---
+if(LAPIZ_BACKEND_METAL AND APPLE)
+    find_library(FOUNDATION_FRAMEWORK Foundation)
+    find_library(QUARTZCORE_FRAMEWORK QuartzCore)
+    find_library(APPKIT_FRAMEWORK AppKit)
+    find_library(METAL_FRAMEWORK Metal)
+    
+    list(APPEND LAPIZ_SOURCES src/metal_types.m)
+    list(APPEND LAPIZ_LIBS 
+        ${FOUNDATION_FRAMEWORK} 
+        ${QUARTZCORE_FRAMEWORK} 
+        ${APPKIT_FRAMEWORK} 
+        ${METAL_FRAMEWORK}
+    )
+    add_compile_definitions(LAPIZ_HAS_METAL)
 endif()
 
-#-----------------------------------------------------------------------------
-# Example
-#-----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# 4. FORMAT TARGET
+# Scopes to only src/, include/, and examples/ — never touches external/
+# or anything generated in the build directory.
+# ------------------------------------------------------------------------------
+find_program(CLANG_FORMAT clang-format)
+if(CLANG_FORMAT)
+    file(GLOB_RECURSE FORMAT_SOURCES
+        "${CMAKE_SOURCE_DIR}/src/*.c"
+        "${CMAKE_SOURCE_DIR}/src/*.m"
+        "${CMAKE_SOURCE_DIR}/src/*.h"
+        "${CMAKE_SOURCE_DIR}/include/*.h"
+        "${CMAKE_SOURCE_DIR}/examples/*.c"
+        "${CMAKE_SOURCE_DIR}/examples/*.h"
+    )
+    add_custom_target(format
+        COMMAND ${CLANG_FORMAT} -i ${FORMAT_SOURCES}
+        COMMENT "Running clang-format on src/, include/, examples/..."
+        VERBATIM
+    )
+endif()
 
-option(LAPIZ_BUILD_EXAMPLE "Build example executable" ON)
-if(LAPIZ_BUILD_EXAMPLE)
-    add_executable(lapiz_example examples/main.c)
-    target_link_libraries(lapiz_example PRIVATE LAPIZ)
-    set_target_properties(lapiz_example PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-    # Copy shaders to build/shaders/ so example finds them next to exe.
-    file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/shaders)
-    file(GLOB _SHADER_FILES ${CMAKE_SOURCE_DIR}/shaders/*)
-    list(FILTER _SHADER_FILES EXCLUDE REGEX "ripple\\.(vert|frag)$")
-    foreach(_f ${_SHADER_FILES})
-        file(COPY ${_f} DESTINATION ${CMAKE_BINARY_DIR}/shaders)
-    endforeach()
-    # Ripple shader: example custom shader (not part of library)
-    if((LAPIZ_OPENGL OR LAPIZ_VULKAN) AND GLSLC AND PYTHON3)
-        add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/shaders/ripple.vert
-                           ${CMAKE_BINARY_DIR}/shaders/ripple.frag
-                           ${CMAKE_BINARY_DIR}/gen/ripple_vert.spv
-                           ${CMAKE_BINARY_DIR}/gen/ripple_frag.spv
-            COMMAND ${PYTHON3} ${CMAKE_SOURCE_DIR}/scripts/compile_shaders.py
-                ${GLSLC} ${CMAKE_SOURCE_DIR}/shaders ${CMAKE_BINARY_DIR}/gen
-                ${CMAKE_BINARY_DIR}/shaders
-            DEPENDS ${CMAKE_SOURCE_DIR}/shaders/ripple.vert
-                   ${CMAKE_SOURCE_DIR}/shaders/ripple.frag
-            COMMENT "Compiling ripple example shader"
-        )
-        add_custom_target(example_ripple_shaders DEPENDS
-            ${CMAKE_BINARY_DIR}/shaders/ripple.vert
-            ${CMAKE_BINARY_DIR}/shaders/ripple.frag
-            ${CMAKE_BINARY_DIR}/gen/ripple_vert.spv
-            ${CMAKE_BINARY_DIR}/gen/ripple_frag.spv
-        )
-        add_dependencies(lapiz_example example_ripple_shaders)
-        add_custom_command(TARGET lapiz_example POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                ${CMAKE_BINARY_DIR}/gen/ripple_vert.spv ${CMAKE_BINARY_DIR}/shaders/
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                ${CMAKE_BINARY_DIR}/gen/ripple_frag.spv ${CMAKE_BINARY_DIR}/shaders/
-            COMMENT "Copy ripple SPIR-V to shaders dir"
+# --- CREATE LAPIZ TARGET ---
+add_library(Lapiz STATIC ${LAPIZ_SOURCES})
+target_include_directories(Lapiz PUBLIC include)
+target_link_libraries(Lapiz PUBLIC ${LAPIZ_LIBS})
+
+# ------------------------------------------------------------------------------
+# 5. EXAMPLE HELPER LIBRARY
+#
+# app_camera.c and shader_loader.c live in examples/ but are shared utilities,
+# not standalone programs.  We compile them once into a small OBJECT library so
+# every example executable can link against them without recompiling.
+#
+# Add any future shared helper files to EXAMPLE_HELPER_SOURCES here.
+# ------------------------------------------------------------------------------
+set(EXAMPLE_HELPER_SOURCES
+    "${CMAKE_SOURCE_DIR}/examples/app_camera.c"
+    "${CMAKE_SOURCE_DIR}/examples/shader_loader.c"
+)
+
+# OBJECT libraries are not linked as archives — their compiled .o files are
+# merged directly into any target that links against $<TARGET_OBJECTS:...>.
+# This avoids the linker dropping "unused" translation units from a static lib.
+add_library(LapizExampleHelpers OBJECT ${EXAMPLE_HELPER_SOURCES})
+target_link_libraries(LapizExampleHelpers PUBLIC Lapiz)
+
+# ------------------------------------------------------------------------------
+# 6. EXECUTABLES
+#
+# Glob every .c file in examples/, strip out the shared helper sources, then
+# build each remaining file as a standalone executable.
+#
+# Output directory rules:
+#   main*.c  →  examples/bin/   (quick-launch binaries next to the source)
+#   all others  →  default CMake build tree (e.g. build/examples/shadertoy)
+# ------------------------------------------------------------------------------
+set(EXAMPLE_BIN_DIR "${CMAKE_SOURCE_DIR}/examples/bin")
+
+file(GLOB EXAMPLE_SOURCES "${CMAKE_SOURCE_DIR}/examples/*.c")
+
+# Remove shared helper files — they are not entry points
+list(REMOVE_ITEM EXAMPLE_SOURCES
+    "${CMAKE_SOURCE_DIR}/examples/app_camera.c"
+    "${CMAKE_SOURCE_DIR}/examples/shader_loader.c"
+)
+
+foreach(EXAMPLE_SRC ${EXAMPLE_SOURCES})
+    get_filename_component(EXAMPLE_NAME ${EXAMPLE_SRC} NAME_WE)
+
+    add_executable(${EXAMPLE_NAME} ${EXAMPLE_SRC})
+
+    target_link_libraries(${EXAMPLE_NAME} PRIVATE
+        Lapiz
+        LapizExampleHelpers
+    )
+
+    # Route main*.c executables to examples/bin/; leave all others in the
+    # default build tree. The MATCHES check uses a CMake regex: "^main"
+    # anchors to the start of the filename (without extension).
+    if(EXAMPLE_NAME MATCHES "^main")
+        set_target_properties(${EXAMPLE_NAME} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY         "${EXAMPLE_BIN_DIR}"
+            RUNTIME_OUTPUT_DIRECTORY_DEBUG   "${EXAMPLE_BIN_DIR}"
+            RUNTIME_OUTPUT_DIRECTORY_RELEASE "${EXAMPLE_BIN_DIR}"
         )
     endif()
-endif()
+endforeach()
