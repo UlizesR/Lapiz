@@ -18,11 +18,10 @@
 //   ./shadertoy --metal    — Metal  (explicit)
 // =============================================================================
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "../include/LPZ/Lpz.h"
+#include "Lpz.h"
 
 #include "shader_loader.h"
 
@@ -44,8 +43,7 @@ LpzAPI Lpz = {0};
 //
 // Total: 12 bytes  (3 × float)
 // =============================================================================
-typedef struct
-{
+typedef struct {
     float time;
     float res_x;
     float res_y;
@@ -54,8 +52,7 @@ typedef struct
 // =============================================================================
 // APPLICATION STATE
 // =============================================================================
-typedef struct
-{
+typedef struct {
     lpz_window_t window;
     lpz_device_t device;
     lpz_surface_t surface;
@@ -125,7 +122,7 @@ int main(int argc, char **argv)
 #if defined(LAPIZ_HAS_VULKAN)
             use_metal = false;
 #else
-            fprintf(stderr, "This build was compiled without Vulkan support.\n");
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "This build was compiled without Vulkan support.");
             return 1;
 #endif
         }
@@ -134,27 +131,27 @@ int main(int argc, char **argv)
 #if defined(LAPIZ_HAS_METAL)
             use_metal = true;
 #else
-            fprintf(stderr, "This build was compiled without Metal support.\n");
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "This build was compiled without Metal support.");
             return 1;
 #endif
         }
         else
         {
-            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-            fprintf(stderr, "Usage: %s [--vulkan | --metal]\n", argv[0]);
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Unknown argument: %s", argv[i]);
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Usage: %s [--vulkan | --metal]", argv[0]);
             return 1;
         }
     }
 
     if (use_metal)
     {
-        Lpz = LpzMetal;
-        printf("Backend: Metal\n");
+        Lpz = LPZ_MAKE_API_METAL();
+        LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "Backend: Metal");
     }
     else
     {
-        Lpz = LpzVulkan;
-        printf("Backend: Vulkan\n");
+        Lpz = LPZ_MAKE_API_VULKAN();
+        LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "Backend: Vulkan");
     }
     Lpz.window = LpzWindow_GLFW;
 
@@ -164,14 +161,14 @@ int main(int argc, char **argv)
 
     if (!Lpz.window.Init())
     {
-        fprintf(stderr, "Failed to initialise the window system\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to initialise the window system");
         return 1;
     }
 
     g_app.window = Lpz.window.CreateWindow("Lapiz — Shadertoy", 800, 600);
     if (!g_app.window)
     {
-        fprintf(stderr, "Failed to create window\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create window");
         return 1;
     }
 
@@ -180,10 +177,10 @@ int main(int argc, char **argv)
 
     if (Lpz.device.Create(&g_app.device) != LPZ_SUCCESS)
     {
-        fprintf(stderr, "Failed to create GPU device\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create GPU device");
         return 1;
     }
-    printf("GPU: %s\n", Lpz.device.GetName(g_app.device));
+    LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "GPU: %s", Lpz.device.GetName(g_app.device));
 
     LpzSurfaceDesc surf_desc = {
         .window = g_app.window,
@@ -194,14 +191,14 @@ int main(int argc, char **argv)
     g_app.surface = Lpz.surface.CreateSurface(g_app.device, &surf_desc);
     if (!g_app.surface)
     {
-        fprintf(stderr, "Failed to create surface\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create surface");
         return 1;
     }
 
     g_app.renderer = Lpz.renderer.CreateRenderer(g_app.device);
     if (!g_app.renderer)
     {
-        fprintf(stderr, "Failed to create renderer\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create renderer");
         return 1;
     }
 
@@ -220,7 +217,7 @@ int main(int argc, char **argv)
     if (use_metal)
     {
         vs_blob = shader_load_msl("../shaders/fullscreen.metal");
-        fs_blob = vs_blob; // both stages live in the same .metal file
+        fs_blob = vs_blob;  // both stages live in the same .metal file
     }
     else
     {
@@ -230,7 +227,7 @@ int main(int argc, char **argv)
 
     if (!vs_blob.data || !fs_blob.data)
     {
-        fprintf(stderr, "Failed to load shader files\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to load shader files");
         return 1;
     }
 
@@ -259,7 +256,7 @@ int main(int argc, char **argv)
 
     if (Lpz.device.CreateShader(g_app.device, &vert_desc, &g_app.vert_shader) != LPZ_SUCCESS || Lpz.device.CreateShader(g_app.device, &frag_desc, &g_app.frag_shader) != LPZ_SUCCESS)
     {
-        fprintf(stderr, "Failed to create shaders\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create shaders");
         return 1;
     }
 
@@ -284,12 +281,12 @@ int main(int argc, char **argv)
         .fragment_shader = g_app.frag_shader,
 
         .color_attachment_format = swapchain_format,
-        .depth_attachment_format = LPZ_FORMAT_UNDEFINED, // no depth buffer
+        .depth_attachment_format = LPZ_FORMAT_UNDEFINED,  // no depth buffer
 
         .sample_count = 1,
 
         .topology = LPZ_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-        .vertex_bindings = NULL, // no vertex buffers
+        .vertex_bindings = NULL,  // no vertex buffers
         .vertex_binding_count = 0,
         .vertex_attributes = NULL,
         .vertex_attribute_count = 0,
@@ -299,7 +296,7 @@ int main(int argc, char **argv)
 
         .rasterizer_state =
             {
-                .cull_mode = LPZ_CULL_MODE_NONE, // single big triangle; culling irrelevant
+                .cull_mode = LPZ_CULL_MODE_NONE,  // single big triangle; culling irrelevant
                 .front_face = LPZ_FRONT_FACE_COUNTER_CLOCKWISE,
                 .wireframe = false,
             },
@@ -313,7 +310,7 @@ int main(int argc, char **argv)
 
     if (Lpz.device.CreatePipeline(g_app.device, &pipe_desc, &g_app.pipeline) != LPZ_SUCCESS)
     {
-        fprintf(stderr, "Failed to create render pipeline\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create render pipeline");
         return 1;
     }
 
@@ -330,7 +327,7 @@ int main(int argc, char **argv)
     };
     if (Lpz.device.CreateDepthStencilState(g_app.device, &ds_desc, &g_app.depth_stencil_state) != LPZ_SUCCESS)
     {
-        fprintf(stderr, "Failed to create depth-stencil state\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create depth-stencil state");
         return 1;
     }
 
@@ -338,7 +335,7 @@ int main(int argc, char **argv)
     // PHASE 5 — MAIN LOOP
     // =========================================================================
     g_app.start_time = Lpz.window.GetTime();
-    printf("Press Escape to quit\n");
+    LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "Press Escape to quit");
 
     while (!Lpz.window.ShouldClose(g_app.window))
     {
@@ -381,7 +378,7 @@ int main(int argc, char **argv)
         LpzRenderPassDesc pass_desc = {
             .color_attachments = &colour_att,
             .color_attachment_count = 1,
-            .depth_attachment = NULL, // no depth buffer for this pass
+            .depth_attachment = NULL,  // no depth buffer for this pass
         };
 
         Lpz.renderer.BeginRenderPass(g_app.renderer, &pass_desc);
@@ -427,6 +424,6 @@ int main(int argc, char **argv)
     Lpz.window.DestroyWindow(g_app.window);
     Lpz.window.Terminate();
 
-    printf("Clean exit.\n");
+    LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "Clean exit.");
     return 0;
 }

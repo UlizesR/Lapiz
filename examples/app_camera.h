@@ -1,8 +1,7 @@
 #ifndef APP_CAMERA_H
 #define APP_CAMERA_H
 
-#include "../include/LPZ/LpzTypes.h"
-#include "../include/LPZ/LpzMath.h"
+#include "../include/Lpz.h"
 
 // =============================================================================
 // app_camera.h — First-person camera for the Lapiz demo
@@ -21,8 +20,7 @@
 // to upload as part of the push-constant MVP.
 // =============================================================================
 
-typedef struct
-{
+typedef struct {
     // -------------------------------------------------------------------------
     // Orientation expressed as Euler angles (radians).
     // Yaw   = horizontal rotation around the world Y axis.
@@ -45,7 +43,7 @@ typedef struct
     // -------------------------------------------------------------------------
     float prev_mouse_x;
     float prev_mouse_y;
-    bool rmb_was_down; // was the right mouse button down last frame?
+    bool rmb_was_down;  // was the right mouse button down last frame?
 } AppCamera;
 
 // ---------------------------------------------------------------------------
@@ -75,4 +73,4 @@ void app_camera_update(AppCamera *cam, lpz_window_t window, const LpzWindowAPI *
 // ---------------------------------------------------------------------------
 void app_camera_vp(const AppCamera *cam, float aspect_ratio, float fov_y_deg, LpzMat4 out_vp);
 
-#endif // APP_CAMERA_H
+#endif  // APP_CAMERA_H

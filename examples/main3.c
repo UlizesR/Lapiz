@@ -28,16 +28,14 @@
 //
 // =============================================================================
 
-#include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
 
-#include "../include/LPZ/Lpz.h"
-#include "../include/LPZ/LpzMath.h"
+#include "Lpz.h"
 
-#include "shader_loader.h"
 #include "app_camera.h"
+#include "shader_loader.h"
 
 // =============================================================================
 // GLOBAL DISPATCH TABLE
@@ -52,14 +50,14 @@ LpzAPI Lpz = {0};
 #define WINDOW_WIDTH 800
 #define WINDOW_HEIGHT 600
 
-#define CAMERA_SPEED 6.0f  // world units per second
-#define CAMERA_SENS 0.003f // radians per mouse pixel
-#define FOV_Y 60.0f        // vertical field-of-view in degrees
+#define CAMERA_SPEED 6.0f   // world units per second
+#define CAMERA_SENS 0.003f  // radians per mouse pixel
+#define FOV_Y 60.0f         // vertical field-of-view in degrees
 
-#define NUM_RING_CUBES 8               // cubes arranged in a circle
-#define RING_RADIUS 4.5f               // circle radius
-#define RING_Z_OFFSET -8.0f            // shift the whole ring away from the origin
-#define NUM_CUBES (NUM_RING_CUBES + 1) // +1 centre cube
+#define NUM_RING_CUBES 8                // cubes arranged in a circle
+#define RING_RADIUS 4.5f                // circle radius
+#define RING_Z_OFFSET -8.0f             // shift the whole ring away from the origin
+#define NUM_CUBES (NUM_RING_CUBES + 1)  // +1 centre cube
 
 // =============================================================================
 // PUSH CONSTANT LAYOUT
@@ -72,11 +70,10 @@ LpzAPI Lpz = {0};
 // [[buffer(7)]] struct in cube_shadertoy.metal exactly.
 // =============================================================================
 
-typedef struct
-{
-    float mvp[4][4]; // Model-View-Projection — consumed by the vertex stage
-    float time;      // animation time         — consumed by the fragment stage
-} CubeEffectPC;      // 68 bytes
+typedef struct {
+    float mvp[4][4];  // Model-View-Projection — consumed by the vertex stage
+    float time;       // animation time         — consumed by the fragment stage
+} CubeEffectPC;       // 68 bytes
 
 // =============================================================================
 // CUBE DESCRIPTION
@@ -88,8 +85,7 @@ typedef struct
 //   spin_speed  — radians per second (each cube has its own rate)
 //   spin_phase  — initial angle offset so they don't all start aligned
 // =============================================================================
-typedef struct
-{
+typedef struct {
     lpz_buffer_t gpu_vb;
     lpz_buffer_t gpu_ib;
     float pos[3];
@@ -101,8 +97,7 @@ typedef struct
 // =============================================================================
 // APPLICATION STATE
 // =============================================================================
-typedef struct
-{
+typedef struct {
     lpz_window_t window;
     lpz_device_t device;
     lpz_surface_t surface;
@@ -112,7 +107,7 @@ typedef struct
     lpz_shader_t cube_vert_shader;
     lpz_shader_t cube_frag_shader;
     lpz_pipeline_t cube_pipeline;
-    lpz_depth_stencil_state_t cube_ds_state; // depth testing ON
+    lpz_depth_stencil_state_t cube_ds_state;  // depth testing ON
 
     // Depth texture — only used by the cube pass.
     // Recreated on resize.
@@ -168,7 +163,7 @@ static lpz_texture_t create_depth_texture(lpz_device_t device, uint32_t w, uint3
     };
     lpz_texture_t tex = NULL;
     if (Lpz.device.CreateTexture(device, &desc, &tex) != LPZ_SUCCESS)
-        fprintf(stderr, "Failed to create depth texture (%u × %u)\n", w, h);
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create depth texture (%u × %u)", w, h);
     return tex;
 }
 
@@ -200,7 +195,7 @@ static bool upload_mesh(const LpzVertex *vertices, uint32_t vert_count, const vo
     };
     if (Lpz.device.CreateBuffer(g_app.device, &vb_desc, out_vb) != LPZ_SUCCESS || Lpz.device.CreateBuffer(g_app.device, &ib_desc, out_ib) != LPZ_SUCCESS)
     {
-        fprintf(stderr, "Failed to create GPU vertex/index buffers\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create GPU vertex/index buffers");
         return false;
     }
 
@@ -210,7 +205,7 @@ static bool upload_mesh(const LpzVertex *vertices, uint32_t vert_count, const vo
     LpzBufferDesc si_desc = {.size = ib_size, .usage = LPZ_BUFFER_USAGE_TRANSFER_SRC, .memory_usage = LPZ_MEMORY_USAGE_CPU_TO_GPU};
     if (Lpz.device.CreateBuffer(g_app.device, &sv_desc, &sv) != LPZ_SUCCESS || Lpz.device.CreateBuffer(g_app.device, &si_desc, &si) != LPZ_SUCCESS)
     {
-        fprintf(stderr, "Failed to create staging buffers\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create staging buffers");
         return false;
     }
 
@@ -335,7 +330,7 @@ int main(int argc, char **argv)
 #if defined(LAPIZ_HAS_VULKAN)
             use_metal = false;
 #else
-            fprintf(stderr, "This build was compiled without Vulkan support.\n");
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "This build was compiled without Vulkan support.");
             return 1;
 #endif
         }
@@ -344,35 +339,35 @@ int main(int argc, char **argv)
 #if defined(LAPIZ_HAS_METAL)
             use_metal = true;
 #else
-            fprintf(stderr, "This build was compiled without Metal support.\n");
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "This build was compiled without Metal support.");
             return 1;
 #endif
         }
         else
         {
-            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-            fprintf(stderr, "Usage: %s [--vulkan | --metal]\n", argv[0]);
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Unknown argument: %s", argv[i]);
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Usage: %s [--vulkan | --metal]", argv[0]);
             return 1;
         }
     }
 
-    Lpz = use_metal ? LpzMetal : LpzVulkan;
+    Lpz = use_metal ? LPZ_MAKE_API_METAL() : LPZ_MAKE_API_VULKAN();
     Lpz.window = LpzWindow_GLFW;
-    printf("Backend: %s\n", use_metal ? "Metal" : "Vulkan");
+    LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "Backend: %s", use_metal ? "Metal" : "Vulkan");
 
     // -------------------------------------------------------------------------
     // 1b–1g. Window / device / surface / renderer / depth texture
     // -------------------------------------------------------------------------
     if (!Lpz.window.Init())
     {
-        fprintf(stderr, "Failed to initialise the window system\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to initialise the window system");
         return 1;
     }
 
     g_app.window = Lpz.window.CreateWindow(WINDOW_TITLE, WINDOW_WIDTH, WINDOW_HEIGHT);
     if (!g_app.window)
     {
-        fprintf(stderr, "Failed to create window\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create window");
         return 1;
     }
 
@@ -381,10 +376,10 @@ int main(int argc, char **argv)
 
     if (Lpz.device.Create(&g_app.device) != LPZ_SUCCESS)
     {
-        fprintf(stderr, "Failed to create GPU device\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create GPU device");
         return 1;
     }
-    printf("GPU: %s\n", Lpz.device.GetName(g_app.device));
+    LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "GPU: %s", Lpz.device.GetName(g_app.device));
 
     LpzSurfaceDesc surf_desc = {
         .window = g_app.window,
@@ -395,14 +390,14 @@ int main(int argc, char **argv)
     g_app.surface = Lpz.surface.CreateSurface(g_app.device, &surf_desc);
     if (!g_app.surface)
     {
-        fprintf(stderr, "Failed to create surface\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create surface");
         return 1;
     }
 
     g_app.renderer = Lpz.renderer.CreateRenderer(g_app.device);
     if (!g_app.renderer)
     {
-        fprintf(stderr, "Failed to create renderer\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create renderer");
         return 1;
     }
 
@@ -428,7 +423,7 @@ int main(int argc, char **argv)
         }
         if (!vs.data || !fs.data)
         {
-            fprintf(stderr, "Failed to load cube_shadertoy shader files\n");
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to load cube_shadertoy shader files");
             return 1;
         }
 
@@ -455,7 +450,7 @@ int main(int argc, char **argv)
 
         if (Lpz.device.CreateShader(g_app.device, &vd, &g_app.cube_vert_shader) != LPZ_SUCCESS || Lpz.device.CreateShader(g_app.device, &fd, &g_app.cube_frag_shader) != LPZ_SUCCESS)
         {
-            fprintf(stderr, "Failed to create cube shaders\n");
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create cube shaders");
             return 1;
         }
         shader_free(&vs);
@@ -500,7 +495,7 @@ int main(int argc, char **argv)
         };
         if (Lpz.device.CreatePipeline(g_app.device, &pd, &g_app.cube_pipeline) != LPZ_SUCCESS)
         {
-            fprintf(stderr, "Failed to create cube pipeline\n");
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create cube pipeline");
             return 1;
         }
 
@@ -513,7 +508,7 @@ int main(int argc, char **argv)
         };
         if (Lpz.device.CreateDepthStencilState(g_app.device, &ds, &g_app.cube_ds_state) != LPZ_SUCCESS)
         {
-            fprintf(stderr, "Failed to create cube depth-stencil state\n");
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create cube depth-stencil state");
             return 1;
         }
     }
@@ -541,7 +536,7 @@ int main(int argc, char **argv)
             Cube *c = &g_app.cubes[i];
             if (!upload_mesh(LPZ_GEO_CUBE_VERTICES, 24, LPZ_GEO_CUBE_INDICES, 36, LPZ_INDEX_TYPE_UINT16, &c->gpu_vb, &c->gpu_ib))
             {
-                fprintf(stderr, "Failed to upload geometry for cube %d\n", i);
+                LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to upload geometry for cube %d", i);
                 return 1;
             }
         }
@@ -559,21 +554,21 @@ int main(int argc, char **argv)
 
             // Rotate each cube around a slightly tilted Y axis so they don't
             // look like they're all spinning on the same perfect vertical axle.
-            c->spin_axis[0] = 0.15f * sinf(angle); // small X component
-            c->spin_axis[1] = 1.0f;                // mostly Y
-            c->spin_axis[2] = 0.15f * cosf(angle); // small Z component
-            glm_vec3_normalize(c->spin_axis);      // unit vector required
+            c->spin_axis[0] = 0.15f * sinf(angle);  // small X component
+            c->spin_axis[1] = 1.0f;                 // mostly Y
+            c->spin_axis[2] = 0.15f * cosf(angle);  // small Z component
+            glm_vec3_normalize(c->spin_axis);       // unit vector required
 
             // Each cube gets a unique spin speed and phase so they're never in sync.
             c->spin_speed = 0.4f + 0.25f * (float)i;
-            c->spin_phase = angle; // spread their starting angles around the rotation
+            c->spin_phase = angle;  // spread their starting angles around the rotation
         }
 
         // ---- Centre cube [8] ----
         {
             Cube *c = &g_app.cubes[NUM_RING_CUBES];
             c->pos[0] = 0.0f;
-            c->pos[1] = 1.0f; // float above the ring's floor level
+            c->pos[1] = 1.0f;  // float above the ring's floor level
             c->pos[2] = RING_Z_OFFSET;
 
             // Diagonal spin axis gives a pleasing tumble effect
@@ -582,7 +577,7 @@ int main(int argc, char **argv)
             c->spin_axis[2] = 0.5f;
             glm_vec3_normalize(c->spin_axis);
 
-            c->spin_speed = 1.1f; // spins noticeably faster than the ring
+            c->spin_speed = 1.1f;  // spins noticeably faster than the ring
             c->spin_phase = 0.0f;
         }
     }
@@ -599,7 +594,7 @@ int main(int argc, char **argv)
     g_app.start_time = Lpz.window.GetTime();
     g_app.last_time = g_app.start_time;
 
-    printf("Controls: WASD = move  |  Space/LShift = up/down  |  RMB drag = look  |  Esc = quit\n");
+    LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "Controls: WASD = move  |  Space/LShift = up/down  |  RMB drag = look  |  Esc = quit");
 
     while (!Lpz.window.ShouldClose(g_app.window))
     {
@@ -633,7 +628,7 @@ int main(int argc, char **argv)
         Lpz.renderer.BeginFrame(g_app.renderer);
 
         if (!Lpz.surface.AcquireNextImage(g_app.surface))
-            continue; // surface not ready (rare, usually after a resize)
+            continue;  // surface not ready (rare, usually after a resize)
 
         lpz_texture_t swapchain_tex = Lpz.surface.GetCurrentTexture(g_app.surface);
 
@@ -649,7 +644,7 @@ int main(int argc, char **argv)
             LpzDepthAttachment depth_att = {
                 .texture = g_app.depth_texture,
                 .load_op = LPZ_LOAD_OP_CLEAR,
-                .store_op = LPZ_STORE_OP_DONT_CARE, // depth not read after
+                .store_op = LPZ_STORE_OP_DONT_CARE,  // depth not read after
                 .clear_depth = 1.0f,
                 .clear_stencil = 0,
             };
@@ -704,6 +699,6 @@ int main(int argc, char **argv)
     Lpz.window.DestroyWindow(g_app.window);
     Lpz.window.Terminate();
 
-    printf("Clean exit.\n");
+    LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "Clean exit.");
     return 0;
 }

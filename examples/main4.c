@@ -24,13 +24,11 @@
 //   ./main4 --metal    — Metal  (explicit)
 // =============================================================================
 
-#include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
 
-#include "../include/LPZ/Lpz.h"
-#include "../include/LPZ/LpzText.h"
+#include "Lpz.h"
 
 #include "shader_loader.h"
 
@@ -46,8 +44,7 @@ LpzAPI Lpz = {0};
 // =============================================================================
 // APPLICATION STATE
 // =============================================================================
-typedef struct
-{
+typedef struct {
     lpz_window_t window;
     lpz_device_t device;
     lpz_surface_t surface;
@@ -60,7 +57,7 @@ typedef struct
     lpz_bind_group_layout_t text_bgl;
     lpz_bind_group_t text_bind_group;
     lpz_sampler_t atlas_sampler;
-    lpz_depth_stencil_state_t depth_stencil_state; // depth test OFF — required by Vulkan dynamic state
+    lpz_depth_stencil_state_t depth_stencil_state;  // depth test OFF — required by Vulkan dynamic state
 
     LpzFontAtlas *font;
     LpzTextBatch *text_batch;
@@ -120,7 +117,7 @@ int main(int argc, char **argv)
 #if defined(LAPIZ_HAS_VULKAN)
             use_metal = false;
 #else
-            fprintf(stderr, "This build was compiled without Vulkan support.\n");
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "This build was compiled without Vulkan support.");
             return 1;
 #endif
         }
@@ -129,27 +126,27 @@ int main(int argc, char **argv)
 #if defined(LAPIZ_HAS_METAL)
             use_metal = true;
 #else
-            fprintf(stderr, "This build was compiled without Metal support.\n");
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "This build was compiled without Metal support.");
             return 1;
 #endif
         }
         else
         {
-            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-            fprintf(stderr, "Usage: %s [--vulkan | --metal]\n", argv[0]);
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Unknown argument: %s", argv[i]);
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Usage: %s [--vulkan | --metal]", argv[0]);
             return 1;
         }
     }
 
     if (use_metal)
     {
-        Lpz = LpzMetal;
-        printf("Backend: Metal\n");
+        Lpz = LPZ_MAKE_API_METAL();
+        LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "Backend: Metal");
     }
     else
     {
-        Lpz = LpzVulkan;
-        printf("Backend: Vulkan\n");
+        Lpz = LPZ_MAKE_API_VULKAN();
+        LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "Backend: Vulkan");
     }
     Lpz.window = LpzWindow_GLFW;
 
@@ -158,14 +155,14 @@ int main(int argc, char **argv)
     // =========================================================================
     if (!Lpz.window.Init())
     {
-        fprintf(stderr, "Failed to initialise the window system\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to initialise the window system");
         return 1;
     }
 
-    g_app.window = Lpz.window.CreateWindow("LpzText Demo", 1280, 720);
+    g_app.window = Lpz.window.CreateWindow("LpzText Demo", 800, 600);
     if (!g_app.window)
     {
-        fprintf(stderr, "Failed to create window\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create window");
         return 1;
     }
 
@@ -174,10 +171,10 @@ int main(int argc, char **argv)
 
     if (Lpz.device.Create(&g_app.device) != LPZ_SUCCESS)
     {
-        fprintf(stderr, "Failed to create GPU device\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create GPU device");
         return 1;
     }
-    printf("GPU: %s\n", Lpz.device.GetName(g_app.device));
+    LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "GPU: %s", Lpz.device.GetName(g_app.device));
 
     LpzSurfaceDesc surf_desc = {
         .window = g_app.window,
@@ -188,14 +185,14 @@ int main(int argc, char **argv)
     g_app.surface = Lpz.surface.CreateSurface(g_app.device, &surf_desc);
     if (!g_app.surface)
     {
-        fprintf(stderr, "Failed to create surface\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create surface");
         return 1;
     }
 
     g_app.renderer = Lpz.renderer.CreateRenderer(g_app.device);
     if (!g_app.renderer)
     {
-        fprintf(stderr, "Failed to create renderer\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create renderer");
         return 1;
     }
 
@@ -225,7 +222,7 @@ int main(int argc, char **argv)
 
     if (!vs_blob.data || !fs_blob.data)
     {
-        fprintf(stderr, "Failed to load text shader files\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to load text shader files");
         return 1;
     }
 
@@ -255,7 +252,7 @@ int main(int argc, char **argv)
 
     if (Lpz.device.CreateShader(g_app.device, &vert_desc, &g_app.vert_shader) != LPZ_SUCCESS || Lpz.device.CreateShader(g_app.device, &frag_desc, &g_app.frag_shader) != LPZ_SUCCESS)
     {
-        fprintf(stderr, "Failed to create text shaders\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create text shaders");
         return 1;
     }
 
@@ -303,10 +300,10 @@ int main(int argc, char **argv)
         .vertex_shader = g_app.vert_shader,
         .fragment_shader = g_app.frag_shader,
         .color_attachment_format = Lpz.surface.GetFormat(g_app.surface),
-        .depth_attachment_format = LPZ_FORMAT_UNDEFINED, // no depth test for 2D text
+        .depth_attachment_format = LPZ_FORMAT_UNDEFINED,  // no depth test for 2D text
         .sample_count = 1,
         .topology = LPZ_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-        .vertex_bindings = NULL, // no vertex buffers — SSBO only
+        .vertex_bindings = NULL,  // no vertex buffers — SSBO only
         .vertex_binding_count = 0,
         .vertex_attributes = NULL,
         .vertex_attribute_count = 0,
@@ -318,7 +315,7 @@ int main(int argc, char **argv)
 
     if (Lpz.device.CreatePipeline(g_app.device, &pipeline_desc, &g_app.text_pipeline) != LPZ_SUCCESS)
     {
-        fprintf(stderr, "Failed to create text pipeline\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create text pipeline");
         return 1;
     }
 
@@ -335,7 +332,7 @@ int main(int argc, char **argv)
     };
     if (Lpz.device.CreateDepthStencilState(g_app.device, &ds_desc, &g_app.depth_stencil_state) != LPZ_SUCCESS)
     {
-        fprintf(stderr, "Failed to create depth-stencil state\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create depth-stencil state");
         return 1;
     }
 
@@ -351,7 +348,7 @@ int main(int argc, char **argv)
     g_app.text_batch = LpzTextBatchCreate(g_app.device, &batch_desc);
     if (!g_app.text_batch)
     {
-        fprintf(stderr, "Failed to create text batch\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create text batch");
         return 1;
     }
 
@@ -366,7 +363,7 @@ int main(int argc, char **argv)
     const char *home = getenv("HOME");
     if (!home)
     {
-        fprintf(stderr, "HOME environment variable not set\n");
+        LPZ_LOG_WARNING(LPZ_LOG_CATEGORY_GENERAL, "HOME environment variable not set");
         return 1;
     }
     snprintf(font_path, sizeof(font_path), "%s/Library/Fonts/JetBrainsMonoNLNerdFontPropo-Regular.ttf", home);
@@ -382,7 +379,7 @@ int main(int argc, char **argv)
     g_app.font = LpzFontAtlasCreate(g_app.device, &font_desc);
     if (!g_app.font)
     {
-        fprintf(stderr, "Failed to create font atlas\nPath tried: %s\n", font_path);
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create font atlas\nPath tried: %s", font_path);
         return 1;
     }
 
@@ -416,7 +413,7 @@ int main(int argc, char **argv)
     g_app.start_time = Lpz.window.GetTime();
     g_app.last_time = g_app.start_time;
 
-    printf("Controls: Escape = quit\n");
+    LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "Controls: Escape = quit");
 
     // =========================================================================
     // PHASE 6 — MAIN LOOP
@@ -470,7 +467,7 @@ int main(int argc, char **argv)
                                               .text = fps_str,
                                               .x = 16.0f,
                                               .y = 22.0f,
-                                              .font_size = 16.0f,
+                                              .font_size = 32.0f,
                                               .r = 0.75f,
                                               .g = 0.75f,
                                               .b = 0.75f,
@@ -486,8 +483,8 @@ int main(int argc, char **argv)
                                               .atlas = g_app.font,
                                               .text = time_str,
                                               .x = 16.0f,
-                                              .y = 44.0f,
-                                              .font_size = 14.0f,
+                                              .y = 66.0f,
+                                              .font_size = 32.0f,
                                               .r = 0.55f,
                                               .g = 0.55f,
                                               .b = 0.55f,
@@ -529,13 +526,13 @@ int main(int argc, char **argv)
 
         // Horizontally centered text — measure first, then submit
         const char *title = "Hello, World!";
-        float title_w = LpzTextMeasureWidth(g_app.font, title, 32.0f);
+        float title_w = LpzTextMeasureWidth(g_app.font, title, 96.0f);
         LpzTextBatchAdd(g_app.text_batch, &(LpzTextDesc){
                                               .atlas = g_app.font,
                                               .text = title,
                                               .x = (sw - title_w) * 0.5f,
                                               .y = sh * 0.5f,
-                                              .font_size = 32.0f,
+                                              .font_size = 96.0f,
                                               .r = 1.0f,
                                               .g = 1.0f,
                                               .b = 1.0f,
@@ -581,7 +578,7 @@ int main(int argc, char **argv)
             Lpz.renderer.SetScissor(g_app.renderer, 0, 0, g_app.fb_width, g_app.fb_height);
             Lpz.renderer.BindDepthStencilState(g_app.renderer, g_app.depth_stencil_state);
 
-            Lpz.renderer.BindBindGroup(g_app.renderer, 0, g_app.text_bind_group);
+            Lpz.renderer.BindBindGroup(g_app.renderer, 0, g_app.text_bind_group, NULL, 0);
             Lpz.renderer.Draw(g_app.renderer, 6, glyph_count, 0, 0);
             Lpz.renderer.EndDebugLabel(g_app.renderer);
         }
@@ -614,6 +611,6 @@ int main(int argc, char **argv)
     Lpz.window.DestroyWindow(g_app.window);
     Lpz.window.Terminate();
 
-    printf("Clean exit.\n");
+    LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "Clean exit.");
     return 0;
 }

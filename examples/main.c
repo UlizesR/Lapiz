@@ -27,19 +27,17 @@
 // =============================================================================
 
 // ---------- Standard library ----------
-#include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
 
 // ---------- Lapiz library headers ----------
 // Lpz.h pulls in LpzTypes.h (all GPU types) and LpzGeometry.h (mesh helpers).
-#include "../include/LPZ/Lpz.h"
-#include "../include/LPZ/LpzMath.h" // LpzCamera3D, LpzMat4, cglm wrappers
+#include "Lpz.h"
 
 // ---------- Our own helpers ----------
-#include "shader_loader.h" // shader_load_spirv / shader_load_msl
-#include "app_camera.h"    // first-person camera
+#include "app_camera.h"     // first-person camera
+#include "shader_loader.h"  // shader_load_spirv / shader_load_msl
 
 // =============================================================================
 // GLOBAL BACKEND DISPATCH TABLE
@@ -61,9 +59,9 @@ LpzAPI Lpz = {0};
 #define WINDOW_TITLE "Lapiz — Hello Shapes"
 #define WINDOW_WIDTH 800
 #define WINDOW_HEIGHT 600
-#define CAMERA_SPEED 5.0f  // world units per second
-#define CAMERA_SENS 0.003f // radians per pixel
-#define FOV_Y 60.0f        // vertical field-of-view in degrees
+#define CAMERA_SPEED 5.0f   // world units per second
+#define CAMERA_SENS 0.003f  // radians per pixel
+#define FOV_Y 60.0f         // vertical field-of-view in degrees
 
 // =============================================================================
 // PUSH CONSTANT LAYOUT
@@ -76,10 +74,9 @@ LpzAPI Lpz = {0};
 //
 // We upload this struct with Lpz.renderer.PushConstants() before each draw.
 // =============================================================================
-typedef struct
-{
-    float mvp[4][4]; // Model-View-Projection matrix
-    float tint[4];   // R, G, B, A
+typedef struct {
+    float mvp[4][4];  // Model-View-Projection matrix
+    float tint[4];    // R, G, B, A
 } PushConstants;
 
 // =============================================================================
@@ -93,14 +90,13 @@ typedef struct
 //   tint      — colour used in the push constant
 //   model     — 4×4 model matrix (position + rotation)
 // =============================================================================
-typedef struct
-{
+typedef struct {
     lpz_buffer_t gpu_vb;
     lpz_buffer_t gpu_ib;
     uint32_t idx_count;
     LpzIndexType idx_type;
-    float tint[4]; // RGBA
-    LpzMat4 model; // world-space transform
+    float tint[4];  // RGBA
+    LpzMat4 model;  // world-space transform
 } Shape;
 
 // =============================================================================
@@ -110,8 +106,7 @@ typedef struct
 // everything into one struct.  The main() function fills this in step-by-step
 // and tears it all down at the end.
 // =============================================================================
-typedef struct
-{
+typedef struct {
     lpz_window_t window;
     lpz_device_t device;
     lpz_surface_t surface;
@@ -179,20 +174,20 @@ static lpz_texture_t create_depth_texture(lpz_device_t device, uint32_t w, uint3
     LpzTextureDesc desc = {
         .width = w,
         .height = h,
-        .depth = 0,        // 0 → treated as 1 (2-D texture)
-        .array_layers = 0, // 0 → treated as 1
-        .sample_count = 1, // no MSAA
-        .mip_levels = 1,   // depth buffers don't need mip-maps
+        .depth = 0,         // 0 → treated as 1 (2-D texture)
+        .array_layers = 0,  // 0 → treated as 1
+        .sample_count = 1,  // no MSAA
+        .mip_levels = 1,    // depth buffers don't need mip-maps
         .format = LPZ_FORMAT_DEPTH32_FLOAT,
         .usage = LPZ_TEXTURE_USAGE_DEPTH_ATTACHMENT_BIT,
         .texture_type = LPZ_TEXTURE_TYPE_2D,
-        .heap = NULL, // let the driver allocate its own memory
+        .heap = NULL,  // let the driver allocate its own memory
     };
 
     lpz_texture_t tex = NULL;
     if (Lpz.device.CreateTexture(device, &desc, &tex) != LPZ_SUCCESS)
     {
-        fprintf(stderr, "Failed to create depth texture (%u × %u)\n", w, h);
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create depth texture (%u × %u)", w, h);
     }
     return tex;
 }
@@ -241,7 +236,7 @@ static bool upload_mesh(const LpzVertex *vertices, uint32_t vert_count, const vo
 
     if (Lpz.device.CreateBuffer(g_app.device, &vb_desc, out_vb) != LPZ_SUCCESS || Lpz.device.CreateBuffer(g_app.device, &ib_desc, out_ib) != LPZ_SUCCESS)
     {
-        fprintf(stderr, "Failed to create GPU vertex/index buffers\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create GPU vertex/index buffers");
         return false;
     }
 
@@ -268,7 +263,7 @@ static bool upload_mesh(const LpzVertex *vertices, uint32_t vert_count, const vo
 
     if (Lpz.device.CreateBuffer(g_app.device, &sv_desc, &staging_vb) != LPZ_SUCCESS || Lpz.device.CreateBuffer(g_app.device, &si_desc, &staging_ib) != LPZ_SUCCESS)
     {
-        fprintf(stderr, "Failed to create staging buffers\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create staging buffers");
         return false;
     }
 
@@ -313,7 +308,7 @@ static bool upload_mesh(const LpzVertex *vertices, uint32_t vert_count, const vo
 // =============================================================================
 static void make_translation_matrix(float tx, float ty, float tz, LpzMat4 out)
 {
-    glm_mat4_identity(out); // fills out with the 4×4 identity
+    glm_mat4_identity(out);  // fills out with the 4×4 identity
     out[3][0] = tx;
     out[3][1] = ty;
     out[3][2] = tz;
@@ -341,7 +336,7 @@ static void draw_shape(const Shape *s, const LpzMat4 view_proj)
     // shader.  They live in a small region of memory directly on the GPU command
     // buffer — no separate descriptor set or buffer binding needed.
     Lpz.renderer.PushConstants(g_app.renderer, LPZ_SHADER_STAGE_ALL_GRAPHICS,
-                               0, // byte offset into push constant block
+                               0,  // byte offset into push constant block
                                sizeof(PushConstants), &pc);
 
     // Bind the vertex buffer.  The '0' is the "binding slot" — matches
@@ -415,7 +410,7 @@ int main(int argc, char **argv)
     // We also need to tell the library which windowing system to use for the
     // window.* functions.  Here we use GLFW regardless of backend.
     // -------------------------------------------------------------------------
-    bool use_metal = true; // Metal is the default on macOS
+    bool use_metal = true;  // Metal is the default on macOS
 
 #if !defined(LAPIZ_HAS_METAL)
     // If the library was built without the Metal backend, force Vulkan.
@@ -429,7 +424,7 @@ int main(int argc, char **argv)
 #if defined(LAPIZ_HAS_VULKAN)
             use_metal = false;
 #else
-            fprintf(stderr, "This build was compiled without Vulkan support.\n");
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "This build was compiled without Vulkan support.");
             return 1;
 #endif
         }
@@ -438,29 +433,29 @@ int main(int argc, char **argv)
 #if defined(LAPIZ_HAS_METAL)
             use_metal = true;
 #else
-            fprintf(stderr, "This build was compiled without Metal support.\n");
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "This build was compiled without Metal support.");
             return 1;
 #endif
         }
         else
         {
-            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-            fprintf(stderr, "Usage: %s [--vulkan | --metal]\n", argv[0]);
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Unknown argument: %s", argv[i]);
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Usage: %s [--vulkan | --metal]", argv[0]);
             return 1;
         }
     }
 
     if (use_metal)
     {
-        Lpz = LpzMetal;
-        printf("Backend: Metal\n");
+        Lpz = LPZ_MAKE_API_METAL();
+        LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "Backend: Metal");
     }
     else
     {
-        Lpz = LpzVulkan;
-        printf("Backend: Vulkan\n");
+        Lpz = LPZ_MAKE_API_VULKAN();
+        LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "Backend: Vulkan");
     }
-    Lpz.window = LpzWindow_GLFW; // swap in the GLFW window implementation
+    Lpz.window = LpzWindow_GLFW;  // swap in the GLFW window implementation
 
     // -------------------------------------------------------------------------
     // 1b. Initialise the windowing system
@@ -469,7 +464,7 @@ int main(int argc, char **argv)
     // -------------------------------------------------------------------------
     if (!Lpz.window.Init())
     {
-        fprintf(stderr, "Failed to initialise the window system\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to initialise the window system");
         return 1;
     }
 
@@ -482,7 +477,7 @@ int main(int argc, char **argv)
     g_app.window = Lpz.window.CreateWindow(WINDOW_TITLE, WINDOW_WIDTH, WINDOW_HEIGHT);
     if (!g_app.window)
     {
-        fprintf(stderr, "Failed to create window\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create window");
         return 1;
     }
 
@@ -500,10 +495,10 @@ int main(int argc, char **argv)
     // -------------------------------------------------------------------------
     if (Lpz.device.Create(&g_app.device) != LPZ_SUCCESS)
     {
-        fprintf(stderr, "Failed to create GPU device\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create GPU device");
         return 1;
     }
-    printf("GPU: %s\n", Lpz.device.GetName(g_app.device));
+    LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "GPU: %s", Lpz.device.GetName(g_app.device));
 
     // -------------------------------------------------------------------------
     // 1e. Create the swap-chain surface
@@ -516,12 +511,12 @@ int main(int argc, char **argv)
         .window = g_app.window,
         .width = g_app.fb_width,
         .height = g_app.fb_height,
-        .present_mode = LPZ_PRESENT_MODE_FIFO, // vsync (tear-free, always available)
+        .present_mode = LPZ_PRESENT_MODE_FIFO,  // vsync (tear-free, always available)
     };
     g_app.surface = Lpz.surface.CreateSurface(g_app.device, &surf_desc);
     if (!g_app.surface)
     {
-        fprintf(stderr, "Failed to create surface\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create surface");
         return 1;
     }
 
@@ -535,7 +530,7 @@ int main(int argc, char **argv)
     g_app.renderer = Lpz.renderer.CreateRenderer(g_app.device);
     if (!g_app.renderer)
     {
-        fprintf(stderr, "Failed to create renderer\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create renderer");
         return 1;
     }
 
@@ -580,7 +575,7 @@ int main(int argc, char **argv)
 
     if (!vs_blob.data || !fs_blob.data)
     {
-        fprintf(stderr, "Failed to load shader files\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to load shader files");
         return 1;
     }
 
@@ -616,7 +611,7 @@ int main(int argc, char **argv)
 
     if (Lpz.device.CreateShader(g_app.device, &vert_desc, &g_app.vert_shader) != LPZ_SUCCESS || Lpz.device.CreateShader(g_app.device, &frag_desc, &g_app.frag_shader) != LPZ_SUCCESS)
     {
-        fprintf(stderr, "Failed to create shaders\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create shaders");
         return 1;
     }
 
@@ -679,12 +674,12 @@ int main(int argc, char **argv)
         // This must exactly match the format of the texture we render into.
         .color_attachment_format = swapchain_format,
         .color_attachment_formats = NULL,
-        .color_attachment_count = 0, // 0 → use the single format above
+        .color_attachment_count = 0,  // 0 → use the single format above
 
         // Depth buffer format — must match the texture we created in 1g
         .depth_attachment_format = LPZ_FORMAT_DEPTH32_FLOAT,
 
-        .sample_count = 1, // no MSAA
+        .sample_count = 1,  // no MSAA
 
         .topology = LPZ_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
         .vertex_bindings = &binding,
@@ -698,7 +693,7 @@ int main(int argc, char **argv)
 
         .rasterizer_state =
             {
-                .cull_mode = LPZ_CULL_MODE_BACK, // skip back-facing triangles
+                .cull_mode = LPZ_CULL_MODE_BACK,  // skip back-facing triangles
                 .front_face = LPZ_FRONT_FACE_COUNTER_CLOCKWISE,
                 .wireframe = false,
             },
@@ -713,7 +708,7 @@ int main(int argc, char **argv)
 
     if (Lpz.device.CreatePipeline(g_app.device, &pipe_desc, &g_app.pipeline) != LPZ_SUCCESS)
     {
-        fprintf(stderr, "Failed to create render pipeline\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create render pipeline");
         return 1;
     }
 
@@ -737,7 +732,7 @@ int main(int argc, char **argv)
     };
     if (Lpz.device.CreateDepthStencilState(g_app.device, &ds_desc, &g_app.depth_stencil_state) != LPZ_SUCCESS)
     {
-        fprintf(stderr, "Failed to create depth-stencil state\n");
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_FAILURE, "Failed to create depth-stencil state");
         return 1;
     }
 
@@ -821,14 +816,14 @@ int main(int argc, char **argv)
         s->tint[3] = 1.0f;
         make_translation_matrix(-1.5f, 2.0f, -5.0f, s->model);
 
-        LpzMeshData sphere = LpzGeometry_GenerateSphere(18, 36); // rings, sectors
+        LpzMeshData sphere = LpzGeometry_GenerateSphere(18, 36);  // rings, sectors
         s->idx_count = sphere.index_count;
         s->idx_type = sphere.index_type;
 
         if (!upload_mesh(sphere.vertices, sphere.vertex_count, sphere.indices, sphere.index_count, sphere.index_type, &s->gpu_vb, &s->gpu_ib))
             return 1;
 
-        LpzGeometry_FreeData(&sphere); // release the CPU copy
+        LpzGeometry_FreeData(&sphere);  // release the CPU copy
     }
 
     // -------------------------------------------------------------------------
@@ -859,12 +854,12 @@ int main(int argc, char **argv)
     // Place the camera 3 units above the origin, a couple of units back,
     // looking slightly downward at the shapes.
     g_app.camera = app_camera_create(0.0f, 2.0f, 2.0f, CAMERA_SPEED, CAMERA_SENS);
-    g_app.camera.pitch = -0.25f; // tilt slightly downward to see the shapes
+    g_app.camera.pitch = -0.25f;  // tilt slightly downward to see the shapes
 
     g_app.last_time = Lpz.window.GetTime();
 
-    printf("Controls: WASD = move, Space/LShift = up/down, RMB drag = look, Esc = quit\n");
-    printf("Tip: run with --vulkan or --metal to switch backends\n");
+    LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "Controls: WASD = move, Space/LShift = up/down, RMB drag = look, Esc = quit");
+    LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "Tip: run with --vulkan or --metal to switch backends");
 
     // =========================================================================
     // PHASE 5 — MAIN LOOP
@@ -942,17 +937,17 @@ int main(int argc, char **argv)
 
         LpzColorAttachment colour_att = {
             .texture = swapchain_tex,
-            .resolve_texture = NULL, // no MSAA resolve
+            .resolve_texture = NULL,  // no MSAA resolve
             .load_op = LPZ_LOAD_OP_CLEAR,
             .store_op = LPZ_STORE_OP_STORE,
-            .clear_color = {0.12f, 0.12f, 0.18f, 1.0f}, // dark navy background
+            .clear_color = {0.12f, 0.12f, 0.18f, 1.0f},  // dark navy background
         };
 
         LpzDepthAttachment depth_att = {
             .texture = g_app.depth_texture,
             .load_op = LPZ_LOAD_OP_CLEAR,
-            .store_op = LPZ_STORE_OP_DONT_CARE, // depth is not read after the pass
-            .clear_depth = 1.0f,                // 1.0 = far plane (clear to "infinity")
+            .store_op = LPZ_STORE_OP_DONT_CARE,  // depth is not read after the pass
+            .clear_depth = 1.0f,                 // 1.0 = far plane (clear to "infinity")
             .clear_stencil = 0,
         };
 
@@ -1025,6 +1020,6 @@ int main(int argc, char **argv)
     Lpz.window.DestroyWindow(g_app.window);
     Lpz.window.Terminate();
 
-    printf("Clean exit.\n");
+    LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "Clean exit.");
     return 0;
 }

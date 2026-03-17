@@ -1,8 +1,8 @@
 #ifndef SHADER_LOADER_H
 #define SHADER_LOADER_H
 
-#include <stddef.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 // =============================================================================
 // shader_loader.h
@@ -27,12 +27,11 @@
 // A tiny container returned by both loaders so callers never need to track
 // separate pointer + size variables.
 // ---------------------------------------------------------------------------
-typedef struct
-{
-    void *data;  // heap-allocated; NULL on failure
-    size_t size; // byte count:
-                 //   SPIR-V  → raw binary byte count
-                 //   MSL     → string length (excluding null terminator)
+typedef struct {
+    void *data;   // heap-allocated; NULL on failure
+    size_t size;  // byte count:
+                  //   SPIR-V  → raw binary byte count
+                  //   MSL     → string length (excluding null terminator)
 } LpzShaderBlob;
 
 // ---------------------------------------------------------------------------
@@ -87,4 +86,4 @@ LpzShaderBlob shader_load_msl(const char *path);
 // ---------------------------------------------------------------------------
 void shader_free(LpzShaderBlob *blob);
 
-#endif // SHADER_LOADER_H
+#endif  // SHADER_LOADER_H

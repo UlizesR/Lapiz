@@ -1,12 +1,12 @@
-#include "../include/LPZ/LpzGeometry.h"
+#include "LpzGeometry.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <math.h>
 #include <string.h>
 
 #include <assimp/cimport.h>
-#include <assimp/scene.h>
 #include <assimp/postprocess.h>
+#include <assimp/scene.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -14,12 +14,71 @@
 
 #define LPZ_WHITE_COLOR {1.f, 1.f, 1.f, 1.f}
 
+static void lpz_geometry_zero_mesh(LpzMeshData *mesh)
+{
+    if (mesh)
+        memset(mesh, 0, sizeof(*mesh));
+}
+
+static void lpz_geometry_fill_white(float color[4])
+{
+    color[0] = 1.0f;
+    color[1] = 1.0f;
+    color[2] = 1.0f;
+    color[3] = 1.0f;
+}
+
+static size_t lpz_geometry_index_size(LpzIndexType type)
+{
+    return (type == LPZ_INDEX_TYPE_UINT32) ? sizeof(uint32_t) : sizeof(uint16_t);
+}
+
+static bool lpz_geometry_choose_index_type(uint32_t vertex_count, LpzIndexType *out_type)
+{
+    if (!out_type)
+        return false;
+    *out_type = (vertex_count > 65535u) ? LPZ_INDEX_TYPE_UINT32 : LPZ_INDEX_TYPE_UINT16;
+    return true;
+}
+
+static bool lpz_geometry_alloc_mesh(LpzMeshData *mesh, uint32_t vertex_count, uint32_t index_count, LpzIndexType index_type)
+{
+    if (!mesh)
+        return false;
+
+    lpz_geometry_zero_mesh(mesh);
+    mesh->vertex_count = vertex_count;
+    mesh->index_count = index_count;
+    mesh->index_type = index_type;
+
+    mesh->vertices = (LpzVertex *)calloc(vertex_count, sizeof(LpzVertex));
+    if (!mesh->vertices)
+        return false;
+
+    mesh->indices = calloc(index_count, lpz_geometry_index_size(index_type));
+    if (!mesh->indices)
+    {
+        free(mesh->vertices);
+        mesh->vertices = NULL;
+        return false;
+    }
+
+    return true;
+}
+
+static void lpz_geometry_write_index(LpzMeshData *mesh, uint32_t at, uint32_t value)
+{
+    if (mesh->index_type == LPZ_INDEX_TYPE_UINT32)
+        ((uint32_t *)mesh->indices)[at] = value;
+    else
+        ((uint16_t *)mesh->indices)[at] = (uint16_t)value;
+}
+
 // ============================================================================
 // PREDEFINED STATIC ARRAYS
 // ============================================================================
 
-const LpzVertex LPZ_GEO_TRIANGLE_VERTICES[3] = {
-    {{0.0f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.5f, 0.0f}, {1.f, 1.f, 1.f, 1.f}}, {{0.5f, -0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}, {1.f, 1.f, 1.f, 1.f}}, {{-0.5f, -0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}, {1.f, 1.f, 1.f, 1.f}}};
+const LpzVertex LPZ_GEO_TRIANGLE_VERTICES[3] = {{{0.0f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.5f, 0.0f}, {1.f, 1.f, 1.f, 1.f}}, {{0.5f, -0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}, {1.f, 1.f, 1.f, 1.f}}, {{-0.5f, -0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}, {1.f, 1.f, 1.f, 1.f}}};
 const uint16_t LPZ_GEO_TRIANGLE_INDICES[3] = {0, 1, 2};
 
 const LpzVertex LPZ_GEO_QUAD_VERTICES[4] = {{{-0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 0.0f}, {1.f, 1.f, 1.f, 1.f}},
@@ -28,15 +87,14 @@ const LpzVertex LPZ_GEO_QUAD_VERTICES[4] = {{{-0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1
                                             {{-0.5f, -0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}, {1.f, 1.f, 1.f, 1.f}}};
 const uint16_t LPZ_GEO_QUAD_INDICES[6] = {0, 1, 2, 2, 3, 0};
 
-const LpzVertex LPZ_GEO_CUBE_VERTICES[24] = {
-    {{-0.5f, 0.5f, 0.5f}, {0.f, 0.f, 1.f}, {0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},    {{0.5f, 0.5f, 0.5f}, {0.f, 0.f, 1.f}, {1.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},    {{0.5f, -0.5f, 0.5f}, {0.f, 0.f, 1.f}, {1.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},
-    {{-0.5f, -0.5f, 0.5f}, {0.f, 0.f, 1.f}, {0.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},   {{0.5f, 0.5f, -0.5f}, {0.f, 0.f, -1.f}, {0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},  {{-0.5f, 0.5f, -0.5f}, {0.f, 0.f, -1.f}, {1.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
-    {{-0.5f, -0.5f, -0.5f}, {0.f, 0.f, -1.f}, {1.f, 1.f}, {1.f, 1.f, 1.f, 1.f}}, {{0.5f, -0.5f, -0.5f}, {0.f, 0.f, -1.f}, {0.f, 1.f}, {1.f, 1.f, 1.f, 1.f}}, {{-0.5f, 0.5f, -0.5f}, {-1.f, 0.f, 0.f}, {0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
-    {{-0.5f, 0.5f, 0.5f}, {-1.f, 0.f, 0.f}, {1.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},   {{-0.5f, -0.5f, 0.5f}, {-1.f, 0.f, 0.f}, {1.f, 1.f}, {1.f, 1.f, 1.f, 1.f}}, {{-0.5f, -0.5f, -0.5f}, {-1.f, 0.f, 0.f}, {0.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},
-    {{0.5f, 0.5f, 0.5f}, {1.f, 0.f, 0.f}, {0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},     {{0.5f, 0.5f, -0.5f}, {1.f, 0.f, 0.f}, {1.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},   {{0.5f, -0.5f, -0.5f}, {1.f, 0.f, 0.f}, {1.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},
-    {{0.5f, -0.5f, 0.5f}, {1.f, 0.f, 0.f}, {0.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},    {{-0.5f, 0.5f, -0.5f}, {0.f, 1.f, 0.f}, {0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},  {{0.5f, 0.5f, -0.5f}, {0.f, 1.f, 0.f}, {1.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
-    {{0.5f, 0.5f, 0.5f}, {0.f, 1.f, 0.f}, {1.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},     {{-0.5f, 0.5f, 0.5f}, {0.f, 1.f, 0.f}, {0.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},   {{-0.5f, -0.5f, 0.5f}, {0.f, -1.f, 0.f}, {0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
-    {{0.5f, -0.5f, 0.5f}, {0.f, -1.f, 0.f}, {1.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},   {{0.5f, -0.5f, -0.5f}, {0.f, -1.f, 0.f}, {1.f, 1.f}, {1.f, 1.f, 1.f, 1.f}}, {{-0.5f, -0.5f, -0.5f}, {0.f, -1.f, 0.f}, {0.f, 1.f}, {1.f, 1.f, 1.f, 1.f}}};
+const LpzVertex LPZ_GEO_CUBE_VERTICES[24] = {{{-0.5f, 0.5f, 0.5f}, {0.f, 0.f, 1.f}, {0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},    {{0.5f, 0.5f, 0.5f}, {0.f, 0.f, 1.f}, {1.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},    {{0.5f, -0.5f, 0.5f}, {0.f, 0.f, 1.f}, {1.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},
+                                             {{-0.5f, -0.5f, 0.5f}, {0.f, 0.f, 1.f}, {0.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},   {{0.5f, 0.5f, -0.5f}, {0.f, 0.f, -1.f}, {0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},  {{-0.5f, 0.5f, -0.5f}, {0.f, 0.f, -1.f}, {1.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
+                                             {{-0.5f, -0.5f, -0.5f}, {0.f, 0.f, -1.f}, {1.f, 1.f}, {1.f, 1.f, 1.f, 1.f}}, {{0.5f, -0.5f, -0.5f}, {0.f, 0.f, -1.f}, {0.f, 1.f}, {1.f, 1.f, 1.f, 1.f}}, {{-0.5f, 0.5f, -0.5f}, {-1.f, 0.f, 0.f}, {0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
+                                             {{-0.5f, 0.5f, 0.5f}, {-1.f, 0.f, 0.f}, {1.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},   {{-0.5f, -0.5f, 0.5f}, {-1.f, 0.f, 0.f}, {1.f, 1.f}, {1.f, 1.f, 1.f, 1.f}}, {{-0.5f, -0.5f, -0.5f}, {-1.f, 0.f, 0.f}, {0.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},
+                                             {{0.5f, 0.5f, 0.5f}, {1.f, 0.f, 0.f}, {0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},     {{0.5f, 0.5f, -0.5f}, {1.f, 0.f, 0.f}, {1.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},   {{0.5f, -0.5f, -0.5f}, {1.f, 0.f, 0.f}, {1.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},
+                                             {{0.5f, -0.5f, 0.5f}, {1.f, 0.f, 0.f}, {0.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},    {{-0.5f, 0.5f, -0.5f}, {0.f, 1.f, 0.f}, {0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},  {{0.5f, 0.5f, -0.5f}, {0.f, 1.f, 0.f}, {1.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
+                                             {{0.5f, 0.5f, 0.5f}, {0.f, 1.f, 0.f}, {1.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},     {{-0.5f, 0.5f, 0.5f}, {0.f, 1.f, 0.f}, {0.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},   {{-0.5f, -0.5f, 0.5f}, {0.f, -1.f, 0.f}, {0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
+                                             {{0.5f, -0.5f, 0.5f}, {0.f, -1.f, 0.f}, {1.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},   {{0.5f, -0.5f, -0.5f}, {0.f, -1.f, 0.f}, {1.f, 1.f}, {1.f, 1.f, 1.f, 1.f}}, {{-0.5f, -0.5f, -0.5f}, {0.f, -1.f, 0.f}, {0.f, 1.f}, {1.f, 1.f, 1.f, 1.f}}};
 // All six faces corrected to CCW winding when viewed from outside the cube,
 // matching the LPZ_FRONT_FACE_COUNTER_CLOCKWISE pipeline setting.
 //
@@ -52,17 +110,16 @@ const LpzVertex LPZ_GEO_CUBE_VERTICES[24] = {
 //  Top    (v16–v19, normal +Y): 16,18,17, 16,19,18 cross((v18-v16),(v17-v16)) = +Y ✓
 //  Bottom (v20–v23, normal -Y): 20,22,21, 20,23,22 cross((v22-v20),(v21-v20)) = -Y ✓
 const uint16_t LPZ_GEO_CUBE_INDICES[36] = {
-    0,  2,  1,  0,  3,  2,  // front
-    4,  6,  5,  4,  7,  6,  // back
-    8,  10, 9,  8,  11, 10, // left
-    12, 14, 13, 12, 15, 14, // right
-    16, 18, 17, 16, 19, 18, // top
-    20, 22, 21, 20, 23, 22  // bottom
+    0,  2,  1,  0,  3,  2,   // front
+    4,  6,  5,  4,  7,  6,   // back
+    8,  10, 9,  8,  11, 10,  // left
+    12, 14, 13, 12, 15, 14,  // right
+    16, 18, 17, 16, 19, 18,  // top
+    20, 22, 21, 20, 23, 22   // bottom
 };
 
-const LpzVertex LPZ_GEO_PRISM_VERTICES[6] = {{{0.0f, 0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}, {0.5f, 0.0f}, {1.f, 1.f, 1.f, 1.f}},     {{0.5f, -0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}, {1.f, 1.f, 1.f, 1.f}},
-                                             {{-0.5f, -0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}, {1.f, 1.f, 1.f, 1.f}},   {{0.0f, 0.5f, -0.5f}, {0.0f, 0.0f, -1.0f}, {0.5f, 0.0f}, {1.f, 1.f, 1.f, 1.f}},
-                                             {{-0.5f, -0.5f, -0.5f}, {0.0f, 0.0f, -1.0f}, {0.0f, 1.0f}, {1.f, 1.f, 1.f, 1.f}}, {{0.5f, -0.5f, -0.5f}, {0.0f, 0.0f, -1.0f}, {1.0f, 1.0f}, {1.f, 1.f, 1.f, 1.f}}};
+const LpzVertex LPZ_GEO_PRISM_VERTICES[6] = {{{0.0f, 0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}, {0.5f, 0.0f}, {1.f, 1.f, 1.f, 1.f}},   {{0.5f, -0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}, {1.f, 1.f, 1.f, 1.f}},    {{-0.5f, -0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}, {1.f, 1.f, 1.f, 1.f}},
+                                             {{0.0f, 0.5f, -0.5f}, {0.0f, 0.0f, -1.0f}, {0.5f, 0.0f}, {1.f, 1.f, 1.f, 1.f}}, {{-0.5f, -0.5f, -0.5f}, {0.0f, 0.0f, -1.0f}, {0.0f, 1.0f}, {1.f, 1.f, 1.f, 1.f}}, {{0.5f, -0.5f, -0.5f}, {0.0f, 0.0f, -1.0f}, {1.0f, 1.0f}, {1.f, 1.f, 1.f, 1.f}}};
 // Fixed: end-cap triangles were CW from outside → culled.
 //
 // Vertex layout:
@@ -107,11 +164,9 @@ LpzMeshData LpzGeometry_GenerateCylinder(uint32_t segments)
     //   top cap:    segments triangles × 3 indices            = segments*3
     //   bottom cap: segments triangles × 3 indices            = segments*3
     data.index_count = segments * 12;
-    data.index_type = LPZ_INDEX_TYPE_UINT16;
-
-    data.vertices = (LpzVertex *)calloc(data.vertex_count, sizeof(LpzVertex));
-    data.indices = calloc(data.index_count, sizeof(uint16_t));
-    uint16_t *idx = (uint16_t *)data.indices;
+    lpz_geometry_choose_index_type(data.vertex_count, &data.index_type);
+    if (!lpz_geometry_alloc_mesh(&data, data.vertex_count, data.index_count, data.index_type))
+        return (LpzMeshData){0};
 
     const float white[4] = {1.f, 1.f, 1.f, 1.f};
     float angle_step = (2.0f * (float)M_PI) / (float)segments;
@@ -122,9 +177,9 @@ LpzMeshData LpzGeometry_GenerateCylinder(uint32_t segments)
     for (uint32_t i = 0; i <= segments; i++)
     {
         float angle = i * angle_step;
-        float nx = cosf(angle); // unit radial direction
+        float nx = cosf(angle);  // unit radial direction
         float nz = sinf(angle);
-        float px = nx * 0.5f; // position on unit-radius cylinder
+        float px = nx * 0.5f;  // position on unit-radius cylinder
         float pz = nz * 0.5f;
         float u = (float)i / (float)segments;
 
@@ -225,12 +280,12 @@ LpzMeshData LpzGeometry_GenerateCylinder(uint32_t segments)
         uint16_t b1 = (uint16_t)(i + segments + 1);
         uint16_t b2 = (uint16_t)(i + 1 + segments + 1);
 
-        idx[ii++] = t1;
-        idx[ii++] = t2;
-        idx[ii++] = b2;
-        idx[ii++] = b2;
-        idx[ii++] = b1;
-        idx[ii++] = t1;
+        lpz_geometry_write_index(&data, ii++, t1);
+        lpz_geometry_write_index(&data, ii++, t2);
+        lpz_geometry_write_index(&data, ii++, b2);
+        lpz_geometry_write_index(&data, ii++, b2);
+        lpz_geometry_write_index(&data, ii++, b1);
+        lpz_geometry_write_index(&data, ii++, t1);
     }
 
     // Top cap — fan, CCW from above (+Y)
@@ -239,9 +294,9 @@ LpzMeshData LpzGeometry_GenerateCylinder(uint32_t segments)
     {
         uint16_t cur = (uint16_t)(top_ring_base + i);
         uint16_t next = (uint16_t)(top_ring_base + (i + 1) % segments);
-        idx[ii++] = (uint16_t)top_center;
-        idx[ii++] = next;
-        idx[ii++] = cur;
+        lpz_geometry_write_index(&data, ii++, top_center);
+        lpz_geometry_write_index(&data, ii++, next);
+        lpz_geometry_write_index(&data, ii++, cur);
     }
 
     // Bottom cap — fan, CCW from below (-Y)
@@ -250,9 +305,9 @@ LpzMeshData LpzGeometry_GenerateCylinder(uint32_t segments)
     {
         uint16_t cur = (uint16_t)(bot_ring_base + i);
         uint16_t next = (uint16_t)(bot_ring_base + (i + 1) % segments);
-        idx[ii++] = (uint16_t)bot_center;
-        idx[ii++] = cur;
-        idx[ii++] = next;
+        lpz_geometry_write_index(&data, ii++, bot_center);
+        lpz_geometry_write_index(&data, ii++, cur);
+        lpz_geometry_write_index(&data, ii++, next);
     }
 
     return data;
@@ -393,14 +448,20 @@ void LpzGeometry_FreeData(LpzMeshData *data)
 {
     if (!data)
         return;
-    if (data->vertices)
-        free(data->vertices);
-    if (data->indices)
-        free(data->indices);
+    free(data->vertices);
+    free(data->indices);
     data->vertices = NULL;
     data->indices = NULL;
     data->vertex_count = 0;
     data->index_count = 0;
+}
+
+void LpzGeometry_FreeSceneData(LpzMeshData *meshes, uint32_t count)
+{
+    if (!meshes)
+        return;
+    for (uint32_t i = 0; i < count; ++i)
+        LpzGeometry_FreeData(&meshes[i]);
 }
 
 // ============================================================================
@@ -443,6 +504,7 @@ static bool convert_mesh(const struct aiMesh *src, LpzMeshData *out)
     if (!src || !out)
         return false;
 
+    lpz_geometry_zero_mesh(out);
     out->vertex_count = src->mNumVertices;
     out->vertices = (LpzVertex *)calloc(out->vertex_count, sizeof(LpzVertex));
     if (!out->vertices)
@@ -493,10 +555,7 @@ static bool convert_mesh(const struct aiMesh *src, LpzMeshData *out)
         }
         else
         {
-            v->color[0] = 1.0f;
-            v->color[1] = 1.0f;
-            v->color[2] = 1.0f;
-            v->color[3] = 1.0f;
+            lpz_geometry_fill_white(v->color);
         }
     }
 
@@ -504,8 +563,8 @@ static bool convert_mesh(const struct aiMesh *src, LpzMeshData *out)
     out->index_count = src->mNumFaces * 3;
 
     // Choose 16-bit indices when possible to match the rest of the engine
-    out->index_type = (out->vertex_count > 65535) ? LPZ_INDEX_TYPE_UINT32 : LPZ_INDEX_TYPE_UINT16;
-    size_t index_size = (out->index_type == LPZ_INDEX_TYPE_UINT32) ? sizeof(uint32_t) : sizeof(uint16_t);
+    lpz_geometry_choose_index_type(out->vertex_count, &out->index_type);
+    size_t index_size = lpz_geometry_index_size(out->index_type);
 
     out->indices = calloc(out->index_count, index_size);
     if (!out->indices)

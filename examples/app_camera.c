@@ -20,7 +20,7 @@ AppCamera app_camera_create(float x, float y, float z, float move_speed, float l
     cam.position[0] = x;
     cam.position[1] = y;
     cam.position[2] = z;
-    cam.yaw = 0.0f; // looking toward -Z initially
+    cam.yaw = 0.0f;  // looking toward -Z initially
     cam.pitch = 0.0f;
     cam.move_speed = move_speed;
     cam.look_sensitivity = look_sensitivity;
@@ -66,7 +66,7 @@ void app_camera_update(AppCamera *cam, lpz_window_t window, const LpzWindowAPI *
             cam->pitch -= dy * cam->look_sensitivity;
 
             // Clamp pitch so the camera never flips over (±89 degrees)
-            const float MAX_PITCH = 1.5533430f; // 89° in radians
+            const float MAX_PITCH = 1.5533430f;  // 89° in radians
             cam->pitch = clampf(cam->pitch, -MAX_PITCH, MAX_PITCH);
         }
 
@@ -102,7 +102,7 @@ void app_camera_update(AppCamera *cam, lpz_window_t window, const LpzWindowAPI *
 
     float fwd[3] = {
         cos_pitch * sin_yaw, sin_pitch,
-        cos_pitch * -cos_yaw // negative so yaw=0 looks into -Z (OpenGL convention)
+        cos_pitch * -cos_yaw  // negative so yaw=0 looks into -Z (OpenGL convention)
     };
 
     // Right vector = cross(forward, world_up).  world_up = (0, 1, 0).
