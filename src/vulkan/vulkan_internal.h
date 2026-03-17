@@ -25,7 +25,7 @@
 #define LPZ_VK_WARN(fmt, ...) LPZ_LOG_BACKEND_WARNING(LPZ_VK_SUBSYSTEM, LPZ_LOG_CATEGORY_BACKEND, fmt, ##__VA_ARGS__)
 #define LPZ_VK_ERR(res, fmt, ...) LPZ_LOG_BACKEND_ERROR(LPZ_VK_SUBSYSTEM, LPZ_LOG_CATEGORY_BACKEND, res, fmt, ##__VA_ARGS__)
 
-static inline void lpz_vk_log_api_specific_once(const char *fn, const char *feature, bool *logged)
+LAPIZ_INLINE void lpz_vk_log_api_specific_once(const char *fn, const char *feature, bool *logged)
 {
     if (!logged || *logged)
         return;
@@ -293,7 +293,7 @@ struct compute_queue_t {
 // SHARED HELPERS
 // ============================================================================
 
-static inline uint32_t find_memory_type(VkPhysicalDevice physDev, uint32_t typeFilter, VkMemoryPropertyFlags props)
+LAPIZ_INLINE uint32_t find_memory_type(VkPhysicalDevice physDev, uint32_t typeFilter, VkMemoryPropertyFlags props)
 {
     VkPhysicalDeviceMemoryProperties mem;
     vkGetPhysicalDeviceMemoryProperties(physDev, &mem);
@@ -303,7 +303,7 @@ static inline uint32_t find_memory_type(VkPhysicalDevice physDev, uint32_t typeF
     return 0xFFFFFFFF;
 }
 
-static inline void lpz_vk_renderer_reset_state(lpz_renderer_t renderer)
+LAPIZ_INLINE void lpz_vk_renderer_reset_state(lpz_renderer_t renderer)
 {
     if (!renderer)
         return;
@@ -331,7 +331,7 @@ typedef struct {
     VkBuffer buffer;
     VkDeviceMemory memory;
 } staging_buffer_t;
-static inline staging_buffer_t staging_create(lpz_device_t device, size_t size)
+LAPIZ_INLINE staging_buffer_t staging_create(lpz_device_t device, size_t size)
 {
     staging_buffer_t s = {VK_NULL_HANDLE, VK_NULL_HANDLE};
 
@@ -356,7 +356,7 @@ static inline staging_buffer_t staging_create(lpz_device_t device, size_t size)
     return s;
 }
 
-static inline void staging_upload(lpz_device_t device, staging_buffer_t *s, const void *src, size_t size)
+LAPIZ_INLINE void staging_upload(lpz_device_t device, staging_buffer_t *s, const void *src, size_t size)
 {
     void *mapped;
     vkMapMemory(device->device, s->memory, 0, size, 0, &mapped);
@@ -364,23 +364,23 @@ static inline void staging_upload(lpz_device_t device, staging_buffer_t *s, cons
     vkUnmapMemory(device->device, s->memory);
 }
 
-static inline void staging_destroy(lpz_device_t device, staging_buffer_t *s)
+LAPIZ_INLINE void staging_destroy(lpz_device_t device, staging_buffer_t *s)
 {
     vkDestroyBuffer(device->device, s->buffer, NULL);
     vkFreeMemory(device->device, s->memory, NULL);
 }
 
-static inline bool is_depth_format(VkFormat f)
+LAPIZ_INLINE bool is_depth_format(VkFormat f)
 {
     return f == VK_FORMAT_D32_SFLOAT || f == VK_FORMAT_D32_SFLOAT_S8_UINT || f == VK_FORMAT_D24_UNORM_S8_UINT || f == VK_FORMAT_D16_UNORM || f == VK_FORMAT_D16_UNORM_S8_UINT;
 }
 
-static inline bool is_stencil_format(VkFormat f)
+LAPIZ_INLINE bool is_stencil_format(VkFormat f)
 {
     return f == VK_FORMAT_D24_UNORM_S8_UINT || f == VK_FORMAT_D32_SFLOAT_S8_UINT || f == VK_FORMAT_D16_UNORM_S8_UINT;
 }
 
-static inline VkCommandBuffer lpz_vk_begin_one_shot(lpz_device_t device)
+LAPIZ_INLINE VkCommandBuffer lpz_vk_begin_one_shot(lpz_device_t device)
 {
     VkCommandBuffer cmd;
     VkCommandBufferAllocateInfo ai = {
@@ -399,7 +399,7 @@ static inline VkCommandBuffer lpz_vk_begin_one_shot(lpz_device_t device)
     return cmd;
 }
 
-static inline void lpz_vk_end_one_shot(lpz_device_t device, VkCommandBuffer cmd)
+LAPIZ_INLINE void lpz_vk_end_one_shot(lpz_device_t device, VkCommandBuffer cmd)
 {
     vkEndCommandBuffer(cmd);
     VkSubmitInfo si = {
@@ -412,7 +412,7 @@ static inline void lpz_vk_end_one_shot(lpz_device_t device, VkCommandBuffer cmd)
     vkFreeCommandBuffers(device->device, device->transferCommandPool, 1, &cmd);
 }
 
-static inline void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout, VkImageAspectFlags aspect)
+LAPIZ_INLINE void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout, VkImageAspectFlags aspect)
 {
     VkImageMemoryBarrier b = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -466,7 +466,7 @@ static inline void transition_image(VkCommandBuffer cmd, VkImage image, VkImageL
 // FORMAT / ENUM CONVERTERS (needed by both device and renderer TUs)
 // ============================================================================
 
-static inline VkFormat LpzToVkFormat(LpzFormat f)
+LAPIZ_INLINE VkFormat LpzToVkFormat(LpzFormat f)
 {
     switch (f)
     {
@@ -559,7 +559,7 @@ static inline VkFormat LpzToVkFormat(LpzFormat f)
     }
 }
 
-static inline VkCompareOp LpzToVkCompareOp(LpzCompareOp op)
+LAPIZ_INLINE VkCompareOp LpzToVkCompareOp(LpzCompareOp op)
 {
     switch (op)
     {
@@ -582,7 +582,7 @@ static inline VkCompareOp LpzToVkCompareOp(LpzCompareOp op)
     }
 }
 
-static inline VkAttachmentLoadOp LpzToVkLoadOp(LpzLoadOp op)
+LAPIZ_INLINE VkAttachmentLoadOp LpzToVkLoadOp(LpzLoadOp op)
 {
     switch (op)
     {
@@ -595,12 +595,12 @@ static inline VkAttachmentLoadOp LpzToVkLoadOp(LpzLoadOp op)
     }
 }
 
-static inline VkAttachmentStoreOp LpzToVkStoreOp(LpzStoreOp op)
+LAPIZ_INLINE VkAttachmentStoreOp LpzToVkStoreOp(LpzStoreOp op)
 {
     return (op == LPZ_STORE_OP_DONT_CARE) ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
 }
 
-static inline VkBlendFactor LpzToVkBlendFactor(LpzBlendFactor f)
+LAPIZ_INLINE VkBlendFactor LpzToVkBlendFactor(LpzBlendFactor f)
 {
     switch (f)
     {
@@ -627,7 +627,7 @@ static inline VkBlendFactor LpzToVkBlendFactor(LpzBlendFactor f)
     }
 }
 
-static inline VkBlendOp LpzToVkBlendOp(LpzBlendOp op)
+LAPIZ_INLINE VkBlendOp LpzToVkBlendOp(LpzBlendOp op)
 {
     switch (op)
     {
@@ -644,7 +644,7 @@ static inline VkBlendOp LpzToVkBlendOp(LpzBlendOp op)
     }
 }
 
-static inline VkSamplerAddressMode LpzToVkAddressMode(LpzSamplerAddressMode m)
+LAPIZ_INLINE VkSamplerAddressMode LpzToVkAddressMode(LpzSamplerAddressMode m)
 {
     switch (m)
     {
@@ -659,7 +659,7 @@ static inline VkSamplerAddressMode LpzToVkAddressMode(LpzSamplerAddressMode m)
     }
 }
 
-static inline VkDescriptorType LpzToVkDescriptorType(LpzBindingType t)
+LAPIZ_INLINE VkDescriptorType LpzToVkDescriptorType(LpzBindingType t)
 {
     switch (t)
     {

@@ -73,6 +73,7 @@ typedef struct LpzAPI {
     LpzRendererAPI renderer;
     LpzRendererExtAPI rendererExt;
     LpzWindowAPI window;
+
 } LpzAPI;
 
 extern LpzAPI Lpz;
@@ -113,6 +114,24 @@ extern LpzAPI Lpz;
     })
 #else
 #define LPZ_MAKE_API_VULKAN() ((LpzAPI){0})
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Window creation
+
+// Drawing
+
+// Texture
+
+// Shaders
+
+// Text
+
+#ifdef __cplusplus
+}
 #endif
 
 #endif  // LPZ_H

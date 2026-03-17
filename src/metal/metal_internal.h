@@ -19,7 +19,7 @@
 #define LPZ_MTL_WARN(fmt, ...) LPZ_LOG_BACKEND_WARNING(LPZ_MTL_SUBSYSTEM, LPZ_LOG_CATEGORY_BACKEND, fmt, ##__VA_ARGS__)
 #define LPZ_MTL_ERR(res, fmt, ...) LPZ_LOG_BACKEND_ERROR(LPZ_MTL_SUBSYSTEM, LPZ_LOG_CATEGORY_BACKEND, res, fmt, ##__VA_ARGS__)
 
-static inline void lpz_metal_log_api_specific_once(const char *fn, const char *feature, bool *logged)
+LAPIZ_INLINE void lpz_metal_log_api_specific_once(const char *fn, const char *feature, bool *logged)
 {
     if (!logged || *logged)
         return;
@@ -239,7 +239,7 @@ struct compute_queue_t {
 // INLINE HELPERS (shared across translation units)
 // ============================================================================
 
-static inline id<MTLBuffer> lpz_buffer_get_mtl(lpz_buffer_t buf, uint32_t frameIndex)
+LAPIZ_INLINE id<MTLBuffer> lpz_buffer_get_mtl(lpz_buffer_t buf, uint32_t frameIndex)
 {
     if (!buf)
         return nil;
@@ -247,19 +247,19 @@ static inline id<MTLBuffer> lpz_buffer_get_mtl(lpz_buffer_t buf, uint32_t frameI
     return buf->buffers[slot];
 }
 
-static inline NSUInteger lpz_align_up_ns(NSUInteger value, NSUInteger alignment)
+LAPIZ_INLINE NSUInteger lpz_align_up_ns(NSUInteger value, NSUInteger alignment)
 {
     if (alignment == 0)
         return value;
     return (value + alignment - 1u) & ~(alignment - 1u);
 }
 
-static inline bool lpz_visible_to_vertex(LpzShaderStage vis)
+LAPIZ_INLINE bool lpz_visible_to_vertex(LpzShaderStage vis)
 {
     return (vis == LPZ_SHADER_STAGE_NONE) || (vis & LPZ_SHADER_STAGE_VERTEX) || (vis == LPZ_SHADER_STAGE_ALL_GRAPHICS) || (vis == LPZ_SHADER_STAGE_ALL);
 }
 
-static inline bool lpz_visible_to_fragment(LpzShaderStage vis)
+LAPIZ_INLINE bool lpz_visible_to_fragment(LpzShaderStage vis)
 {
     return (vis == LPZ_SHADER_STAGE_NONE) || (vis & LPZ_SHADER_STAGE_FRAGMENT) || (vis == LPZ_SHADER_STAGE_ALL_GRAPHICS) || (vis == LPZ_SHADER_STAGE_ALL);
 }
@@ -270,7 +270,7 @@ static inline bool lpz_visible_to_fragment(LpzShaderStage vis)
 
 #if LAPIZ_MTL_HAS_METAL3
 
-static inline NSURL *lpz_mtl3_pipeline_cache_url(void)
+LAPIZ_INLINE NSURL *lpz_mtl3_pipeline_cache_url(void)
 {
     NSArray *paths = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
     NSString *cachesDir = [paths firstObject];
@@ -279,7 +279,7 @@ static inline NSURL *lpz_mtl3_pipeline_cache_url(void)
     return [NSURL fileURLWithPath:[lapizDir stringByAppendingPathComponent:@"pipeline_cache.metallib"]];
 }
 
-static inline id<MTLBinaryArchive> lpz_mtl3_create_pipeline_cache(id<MTLDevice> device)
+LAPIZ_INLINE id<MTLBinaryArchive> lpz_mtl3_create_pipeline_cache(id<MTLDevice> device)
 {
     NSURL *cacheURL = lpz_mtl3_pipeline_cache_url();
     BOOL fileExists = [[NSFileManager defaultManager] fileExistsAtPath:cacheURL.path];
@@ -305,7 +305,7 @@ static inline id<MTLBinaryArchive> lpz_mtl3_create_pipeline_cache(id<MTLDevice> 
     return archive;
 }
 
-static inline void lpz_mtl3_flush_pipeline_cache(id<MTLBinaryArchive> archive)
+LAPIZ_INLINE void lpz_mtl3_flush_pipeline_cache(id<MTLBinaryArchive> archive)
 {
     if (!archive)
         return;
@@ -315,7 +315,7 @@ static inline void lpz_mtl3_flush_pipeline_cache(id<MTLBinaryArchive> archive)
         LPZ_MTL_WARN("Binary archive flush failed.");
 }
 
-static inline id<MTLIOCommandQueue> lpz_mtl3_create_io_command_queue(id<MTLDevice> device)
+LAPIZ_INLINE id<MTLIOCommandQueue> lpz_mtl3_create_io_command_queue(id<MTLDevice> device)
 {
     MTLIOCommandQueueDescriptor *desc = [[MTLIOCommandQueueDescriptor alloc] init];
     desc.type = MTLIOCommandQueueTypeConcurrent;
@@ -338,7 +338,7 @@ static inline id<MTLIOCommandQueue> lpz_mtl3_create_io_command_queue(id<MTLDevic
 // Used by both metal_device.m and metal_renderer.m
 // ============================================================================
 
-static inline void lpz_renderer_reset_frame_state(lpz_renderer_t renderer)
+LAPIZ_INLINE void lpz_renderer_reset_frame_state(lpz_renderer_t renderer)
 {
     if (!renderer)
         return;
@@ -357,7 +357,7 @@ static inline void lpz_renderer_reset_frame_state(lpz_renderer_t renderer)
     renderer->transientOffsets[renderer->frameIndex % LPZ_MAX_FRAMES_IN_FLIGHT] = 0;
 }
 
-static inline void lpz_encode_entries_render(id<MTLRenderCommandEncoder> enc, const struct bind_group_entry_t *entries, uint32_t count)
+LAPIZ_INLINE void lpz_encode_entries_render(id<MTLRenderCommandEncoder> enc, const struct bind_group_entry_t *entries, uint32_t count)
 {
     for (uint32_t i = 0; i < count; i++)
     {
@@ -397,7 +397,7 @@ static inline void lpz_encode_entries_render(id<MTLRenderCommandEncoder> enc, co
     }
 }
 
-static inline void lpz_encode_entries_compute(id<MTLComputeCommandEncoder> enc, const struct bind_group_entry_t *entries, uint32_t count)
+LAPIZ_INLINE void lpz_encode_entries_compute(id<MTLComputeCommandEncoder> enc, const struct bind_group_entry_t *entries, uint32_t count)
 {
     for (uint32_t i = 0; i < count; i++)
     {
@@ -418,7 +418,7 @@ static inline void lpz_encode_entries_compute(id<MTLComputeCommandEncoder> enc, 
     }
 }
 
-static inline MTLPixelFormat LpzToMetalFormat(LpzFormat format)
+LAPIZ_INLINE MTLPixelFormat LpzToMetalFormat(LpzFormat format)
 {
     switch (format)
     {
@@ -514,7 +514,7 @@ static inline MTLPixelFormat LpzToMetalFormat(LpzFormat format)
     }
 }
 
-static inline MTLVertexFormat LpzToMetalVertexFormat(LpzFormat format)
+LAPIZ_INLINE MTLVertexFormat LpzToMetalVertexFormat(LpzFormat format)
 {
     switch (format)
     {
@@ -529,7 +529,7 @@ static inline MTLVertexFormat LpzToMetalVertexFormat(LpzFormat format)
     }
 }
 
-static inline MTLCompareFunction LpzToMetalCompareOp(LpzCompareOp op)
+LAPIZ_INLINE MTLCompareFunction LpzToMetalCompareOp(LpzCompareOp op)
 {
     switch (op)
     {
@@ -553,7 +553,7 @@ static inline MTLCompareFunction LpzToMetalCompareOp(LpzCompareOp op)
     }
 }
 
-static inline MTLBlendFactor LpzToMetalBlendFactor(LpzBlendFactor factor)
+LAPIZ_INLINE MTLBlendFactor LpzToMetalBlendFactor(LpzBlendFactor factor)
 {
     switch (factor)
     {
@@ -582,7 +582,7 @@ static inline MTLBlendFactor LpzToMetalBlendFactor(LpzBlendFactor factor)
     }
 }
 
-static inline MTLBlendOperation LpzToMetalBlendOp(LpzBlendOp op)
+LAPIZ_INLINE MTLBlendOperation LpzToMetalBlendOp(LpzBlendOp op)
 {
     switch (op)
     {
@@ -600,7 +600,7 @@ static inline MTLBlendOperation LpzToMetalBlendOp(LpzBlendOp op)
     }
 }
 
-static inline MTLLoadAction LpzToMetalLoadOp(LpzLoadOp op)
+LAPIZ_INLINE MTLLoadAction LpzToMetalLoadOp(LpzLoadOp op)
 {
     switch (op)
     {
@@ -614,7 +614,7 @@ static inline MTLLoadAction LpzToMetalLoadOp(LpzLoadOp op)
     }
 }
 
-static inline MTLStoreAction LpzToMetalStoreOp(LpzStoreOp op)
+LAPIZ_INLINE MTLStoreAction LpzToMetalStoreOp(LpzStoreOp op)
 {
     switch (op)
     {
@@ -626,12 +626,12 @@ static inline MTLStoreAction LpzToMetalStoreOp(LpzStoreOp op)
     }
 }
 
-static inline MTLIndexType LpzToMetalIndexType(LpzIndexType type)
+LAPIZ_INLINE MTLIndexType LpzToMetalIndexType(LpzIndexType type)
 {
     return (type == LPZ_INDEX_TYPE_UINT16) ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
 }
 
-static inline MTLSamplerAddressMode LpzToMetalAddressMode(LpzSamplerAddressMode m)
+LAPIZ_INLINE MTLSamplerAddressMode LpzToMetalAddressMode(LpzSamplerAddressMode m)
 {
     switch (m)
     {

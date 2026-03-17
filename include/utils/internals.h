@@ -64,4 +64,28 @@ typedef sem_t lpz_sem_t;
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
+// Create API visibility macros
+#if defined(_WIN32)
+#define LAPIZ_API __declspec(dllexport)
+#define LAPIZ_HIDDEN __declspec(dllimport)
+#else
+#define LAPIZ_API __attribute__((visibility("default")))
+#define LAPIZ_HIDDEN __attribute__((visibility("hidden")))
+#endif
+
+// Inline macro for setting static inline functions
+#if defined(__GNUC__) || defined(__clang__)
+#define LAPIZ_INLINE static __inline__
+#elif defined(_MSC_VER)
+#define LAPIZ_INLINE static __inline
+#else
+#define LAPIZ_INLINE static inline /* C99 fallback */
+#endif
+
+#if defined(_MSC_VER)
+#define LAPIZ_ALIGN(X) __declspec(align(X))
+#else
+#define LAPIZ_ALIGN(X) __attribute__((aligned(X)))
+#endif
+
 #endif  // LPZ_INTERMALS_H

@@ -125,6 +125,18 @@ typedef enum {
     LPZ_PRESENT_MODE_MAILBOX,
 } LpzPresentMode;
 
+typedef enum {
+    LPZ_WINDOW_FLAG_RESIZABLE = 1u << 0,
+    LPZ_WINDOW_FLAG_UNDECORATED = 1u << 1,
+    LPZ_WINDOW_FLAG_HIDDEN = 1u << 2,
+    LPZ_WINDOW_FLAG_HIGHDPI = 1u << 3,
+    LPZ_WINDOW_FLAG_FULLSCREEN = 1u << 4,
+    LPZ_WINDOW_FLAG_BORDERLESS_WINDOWED = 1u << 5,
+    LPZ_WINDOW_FLAG_ALWAYS_ON_TOP = 1u << 6,
+    LPZ_WINDOW_FLAG_TRANSPARENT = 1u << 7,
+    LPZ_WINDOW_FLAG_MOUSE_PASSTHROUGH = 1u << 8,
+} LpzWindowFlags;
+
 // ============================================================================
 // WINDOW / SURFACE DESCRIPTORS
 // ============================================================================
@@ -165,6 +177,31 @@ typedef struct {
     void (*SetCursorMode)(lpz_window_t window, bool locked_and_hidden);
 
     double (*GetTime)(void);
+
+    bool (*IsReady)(lpz_window_t window);
+    bool (*IsFullscreen)(lpz_window_t window);
+    bool (*IsHidden)(lpz_window_t window);
+    bool (*IsMinimized)(lpz_window_t window);
+    bool (*IsMaximized)(lpz_window_t window);
+    bool (*IsFocused)(lpz_window_t window);
+    bool (*IsState)(lpz_window_t window, uint32_t flags);
+
+    void (*SetState)(lpz_window_t window, uint32_t flags);
+    void (*ClearState)(lpz_window_t window, uint32_t flags);
+
+    void (*ToggleFullscreen)(lpz_window_t window);
+    void (*ToggleBorderlessWindowed)(lpz_window_t window);
+    void (*Maximize)(lpz_window_t window);
+    void (*Minimize)(lpz_window_t window);
+    void (*Restore)(lpz_window_t window);
+
+    void (*SetTitle)(lpz_window_t window, const char *title);
+    void (*SetPosition)(lpz_window_t window, int x, int y);
+    void (*SetSize)(lpz_window_t window, int width, int height);
+    void (*SetMinSize)(lpz_window_t window, int width, int height);
+    void (*SetMaxSize)(lpz_window_t window, int width, int height);
+    void (*SetOpacity)(lpz_window_t window, float opacity);
+    void (*FocusWindow)(lpz_window_t window);
 
     void *(*GetNativeHandle)(lpz_window_t window);
 
