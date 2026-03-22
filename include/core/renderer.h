@@ -15,9 +15,9 @@ typedef struct surface_t *lpz_surface_t;
 // RENDER PASS / DRAW STRUCTS
 // ============================================================================
 
-typedef struct LpzColor {
+typedef struct Color {
     float r, g, b, a;
-} LpzColor;
+} Color;
 
 typedef struct LpzColorAttachment {
     lpz_texture_t texture;
@@ -25,7 +25,7 @@ typedef struct LpzColorAttachment {
     lpz_texture_t resolve_texture;
     LpzLoadOp load_op;
     LpzStoreOp store_op;
-    LpzColor clear_color;
+    Color clear_color;
 } LpzColorAttachment;
 
 typedef struct LpzDepthAttachment {

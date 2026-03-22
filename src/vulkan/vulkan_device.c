@@ -8,6 +8,8 @@ extern LpzAPI Lpz;  // for Lpz.window.GetRequiredVulkanExtensions
 
 // Global feature flags (extern declared in vulkan_internal.h)
 bool g_vk13 = false;
+bool g_has_sync2 = false;
+PFN_vkCmdPipelineBarrier2KHR g_vkCmdPipelineBarrier2 = NULL;
 bool g_has_dynamic_render = false;
 bool g_has_ext_dyn_state = false;
 bool g_has_mesh_shader = false;
@@ -792,6 +794,8 @@ static LpzResult lpz_vk_device_create_texture(lpz_device_t device, const LpzText
     tex->height = desc->height;
     tex->format = LpzToVkFormat(desc->format);
     tex->mipLevels = (desc->mip_levels >= 1) ? desc->mip_levels : 1;
+    tex->currentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    tex->layoutKnown = true;
 
     uint32_t arrayLayers = (desc->array_layers >= 1) ? desc->array_layers : 1;
     uint32_t depth = (desc->depth >= 1) ? desc->depth : 1;
@@ -902,6 +906,8 @@ static LpzResult lpz_vk_device_create_texture(lpz_device_t device, const LpzText
         tex->ownsMemory = true;
         vkBindImageMemory(device->device, tex->image, tex->memory, 0);
     }
+
+    tex->arrayLayers = arrayLayers;
 
     VkImageAspectFlags aspect = isDepth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
     VkImageViewCreateInfo viewInfo = {

@@ -6,6 +6,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 #import <mach/mach_time.h>
+#include <stdatomic.h> /* _Atomic, atomic_store/fetch_add */
 
 #include "../../include/Lpz.h"
 
@@ -28,6 +29,24 @@ LAPIZ_INLINE void lpz_metal_log_api_specific_once(const char *fn, const char *fe
 }
 
 // ============================================================================
+// MRC LIFETIME HELPERS
+// ============================================================================
+// Centralizes Objective-C release + nil-out and free + null-out patterns so
+// "release without nil" and "free without null" bugs can't creep back in.
+#define LPZ_OBJC_RELEASE(x)                                                                                                                                                                                                                                                                                \
+    do                                                                                                                                                                                                                                                                                                     \
+    {                                                                                                                                                                                                                                                                                                      \
+        [(x) release];                                                                                                                                                                                                                                                                                     \
+        (x) = nil;                                                                                                                                                                                                                                                                                         \
+    } while (0)
+#define LPZ_FREE(x)                                                                                                                                                                                                                                                                                        \
+    do                                                                                                                                                                                                                                                                                                     \
+    {                                                                                                                                                                                                                                                                                                      \
+        free((void *)(x));                                                                                                                                                                                                                                                                                 \
+        (x) = NULL;                                                                                                                                                                                                                                                                                        \
+    } while (0)
+
+// ============================================================================
 // PRIVATE STRUCT DEFINITIONS
 // ============================================================================
 
@@ -38,6 +57,11 @@ struct device_t {
     id<MTLCommandQueue> commandQueue;
 #if LAPIZ_MTL_HAS_METAL3
     id<MTLBinaryArchive> pipelineCache;
+    // True when at least one pipeline has been added to the archive since the
+    // last flush.  The archive is only serialized to disk on device destroy
+    // (or an explicit flush call), not after every individual pipeline compile.
+    // This avoids repeated disk IO and concurrent flush races from async handlers.
+    bool pipelineCacheDirty;
 #endif
 #if LAPIZ_MTL_HAS_METAL4
     id<MTLResidencySet> residencySet;
@@ -158,6 +182,11 @@ struct bind_group_t {
     uint32_t entry_count;
 };
 
+// Size of the per-renderer CPU-side frame-lifetime bump allocator.
+// 64 KB is generous for typical transient allocations (attachment descriptor
+// arrays, small scratch buffers, etc.) while remaining stack-friendly.
+#define LPZ_MTL_FRAME_ARENA_SIZE (64u * 1024u)
+
 struct renderer_t {
     lpz_device_t device;
 
@@ -198,6 +227,38 @@ struct renderer_t {
 #if LAPIZ_MTL_HAS_METAL4
     id<MTLResidencySet> passResidencySet;
 #endif
+
+    /* Reusable MTLCommandBufferDescriptor — allocated once in CreateRenderer,
+     * reused every frame to avoid per-frame alloc/release overhead.        */
+#if LAPIZ_MTL_HAS_METAL3
+    MTLCommandBufferDescriptor *cbDesc;
+#endif
+
+    /* Deferred resource destruction — objects queued here are released when  *
+     * the GPU completes the corresponding frame slot (i.e. at the next       *
+     * BeginFrame that reuses that slot, after the in-flight semaphore wait). *
+     *                                                                        *
+     * Required for correctness with retainedReferences=NO: Metal will not   *
+     * retain referenced objects; the application must guarantee lifetime.   */
+#define LPZ_MTL_MAX_DEFERRED_FREE 16
+    id<NSObject> pending_free[LPZ_MAX_FRAMES_IN_FLIGHT][LPZ_MTL_MAX_DEFERRED_FREE];
+    uint32_t pending_free_count[LPZ_MAX_FRAMES_IN_FLIGHT];
+
+    // -----------------------------------------------------------------------
+    // CPU-side frame-lifetime bump allocator (frame arena).
+    // Reset once per BeginFrame — all transient per-frame CPU allocations use
+    // this arena instead of malloc/free, giving O(1) cost with no heap
+    // traffic and zero fragmentation in the hot path.
+    // -----------------------------------------------------------------------
+    _Alignas(16) char frameArena[LPZ_MTL_FRAME_ARENA_SIZE];
+    size_t frameArenaOffset;
+
+    // Atomic per-frame draw-call counter.  Incremented with memory_order_relaxed
+    // (no ordering guarantees needed for a simple stat counter) so the overhead
+    // is a single atomic add with no memory fence on any current architecture.
+    // Reset to 0 at BeginFrame.  Useful for profiling and multi-thread recording
+    // diagnostics without introducing data races.
+    _Atomic uint32_t drawCounter;
 };
 
 struct fence_t {
@@ -270,49 +331,82 @@ LAPIZ_INLINE bool lpz_visible_to_fragment(LpzShaderStage vis)
 
 #if LAPIZ_MTL_HAS_METAL3
 
+// Returns a *retained* (non-autoreleased) NSURL for the pipeline cache file.
+// Callers must [release] it when done.  Using retain rather than autorelease
+// is essential here because this helper is called from C-level teardown code
+// (lpz_device_destroy → CleanUpApp) where there may be no active
+// @autoreleasepool.  Returning an autoreleased object without an active pool
+// puts it on the thread's root (or an already-drained) pool, making the
+// pointer invalid before the caller can use it — the root cause of the
+// EXC_BAD_ACCESS crash inside MTLBinaryArchive serialization.
 LAPIZ_INLINE NSURL *lpz_mtl3_pipeline_cache_url(void)
 {
-    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
-    NSString *cachesDir = [paths firstObject];
-    NSString *lapizDir = [cachesDir stringByAppendingPathComponent:@"com.lapiz"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:lapizDir withIntermediateDirectories:YES attributes:nil error:nil];
-    return [NSURL fileURLWithPath:[lapizDir stringByAppendingPathComponent:@"pipeline_cache.metallib"]];
+    NSURL *result = nil;
+    @autoreleasepool {
+        NSArray  *paths     = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+        NSString *cachesDir = [paths firstObject];
+        NSString *lapizDir  = [cachesDir stringByAppendingPathComponent:@"com.lapiz"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:lapizDir
+                                 withIntermediateDirectories:YES
+                                                  attributes:nil
+                                                       error:nil];
+        result = [[NSURL fileURLWithPath:[lapizDir stringByAppendingPathComponent:@"pipeline_cache.metallib"]] retain];
+    }
+    return result;  // caller must [release]
 }
 
 LAPIZ_INLINE id<MTLBinaryArchive> lpz_mtl3_create_pipeline_cache(id<MTLDevice> device)
 {
-    NSURL *cacheURL = lpz_mtl3_pipeline_cache_url();
-    BOOL fileExists = [[NSFileManager defaultManager] fileExistsAtPath:cacheURL.path];
+    id<MTLBinaryArchive> archive = nil;
+    @autoreleasepool {
+        NSURL *cacheURL = lpz_mtl3_pipeline_cache_url();  // retained — must release
+        BOOL   fileExists = [[NSFileManager defaultManager] fileExistsAtPath:cacheURL.path];
 
-    MTLBinaryArchiveDescriptor *desc = [[MTLBinaryArchiveDescriptor alloc] init];
-    desc.url = fileExists ? cacheURL : nil;
+        MTLBinaryArchiveDescriptor *desc = [[MTLBinaryArchiveDescriptor alloc] init];
+        desc.url = fileExists ? cacheURL : nil;
 
-    NSError *err = nil;
-    id<MTLBinaryArchive> archive = [device newBinaryArchiveWithDescriptor:desc error:&err];
-
-    if ((!archive || err) && fileExists)
-    {
-        LPZ_MTL_WARN("Binary archive load failed — deleting stale cache.");
-        [[NSFileManager defaultManager] removeItemAtURL:cacheURL error:nil];
-        err = nil;
-        desc.url = nil;
+        NSError *err = nil;
         archive = [device newBinaryArchiveWithDescriptor:desc error:&err];
-        if (err)
-            LPZ_MTL_WARN("Binary archive fresh-create also failed.");
-    }
 
-    [desc release];
-    return archive;
+        if ((!archive || err) && fileExists)
+        {
+            LPZ_MTL_WARN("Binary archive load failed — deleting stale cache.");
+            [[NSFileManager defaultManager] removeItemAtURL:cacheURL error:nil];
+            err = nil;
+            desc.url = nil;
+            archive = [device newBinaryArchiveWithDescriptor:desc error:&err];
+            if (err)
+                LPZ_MTL_WARN("Binary archive fresh-create also failed.");
+        }
+
+        [desc release];
+        [cacheURL release];  // balance lpz_mtl3_pipeline_cache_url retain
+    }
+    return archive;  // caller owns the +1 retain from newBinaryArchiveWithDescriptor
 }
 
 LAPIZ_INLINE void lpz_mtl3_flush_pipeline_cache(id<MTLBinaryArchive> archive)
 {
     if (!archive)
         return;
-    NSError *err = nil;
-    [archive serializeToURL:lpz_mtl3_pipeline_cache_url() error:&err];
-    if (err)
-        LPZ_MTL_WARN("Binary archive flush failed.");
+    // @autoreleasepool is mandatory: this function is called from C-level
+    // teardown (lpz_device_destroy) where no pool is active.  Without it,
+    // autoreleased objects created here AND inside Metal's serializeToURL:
+    // implementation land on the thread's root/drained pool, producing the
+    // EXC_BAD_ACCESS crash seen in objc_retain inside _MTLBinaryArchive.
+    @autoreleasepool {
+        NSURL   *url = lpz_mtl3_pipeline_cache_url();  // retained — released below
+        NSError *err = nil;
+        BOOL     ok  = [archive serializeToURL:url error:&err];
+        if (!ok || err)
+        {
+            // Delete the stale file so the next launch starts with a fresh
+            // archive rather than repeatedly failing on a broken one.
+            LPZ_MTL_WARN("Binary archive flush failed — removing stale cache.");
+            [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+        }
+        [url release];  // balance lpz_mtl3_pipeline_cache_url retain
+    }
 }
 
 LAPIZ_INLINE id<MTLIOCommandQueue> lpz_mtl3_create_io_command_queue(id<MTLDevice> device)
@@ -355,6 +449,40 @@ LAPIZ_INLINE void lpz_renderer_reset_frame_state(lpz_renderer_t renderer)
     memset(renderer->activeBindGroups, 0, sizeof(renderer->activeBindGroups));
     memset(renderer->activeVertexBuffers, 0, sizeof(renderer->activeVertexBuffers));
     renderer->transientOffsets[renderer->frameIndex % LPZ_MAX_FRAMES_IN_FLIGHT] = 0;
+}
+
+// ============================================================================
+// FRAME ARENA HELPERS (Metal)
+//
+// lpz_mtl_frame_reset()  — call once at BeginFrame; reclaims all arena memory
+//                           in a single store, eliminating heap traffic for the
+//                           entire frame.  Also resets the per-frame draw counter.
+// lpz_mtl_frame_alloc()  — O(1) bump allocation with 16-byte alignment.
+//                           Returns NULL when exhausted so callers can fall
+//                           back to a heap allocation for unusually large slabs.
+// ============================================================================
+
+LAPIZ_INLINE void lpz_mtl_frame_reset(lpz_renderer_t renderer)
+{
+    if (renderer)
+    {
+        renderer->frameArenaOffset = 0;
+        // Reset per-frame draw counter.
+        atomic_store_explicit(&renderer->drawCounter, 0, memory_order_relaxed);
+    }
+}
+
+LAPIZ_INLINE void *lpz_mtl_frame_alloc(lpz_renderer_t renderer, size_t size)
+{
+    if (!renderer || size == 0)
+        return NULL;
+    // Round up to next 16-byte boundary for SIMD / GPU-upload alignment.
+    size_t aligned = (size + 15u) & ~15u;
+    if (renderer->frameArenaOffset + aligned > LPZ_MTL_FRAME_ARENA_SIZE)
+        return NULL;  // exhausted — caller falls back to malloc
+    void *p = renderer->frameArena + renderer->frameArenaOffset;
+    renderer->frameArenaOffset += aligned;
+    return p;
 }
 
 LAPIZ_INLINE void lpz_encode_entries_render(id<MTLRenderCommandEncoder> enc, const struct bind_group_entry_t *entries, uint32_t count)
@@ -413,6 +541,78 @@ LAPIZ_INLINE void lpz_encode_entries_compute(id<MTLComputeCommandEncoder> enc, c
         else if (e->buffer)
         {
             NSUInteger off = (NSUInteger)(e->buffer_offset + e->dynamic_offset);
+            [enc setBuffer:e->buffer offset:off atIndex:e->metal_slot];
+        }
+    }
+}
+
+// ============================================================================
+// DYNAMIC-OFFSET ENCODING HELPERS
+// ============================================================================
+// These helpers encode bind-group entries with dynamic buffer offsets applied
+// inline — no scratch-array memcpy required.  Offsets are consumed in order
+// for buffer entries (matching Vulkan's VkDescriptorType dynamic buffer rule).
+// ============================================================================
+
+LAPIZ_INLINE void lpz_encode_entries_render_dyn(id<MTLRenderCommandEncoder> enc, const struct bind_group_entry_t *entries, uint32_t n, const uint32_t *dyn, uint32_t dynCount)
+{
+    uint32_t dynIdx = 0;
+    for (uint32_t i = 0; i < n; i++)
+    {
+        const struct bind_group_entry_t *e = &entries[i];
+        bool toVert = lpz_visible_to_vertex(e->visibility);
+        bool toFrag = lpz_visible_to_fragment(e->visibility);
+        if (e->texture_count > 0 && e->texture_array)
+        {
+            if (toVert)
+                [enc setVertexTextures:(id<MTLTexture> __unsafe_unretained const *)e->texture_array withRange:NSMakeRange(e->metal_slot, e->texture_count)];
+            if (toFrag)
+                [enc setFragmentTextures:(id<MTLTexture> __unsafe_unretained const *)e->texture_array withRange:NSMakeRange(e->metal_slot, e->texture_count)];
+        }
+        else if (e->texture)
+        {
+            if (toVert)
+                [enc setVertexTexture:e->texture atIndex:e->metal_slot];
+            if (toFrag)
+                [enc setFragmentTexture:e->texture atIndex:e->metal_slot];
+        }
+        else if (e->sampler)
+        {
+            if (toVert)
+                [enc setVertexSamplerState:e->sampler atIndex:e->metal_slot];
+            if (toFrag)
+                [enc setFragmentSamplerState:e->sampler atIndex:e->metal_slot];
+        }
+        else if (e->buffer)
+        {
+            NSUInteger off = (NSUInteger)e->buffer_offset;
+            if (dynIdx < dynCount)
+                off += dyn[dynIdx++];
+            if (toVert)
+                [enc setVertexBuffer:e->buffer offset:off atIndex:e->metal_slot];
+            if (toFrag)
+                [enc setFragmentBuffer:e->buffer offset:off atIndex:e->metal_slot];
+        }
+    }
+}
+
+LAPIZ_INLINE void lpz_encode_entries_compute_dyn(id<MTLComputeCommandEncoder> enc, const struct bind_group_entry_t *entries, uint32_t n, const uint32_t *dyn, uint32_t dynCount)
+{
+    uint32_t dynIdx = 0;
+    for (uint32_t i = 0; i < n; i++)
+    {
+        const struct bind_group_entry_t *e = &entries[i];
+        if (e->texture_count > 0 && e->texture_array)
+            [enc setTextures:(id<MTLTexture> __unsafe_unretained const *)e->texture_array withRange:NSMakeRange(e->metal_slot, e->texture_count)];
+        else if (e->texture)
+            [enc setTexture:e->texture atIndex:e->metal_slot];
+        else if (e->sampler)
+            [enc setSamplerState:e->sampler atIndex:e->metal_slot];
+        else if (e->buffer)
+        {
+            NSUInteger off = (NSUInteger)e->buffer_offset;
+            if (dynIdx < dynCount)
+                off += dyn[dynIdx++];
             [enc setBuffer:e->buffer offset:off atIndex:e->metal_slot];
         }
     }
@@ -649,5 +849,29 @@ LAPIZ_INLINE MTLSamplerAddressMode LpzToMetalAddressMode(LpzSamplerAddressMode m
 
 // Forward declaration — defined in metal_renderer.m
 static void lpz_mtl_check_attachment_hazards(lpz_renderer_t renderer, const LpzRenderPassDesc *desc);
+
+// ============================================================================
+// MEMORYLESS SUPPORT HELPER
+// ============================================================================
+// Checks whether memoryless storage is available on the current device.
+// On iOS/tvOS all Apple GPUs support it.  On macOS we require macOS 11+ and
+// an Apple-family GPU (any Apple1+ family).  Using supportsFamily:Apple1 is
+// forward-compatible: it returns YES on Apple Silicon M-series chips including
+// future generations, whereas the old Apple1..Apple7 range loop would miss
+// MTLGPUFamilyApple8 and later without a code change.
+LAPIZ_INLINE BOOL lpz_supports_memoryless(id<MTLDevice> dev)
+{
+#if TARGET_OS_IPHONE
+    (void)dev;
+    return YES;
+#else
+    if (@available(macOS 11.0, *))
+    {
+        if ([dev respondsToSelector:@selector(supportsFamily:)])
+            return [dev supportsFamily:MTLGPUFamilyApple1];
+    }
+    return NO;
+#endif
+}
 
 #endif  // LPZ_METAL_INTERNAL_H

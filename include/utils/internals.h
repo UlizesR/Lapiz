@@ -64,6 +64,20 @@ typedef sem_t lpz_sem_t;
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
+#if defined(__GNUC__) || defined(__clang__)
+#define LAPIZ_LIKELY(x) __builtin_expect(!!(x), 1)
+#define LAPIZ_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define LAPIZ_LIKELY(x) (x)
+#define LAPIZ_UNLIKELY(x) (x)
+#endif
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define LAPIZ_THREAD_LOCAL _Thread_local
+#else
+#define LAPIZ_THREAD_LOCAL
+#endif
+
 // Create API visibility macros
 #if defined(_WIN32)
 #define LAPIZ_API __declspec(dllexport)

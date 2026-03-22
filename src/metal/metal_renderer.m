@@ -1,4 +1,5 @@
 #import "metal_internal.h"
+#include <stdatomic.h> /* atomic_fetch_add_explicit, memory_order_relaxed */
 #import <stdlib.h>
 #import <string.h>
 
@@ -11,6 +12,16 @@ static lpz_renderer_t lpz_renderer_create(lpz_device_t device)
     struct renderer_t *renderer = (struct renderer_t *)calloc(1, sizeof(struct renderer_t));
     renderer->device = device;
     LPZ_SEM_INIT(renderer->inFlightSemaphore);
+
+#if LAPIZ_MTL_HAS_METAL3
+    /* Allocate the command-buffer descriptor once per renderer and reuse it
+     * every frame.  retainedReferences=NO reduces per-resource retain
+     * overhead; the frame-in-flight semaphore ensures resources outlive GPU
+     * execution, making this safe (Apple recommends this for perf-critical apps). */
+    renderer->cbDesc = [[MTLCommandBufferDescriptor alloc] init];
+    renderer->cbDesc.retainedReferences = NO;
+#endif
+
     return (lpz_renderer_t)renderer;
 }
 
@@ -19,7 +30,23 @@ static void lpz_renderer_destroy(lpz_renderer_t renderer)
     if (!renderer)
         return;
     for (uint32_t i = 0; i < LPZ_MAX_FRAMES_IN_FLIGHT; i++)
+    {
         [renderer->transientBuffers[i] release];
+        /* Release any objects that were deferred for this slot. */
+        for (uint32_t j = 0; j < renderer->pending_free_count[i]; j++)
+        {
+            [renderer->pending_free[i][j] release];
+            renderer->pending_free[i][j] = nil;
+        }
+        renderer->pending_free_count[i] = 0;
+    }
+#if LAPIZ_MTL_HAS_METAL3
+    if (renderer->cbDesc)
+    {
+        [renderer->cbDesc release];
+        renderer->cbDesc = nil;
+    }
+#endif
     LPZ_SEM_DESTROY(renderer->inFlightSemaphore);
     free(renderer);
 }
@@ -30,21 +57,32 @@ static void lpz_renderer_begin_frame(lpz_renderer_t renderer)
     renderer->frameIndex = (renderer->frameIndex + 1) % LPZ_MAX_FRAMES_IN_FLIGHT;
     renderer->frameAutoreleasePool = [[NSAutoreleasePool alloc] init];
 
+    /* Flush deferred resource destruction for the slot we just acquired.
+     * After LPZ_SEM_WAIT, the GPU has signaled completion for this slot,
+     * so any objects queued there during the previous occupancy are safe to
+     * release now without causing GPU faults.                              */
+    uint32_t slot = renderer->frameIndex;
+    for (uint32_t i = 0; i < renderer->pending_free_count[slot]; i++)
+    {
+        [renderer->pending_free[slot][i] release];
+        renderer->pending_free[slot][i] = nil;
+    }
+    renderer->pending_free_count[slot] = 0;
+
+    // Reclaim the CPU-side frame arena in O(1) — all transient allocations
+    // from the previous occupancy of this slot are freed without any heap
+    // traffic.  Also resets the per-frame draw counter to 0.
+    lpz_mtl_frame_reset(renderer);
+
 #if LAPIZ_MTL_HAS_METAL3
-    // MTLCommandBufferDescriptor.retainedReferences = NO:
-    // Metal normally retains every MTLResource touched by a command buffer for
-    // the duration of GPU execution, adding ref-count overhead proportional to
-    // draw-calls × resources per draw.  Setting this to NO transfers lifetime
-    // responsibility to the application.  The frame-in-flight semaphore in
-    // Lapiz guarantees that no buffer or texture is destroyed while a frame
-    // that referenced it is still in flight, making this safe.
-    MTLCommandBufferDescriptor *cbDesc = [[MTLCommandBufferDescriptor alloc] init];
-    cbDesc.retainedReferences = NO;
-    renderer->currentCommandBuffer = [[renderer->device->commandQueue commandBufferWithDescriptor:cbDesc] retain];
-    [cbDesc release];
+    /* Reuse the pre-allocated descriptor — avoids per-frame alloc/release.
+     * retainedReferences=NO was set once at CreateRenderer time; resources
+     * are kept alive by the deferred-free queue above.                     */
+    renderer->currentCommandBuffer = [[renderer->device->commandQueue commandBufferWithDescriptor:renderer->cbDesc] retain];
 #else
     renderer->currentCommandBuffer = [[renderer->device->commandQueue commandBuffer] retain];
 #endif
+    renderer->currentCommandBuffer.label = @"LapizFrame";
 }
 
 static uint32_t lpz_renderer_get_current_frame_index(lpz_renderer_t renderer)
@@ -80,7 +118,7 @@ static void lpz_renderer_begin_render_pass(lpz_renderer_t renderer, const LpzRen
             passDesc.colorAttachments[i].storeAction = LpzToMetalStoreOp(desc->color_attachments[i].store_op);
         }
 
-        LpzColor c = desc->color_attachments[i].clear_color;
+        Color c = desc->color_attachments[i].clear_color;
         passDesc.colorAttachments[i].clearColor = MTLClearColorMake(c.r, c.g, c.b, c.a);
     }
 
@@ -105,6 +143,7 @@ static void lpz_renderer_begin_render_pass(lpz_renderer_t renderer, const LpzRen
     }
 
     renderer->currentEncoder = [[renderer->currentCommandBuffer renderCommandEncoderWithDescriptor:passDesc] retain];
+    renderer->currentEncoder.label = @"LapizRenderPass";
     [passDesc release];
 
     lpz_renderer_reset_frame_state(renderer);
@@ -127,8 +166,25 @@ static void lpz_renderer_end_render_pass(lpz_renderer_t renderer)
 
 static void lpz_renderer_begin_transfer_pass(lpz_renderer_t renderer)
 {
-    renderer->transferCommandBuffer = [[renderer->device->commandQueue commandBuffer] retain];
-    renderer->currentBlitEncoder = [[renderer->transferCommandBuffer blitCommandEncoder] retain];
+    if (renderer->currentCommandBuffer)
+    {
+        /* Frame in progress — encode blits into the per-frame command buffer.
+         * Metal executes encoders in order within a command buffer, so the blit
+         * will complete before any subsequent render or compute encoders that
+         * read the uploaded data.  This avoids the CPU stall that a separate
+         * commit + waitUntilCompleted would impose.                          */
+        renderer->currentBlitEncoder = [[renderer->currentCommandBuffer blitCommandEncoder] retain];
+    }
+    else
+    {
+        /* Init-time / out-of-frame transfer — no frame command buffer exists
+         * yet.  Create a one-shot command buffer and block until it completes.
+         * This path is only taken for UploadMesh / LoadTexture before the
+         * first BeginFrame; a synchronous wait here is acceptable.          */
+        renderer->transferCommandBuffer = [[renderer->device->commandQueue commandBuffer] retain];
+        renderer->transferCommandBuffer.label = @"LapizTransferInit";
+        renderer->currentBlitEncoder = [[renderer->transferCommandBuffer blitCommandEncoder] retain];
+    }
 }
 
 static void lpz_renderer_end_transfer_pass(lpz_renderer_t renderer)
@@ -137,10 +193,17 @@ static void lpz_renderer_end_transfer_pass(lpz_renderer_t renderer)
     [renderer->currentBlitEncoder release];
     renderer->currentBlitEncoder = nil;
 
-    [renderer->transferCommandBuffer commit];
-    [renderer->transferCommandBuffer waitUntilCompleted];
-    [renderer->transferCommandBuffer release];
-    renderer->transferCommandBuffer = nil;
+    if (renderer->transferCommandBuffer)
+    {
+        /* One-shot init path: commit and block until the GPU finishes.
+         * The in-frame path encodes into currentCommandBuffer which is
+         * committed later by Submit — nothing to do here.                  */
+        [renderer->transferCommandBuffer commit];
+        [renderer->transferCommandBuffer waitUntilCompleted];
+        [renderer->transferCommandBuffer release];
+        renderer->transferCommandBuffer = nil;
+    }
+    /* In-frame path: no commit — Submit will commit the frame buffer once. */
 }
 
 static void lpz_renderer_copy_buffer_to_buffer(lpz_renderer_t renderer, lpz_buffer_t src, uint64_t src_offset, lpz_buffer_t dst, uint64_t dst_offset, uint64_t size)
@@ -165,6 +228,7 @@ static void lpz_renderer_generate_mipmaps(lpz_renderer_t renderer, lpz_texture_t
 static void lpz_renderer_begin_compute_pass(lpz_renderer_t renderer)
 {
     renderer->currentComputeEncoder = [[renderer->currentCommandBuffer computeCommandEncoder] retain];
+    renderer->currentComputeEncoder.label = @"LapizComputePass";
     lpz_renderer_reset_frame_state(renderer);
 }
 
@@ -325,26 +389,18 @@ static void lpz_renderer_bind_bind_group(lpz_renderer_t renderer, uint32_t set, 
     if (set < 8)
         renderer->activeBindGroups[set] = bind_group;
 
-    // We modify entry copies on the stack to avoid mutating the shared bind_group.
+    /* Apply dynamic offsets inline — no scratch-array memcpy required.
+     * lpz_encode_entries_render_dyn / _compute_dyn consume offsets in buffer
+     * entry order, matching Vulkan's dynamic descriptor offset convention.  */
     if (hasDynamic)
     {
-        struct bind_group_entry_t scratch[LPZ_MTL_MAX_BIND_ENTRIES];
         uint32_t n = bind_group->entry_count;
         if (n > LPZ_MTL_MAX_BIND_ENTRIES)
             n = LPZ_MTL_MAX_BIND_ENTRIES;
-        memcpy(scratch, bind_group->entries, n * sizeof(struct bind_group_entry_t));
-
-        uint32_t dynIdx = 0;
-        for (uint32_t i = 0; i < n; i++)
-        {
-            if (scratch[i].buffer && dynIdx < dynamic_offset_count)
-                scratch[i].dynamic_offset = dynamic_offsets[dynIdx++];
-        }
-
         if (renderer->currentEncoder)
-            lpz_encode_entries_render(renderer->currentEncoder, scratch, n);
+            lpz_encode_entries_render_dyn(renderer->currentEncoder, bind_group->entries, n, dynamic_offsets, dynamic_offset_count);
         else if (renderer->currentComputeEncoder)
-            lpz_encode_entries_compute(renderer->currentComputeEncoder, scratch, n);
+            lpz_encode_entries_compute_dyn(renderer->currentComputeEncoder, bind_group->entries, n, dynamic_offsets, dynamic_offset_count);
         return;
     }
 
@@ -376,6 +432,7 @@ static void lpz_renderer_push_constants(lpz_renderer_t renderer, LpzShaderStage 
 
 static void lpz_renderer_draw(lpz_renderer_t renderer, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance)
 {
+    atomic_fetch_add_explicit(&renderer->drawCounter, 1, memory_order_relaxed);
     [renderer->currentEncoder drawPrimitives:renderer->activePrimitiveType vertexStart:first_vertex vertexCount:vertex_count instanceCount:instance_count baseInstance:first_instance];
 }
 
@@ -383,6 +440,7 @@ static void lpz_renderer_draw_indexed(lpz_renderer_t renderer, uint32_t index_co
 {
     if (!renderer->currentEncoder || !renderer->currentIndexBuffer)
         return;
+    atomic_fetch_add_explicit(&renderer->drawCounter, 1, memory_order_relaxed);
     NSUInteger indexSize = (renderer->currentIndexType == MTLIndexTypeUInt16) ? 2 : 4;
     NSUInteger finalOffset = renderer->currentIndexBufferOffset + (first_index * indexSize);
     [renderer->currentEncoder drawIndexedPrimitives:renderer->activePrimitiveType indexCount:index_count indexType:renderer->currentIndexType indexBuffer:renderer->currentIndexBuffer indexBufferOffset:finalOffset instanceCount:instance_count baseVertex:vertex_offset baseInstance:first_instance];
@@ -442,17 +500,15 @@ static void lpz_renderer_bind_argument_table(lpz_renderer_t renderer, struct arg
     lpz_metal_log_api_specific_once("BindArgumentTable", "Metal argument tables / argument buffers", &logged_bind_argument_table);
 
 #if LAPIZ_MTL_HAS_METAL4
-    if (table->vertexTable && table->fragmentTable)
+    if (renderer->currentEncoder && table->vertexTable && table->fragmentTable)
     {
-        if (renderer->currentEncoder)
-        {
-            [renderer->currentEncoder setVertexArgumentTable:table->vertexTable atIndex:0];
-            [renderer->currentEncoder setFragmentArgumentTable:table->fragmentTable atIndex:0];
-        }
-        else if (renderer->currentComputeEncoder && table->computeTable)
-        {
-            [renderer->currentComputeEncoder setArgumentTable:table->computeTable atIndex:0];
-        }
+        [(id)renderer->currentEncoder setArgumentTable:table->vertexTable atStages:MTLRenderStageVertex];
+        [(id)renderer->currentEncoder setArgumentTable:table->fragmentTable atStages:MTLRenderStageFragment];
+        return;
+    }
+    if (renderer->currentComputeEncoder && table->computeTable)
+    {
+        [(id)renderer->currentComputeEncoder setArgumentTable:table->computeTable];
         return;
     }
 #endif
@@ -595,10 +651,8 @@ static void lpz_renderer_set_pass_resources(lpz_renderer_t renderer, const LpzPa
 
     [renderer->passResidencySet commit];
 
-    if (renderer->currentEncoder)
-        [renderer->currentEncoder useResidencySet:renderer->passResidencySet];
-    else if (renderer->currentComputeEncoder)
-        [renderer->currentComputeEncoder useResidencySet:renderer->passResidencySet];
+    if (renderer->currentCommandBuffer)
+        [(id)renderer->currentCommandBuffer useResidencySet:renderer->passResidencySet];
 #else
     (void)renderer;
     (void)desc;
@@ -1054,7 +1108,9 @@ static void lpz_renderer_set_viewports(lpz_renderer_t renderer, uint32_t first, 
         return;
 
     // Stack-allocate up to 16 viewports (Metal's maximum).
-    const uint32_t kMax = 16;
+    enum {
+        kMax = 16
+    };
     if (count > kMax)
         count = kMax;
     MTLViewport vps[kMax];
@@ -1077,7 +1133,9 @@ static void lpz_renderer_set_scissors(lpz_renderer_t renderer, uint32_t first, u
     if (!renderer->currentEncoder || !xywh || count == 0)
         return;
 
-    const uint32_t kMax = 16;
+    enum {
+        kMax = 16
+    };
     if (count > kMax)
         count = kMax;
     MTLScissorRect rects[kMax];
@@ -1092,14 +1150,6 @@ static void lpz_renderer_set_scissors(lpz_renderer_t renderer, uint32_t first, u
     [renderer->currentEncoder setScissorRects:rects count:(NSUInteger)count];
     (void)first;
 }
-
-// ============================================================================
-// ============================================================================
-
-// ============================================================================
-
-// ============================================================================
-// ============================================================================
 
 // Metal is a TBDR architecture; DONT_CARE on a colour attachment that was
 // previously written produces undefined contents (the tile may or may not

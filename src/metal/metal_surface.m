@@ -179,8 +179,16 @@ static lpz_texture_t lpz_surface_get_current_texture(lpz_surface_t surface)
     if (!surface || !surface->currentDrawable)
         return NULL;
 
-    memset(&surface->currentTexture, 0, sizeof(surface->currentTexture));
-    surface->currentTexture.texture = surface->currentDrawable.texture;
+    // Only rebuild the texture wrapper when the drawable's underlying MTLTexture
+    // has actually changed (i.e. after a new acquire).  Skipping the memset +
+    // pointer assignment on every call eliminates a small but guaranteed write
+    // to the cache line on every frame for no-op calls.
+    id<MTLTexture> drawableTex = surface->currentDrawable.texture;
+    if (surface->currentTexture.texture != drawableTex)
+    {
+        memset(&surface->currentTexture, 0, sizeof(surface->currentTexture));
+        surface->currentTexture.texture = drawableTex;
+    }
     return &surface->currentTexture;
 }
 

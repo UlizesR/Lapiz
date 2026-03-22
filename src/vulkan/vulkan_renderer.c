@@ -1,8 +1,5 @@
 #include "vulkan_internal.h"
 #include <stdlib.h>
-
-static void lpz_vk_check_attachment_hazards(lpz_renderer_t renderer, const LpzRenderPassDesc *desc);
-
 #include <string.h>
 
 static void lpz_vk_check_attachment_hazards(lpz_renderer_t renderer, const LpzRenderPassDesc *desc)
@@ -87,6 +84,12 @@ static void lpz_vk_renderer_begin_frame(lpz_renderer_t renderer)
     vkWaitForFences(renderer->device->device, 1, &renderer->inFlightFences[frame], VK_TRUE, UINT64_MAX);
     vkResetFences(renderer->device->device, 1, &renderer->inFlightFences[frame]);
 
+    // Reclaim the entire frame arena in O(1) — all transient allocations
+    // (attachment arrays, command-buffer handle lists, etc.) from the previous
+    // use of this slot are freed without any heap traffic.  Also resets the
+    // per-frame draw counter.
+    lpz_vk_frame_reset(renderer);
+
     renderer->currentCmd = renderer->commandBuffers[frame];
     vkResetCommandBuffer(renderer->currentCmd, 0);
 
@@ -103,6 +106,100 @@ static uint32_t lpz_vk_renderer_get_current_frame_index(lpz_renderer_t renderer)
     return renderer->frameIndex;
 }
 
+static void lpz_vk_transition_tracked_texture(lpz_renderer_t renderer, struct texture_t *tex, VkImageLayout newLayout, VkImageAspectFlags aspect)
+{
+    if (!renderer || !tex || tex->image == VK_NULL_HANDLE)
+        return;
+
+    VkImageLayout oldLayout = tex->layoutKnown ? tex->currentLayout : VK_IMAGE_LAYOUT_UNDEFINED;
+    if (oldLayout == newLayout)
+        return;
+
+    VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    VkAccessFlags srcAccess = 0;
+    switch (oldLayout)
+    {
+        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+            srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            srcAccess = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+            srcStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+            srcAccess = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+            srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            srcAccess = VK_ACCESS_TRANSFER_WRITE_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+            srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            srcAccess = VK_ACCESS_TRANSFER_READ_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+            srcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            srcAccess = VK_ACCESS_SHADER_READ_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
+            srcStage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+            srcAccess = 0;
+            break;
+        case VK_IMAGE_LAYOUT_UNDEFINED:
+        default:
+            break;
+    }
+
+    VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    VkAccessFlags dstAccess = 0;
+    switch (newLayout)
+    {
+        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+            dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            dstAccess = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+            dstStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+            dstAccess = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+            dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            dstAccess = VK_ACCESS_TRANSFER_WRITE_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+            dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            dstAccess = VK_ACCESS_TRANSFER_READ_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+            dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            dstAccess = VK_ACCESS_SHADER_READ_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
+            dstStage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+            dstAccess = 0;
+            break;
+        default:
+            dstStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            dstAccess = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            break;
+    }
+
+    lpz_vk_image_barrier(renderer->currentCmd, &(LpzImageBarrier){
+                                                   .image = tex->image,
+                                                   .aspect = aspect,
+                                                   .old_layout = oldLayout,
+                                                   .new_layout = newLayout,
+                                                   .src_stage = srcStage,
+                                                   .dst_stage = dstStage,
+                                                   .src_access = srcAccess,
+                                                   .dst_access = dstAccess,
+                                                   .src_stage2 = (VkPipelineStageFlags2KHR)srcStage,
+                                                   .dst_stage2 = (VkPipelineStageFlags2KHR)dstStage,
+                                                   .src_access2 = (VkAccessFlags2KHR)srcAccess,
+                                                   .dst_access2 = (VkAccessFlags2KHR)dstAccess,
+                                               });
+    tex->currentLayout = newLayout;
+    tex->layoutKnown = true;
+}
+
 static void lpz_vk_renderer_begin_render_pass(lpz_renderer_t renderer, const LpzRenderPassDesc *desc)
 {
     lpz_vk_check_attachment_hazards(renderer, desc);
@@ -111,9 +208,22 @@ static void lpz_vk_renderer_begin_render_pass(lpz_renderer_t renderer, const Lpz
     uint32_t renderWidth = 0, renderHeight = 0;
 
     VkRenderingAttachmentInfo *colorAtts = NULL;
+    bool colorAttsFromHeap = false;
     if (colorCount > 0)
     {
-        colorAtts = calloc(colorCount, sizeof(VkRenderingAttachmentInfo));
+        size_t colorAttsBytes = colorCount * sizeof(VkRenderingAttachmentInfo);
+        // O(1) bump allocation from the frame arena; falls back to heap only
+        // when the arena is exhausted (essentially never for normal scenes).
+        colorAtts = lpz_vk_frame_alloc(renderer, colorAttsBytes);
+        if (colorAtts)
+        {
+            memset(colorAtts, 0, colorAttsBytes);
+        }
+        else
+        {
+            colorAtts = calloc(colorCount, sizeof(VkRenderingAttachmentInfo));
+            colorAttsFromHeap = true;
+        }
         for (uint32_t i = 0; i < colorCount; i++)
         {
             colorAtts[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -138,7 +248,7 @@ static void lpz_vk_renderer_begin_render_pass(lpz_renderer_t renderer, const Lpz
                     renderWidth = tex->width;
                     renderHeight = tex->height;
                 }
-                transition_image(renderer->currentCmd, tex->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+                lpz_vk_transition_tracked_texture(renderer, tex, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
             }
 
             colorAtts[i].imageView = resolvedView;
@@ -155,7 +265,7 @@ static void lpz_vk_renderer_begin_render_pass(lpz_renderer_t renderer, const Lpz
             if (desc->color_attachments[i].resolve_texture)
             {
                 struct texture_t *res = (struct texture_t *)desc->color_attachments[i].resolve_texture;
-                transition_image(renderer->currentCmd, res->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+                lpz_vk_transition_tracked_texture(renderer, res, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
                 colorAtts[i].resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
                 colorAtts[i].resolveImageView = res->imageView;
                 colorAtts[i].resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -187,7 +297,7 @@ static void lpz_vk_renderer_begin_render_pass(lpz_renderer_t renderer, const Lpz
 
         if (dtex)
         {
-            transition_image(renderer->currentCmd, dtex->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, aspect);
+            lpz_vk_transition_tracked_texture(renderer, dtex, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, aspect);
             if (renderWidth == 0)
             {
                 renderWidth = dtex->width;
@@ -233,7 +343,10 @@ static void lpz_vk_renderer_begin_render_pass(lpz_renderer_t renderer, const Lpz
     }
 
     lpz_vk_renderer_reset_state(renderer);
-    free(colorAtts);
+    // Only free if we fell back to the heap allocator (arena allocs are
+    // reclaimed automatically at the next lpz_vk_frame_reset call).
+    if (colorAttsFromHeap)
+        free(colorAtts);
 }
 
 static void lpz_vk_renderer_end_render_pass(lpz_renderer_t renderer)
@@ -284,7 +397,24 @@ static void lpz_vk_renderer_copy_buffer_to_texture(lpz_renderer_t renderer, lpz_
         .image = dst->image,
         .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, dst->mipLevels, 0, 1},
     };
-    vkCmdPipelineBarrier(renderer->transferCmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
+    /* Use the tracked layout as oldLayout.  UNDEFINED is used only for the
+     * first upload (currentLayout == 0) which correctly signals that the
+     * previous contents may be discarded; subsequent uploads preserve it.  */
+    VkImageLayout old_layout = (dst->currentLayout != VK_IMAGE_LAYOUT_UNDEFINED) ? dst->currentLayout : VK_IMAGE_LAYOUT_UNDEFINED;
+    lpz_vk_image_barrier(renderer->transferCmd, &(LpzImageBarrier){
+                                                    .image = toDst.image,
+                                                    .aspect = toDst.subresourceRange.aspectMask,
+                                                    .old_layout = old_layout,
+                                                    .new_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                                    .src_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                                    .dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                    .src_access = 0,
+                                                    .dst_access = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                                    .src_stage2 = VK_PIPELINE_STAGE_2_NONE_KHR,
+                                                    .dst_stage2 = VK_PIPELINE_STAGE_2_COPY_BIT_KHR,
+                                                    .src_access2 = 0,
+                                                    .dst_access2 = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR,
+                                                });
 
     uint32_t rowLengthTexels = 0;
     if (bytes_per_row > 0 && width > 0)
@@ -308,7 +438,22 @@ static void lpz_vk_renderer_copy_buffer_to_texture(lpz_renderer_t renderer, lpz_
     toShader.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     toShader.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     toShader.subresourceRange.levelCount = 1;
-    vkCmdPipelineBarrier(renderer->transferCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toShader);
+    lpz_vk_image_barrier(renderer->transferCmd, &(LpzImageBarrier){
+                                                    .image = toShader.image,
+                                                    .aspect = toShader.subresourceRange.aspectMask,
+                                                    .old_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                                    .new_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                                    .src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                    .dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                                    .src_access = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                                    .dst_access = VK_ACCESS_SHADER_READ_BIT,
+                                                    .src_stage2 = VK_PIPELINE_STAGE_2_COPY_BIT_KHR,
+                                                    .dst_stage2 = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT_KHR,
+                                                    .src_access2 = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR,
+                                                    .dst_access2 = VK_ACCESS_2_SHADER_READ_BIT_KHR,
+                                                });
+    /* Update tracked layout so future barriers use the correct oldLayout. */
+    dst->currentLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
 static void lpz_vk_renderer_generate_mipmaps(lpz_renderer_t renderer, lpz_texture_t texture)
@@ -343,7 +488,20 @@ static void lpz_vk_renderer_generate_mipmaps(lpz_renderer_t renderer, lpz_textur
         barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+        lpz_vk_image_barrier(cmd, &(LpzImageBarrier){
+                                      .image = barrier.image,
+                                      .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+                                      .old_layout = barrier.oldLayout,
+                                      .new_layout = barrier.newLayout,
+                                      .src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                      .dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                      .src_access = barrier.srcAccessMask,
+                                      .dst_access = barrier.dstAccessMask,
+                                      .src_stage2 = VK_PIPELINE_STAGE_2_BLIT_BIT_KHR,
+                                      .dst_stage2 = VK_PIPELINE_STAGE_2_BLIT_BIT_KHR,
+                                      .src_access2 = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR,
+                                      .dst_access2 = VK_ACCESS_2_TRANSFER_READ_BIT_KHR,
+                                  });
 
         int32_t nw = mw > 1 ? mw / 2 : 1;
         int32_t nh = mh > 1 ? mh / 2 : 1;
@@ -359,7 +517,20 @@ static void lpz_vk_renderer_generate_mipmaps(lpz_renderer_t renderer, lpz_textur
         barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+        lpz_vk_image_barrier(cmd, &(LpzImageBarrier){
+                                      .image = barrier.image,
+                                      .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+                                      .old_layout = barrier.oldLayout,
+                                      .new_layout = barrier.newLayout,
+                                      .src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                      .dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                      .src_access = VK_ACCESS_TRANSFER_READ_BIT,
+                                      .dst_access = VK_ACCESS_SHADER_READ_BIT,
+                                      .src_stage2 = VK_PIPELINE_STAGE_2_BLIT_BIT_KHR,
+                                      .dst_stage2 = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT_KHR,
+                                      .src_access2 = VK_ACCESS_2_TRANSFER_READ_BIT_KHR,
+                                      .dst_access2 = VK_ACCESS_2_SHADER_READ_BIT_KHR,
+                                  });
         mw = nw;
         mh = nh;
     }
@@ -370,20 +541,45 @@ static void lpz_vk_renderer_generate_mipmaps(lpz_renderer_t renderer, lpz_textur
     barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+    lpz_vk_image_barrier(cmd, &(LpzImageBarrier){
+                                  .image = barrier.image,
+                                  .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+                                  .old_layout = barrier.oldLayout,
+                                  .new_layout = barrier.newLayout,
+                                  .src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                  .dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                  .src_access = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                  .dst_access = VK_ACCESS_SHADER_READ_BIT,
+                                  .src_stage2 = VK_PIPELINE_STAGE_2_COPY_BIT_KHR,
+                                  .dst_stage2 = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT_KHR,
+                                  .src_access2 = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR,
+                                  .dst_access2 = VK_ACCESS_2_SHADER_READ_BIT_KHR,
+                              });
+    /* All mip levels are now in SHADER_READ_ONLY_OPTIMAL.                 */
+    texture->currentLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
 static void lpz_vk_renderer_end_transfer_pass(lpz_renderer_t renderer)
 {
     vkEndCommandBuffer(renderer->transferCmd);
+
+    // Use a transient fence instead of vkQueueWaitIdle.
+    // This is equivalent for the current synchronous upload model and is the
+    // correct primitive to replace with async fence tracking in the future.
+    VkFenceCreateInfo fenceCI = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence transferFence = VK_NULL_HANDLE;
+    vkCreateFence(renderer->device->device, &fenceCI, NULL, &transferFence);
+
     VkSubmitInfo si = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1,
         .pCommandBuffers = &renderer->transferCmd,
     };
     VkQueue queue = renderer->transferOwnsDedicatedQueue ? renderer->device->transferQueue : renderer->device->graphicsQueue;
-    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue);
+    vkQueueSubmit(queue, 1, &si, transferFence);
+    vkWaitForFences(renderer->device->device, 1, &transferFence, VK_TRUE, UINT64_MAX);
+    vkDestroyFence(renderer->device->device, transferFence, NULL);
+
     vkFreeCommandBuffers(renderer->device->device, renderer->device->transferCommandPool, 1, &renderer->transferCmd);
 }
 
@@ -395,7 +591,7 @@ static void lpz_vk_renderer_begin_compute_pass(lpz_renderer_t renderer)
         .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
     };
-    vkCmdPipelineBarrier(renderer->currentCmd, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &b, 0, NULL, 0, NULL);
+    lpz_vk_memory_barrier(renderer->currentCmd, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 }
 
 static void lpz_vk_renderer_end_compute_pass(lpz_renderer_t renderer)
@@ -405,13 +601,13 @@ static void lpz_vk_renderer_end_compute_pass(lpz_renderer_t renderer)
         .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
     };
-    vkCmdPipelineBarrier(renderer->currentCmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &b, 0, NULL, 0, NULL);
+    lpz_vk_memory_barrier(renderer->currentCmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
 }
 
 static void lpz_vk_renderer_submit(lpz_renderer_t renderer, lpz_surface_t surface)
 {
     if (surface)
-        transition_image(renderer->currentCmd, surface->swapchainTextures[surface->currentImageIndex].image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_ASPECT_COLOR_BIT);
+        lpz_vk_transition_tracked_texture(renderer, &surface->swapchainTextures[surface->currentImageIndex], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_ASPECT_COLOR_BIT);
 
     vkEndCommandBuffer(renderer->currentCmd);
 
@@ -451,6 +647,9 @@ static void lpz_vk_renderer_submit(lpz_renderer_t renderer, lpz_surface_t surfac
 
 static void lpz_vk_renderer_submit_with_fence(lpz_renderer_t renderer, lpz_surface_t surface, lpz_fence_t fence)
 {
+    if (surface)
+        lpz_vk_transition_tracked_texture(renderer, &surface->swapchainTextures[surface->currentImageIndex], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_ASPECT_COLOR_BIT);
+
     VkPipelineStageFlags waitStages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     vkEndCommandBuffer(renderer->currentCmd);
 
@@ -592,11 +791,13 @@ static void lpz_vk_renderer_push_constants(lpz_renderer_t renderer, LpzShaderSta
 
 static void lpz_vk_renderer_draw(lpz_renderer_t renderer, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance)
 {
+    atomic_fetch_add_explicit(&renderer->drawCounter, 1, memory_order_relaxed);
     vkCmdDraw(renderer->currentCmd, vertex_count, instance_count, first_vertex, first_instance);
 }
 
 static void lpz_vk_renderer_draw_indexed(lpz_renderer_t renderer, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
 {
+    atomic_fetch_add_explicit(&renderer->drawCounter, 1, memory_order_relaxed);
     vkCmdDrawIndexed(renderer->currentCmd, index_count, instance_count, first_index, vertex_offset, first_instance);
 }
 
@@ -671,12 +872,87 @@ static void lpz_vk_renderer_resource_barrier(lpz_renderer_t renderer, lpz_textur
         return;
     bool isDepth = is_depth_format(texture->format);
     VkImageAspectFlags aspect = isDepth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+
+    VkImageLayout oldLayout = (VkImageLayout)from_state;
+    VkImageLayout newLayout = (VkImageLayout)to_state;
+
+    // Derive precise source stage/access from the current (old) layout.
+    VkPipelineStageFlags srcStage;
+    VkAccessFlags srcAccess;
+    switch (oldLayout)
+    {
+        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+            srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            srcAccess = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+            srcStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+            srcAccess = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+            srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            srcAccess = VK_ACCESS_TRANSFER_WRITE_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+            srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            srcAccess = VK_ACCESS_TRANSFER_READ_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+            srcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            srcAccess = VK_ACCESS_SHADER_READ_BIT;
+            break;
+        default:
+            // Unknown source layout — fall back to a conservative scope.
+            srcStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            srcAccess = VK_ACCESS_MEMORY_WRITE_BIT;
+            break;
+    }
+
+    // Derive precise destination stage/access from the target (new) layout.
+    VkPipelineStageFlags dstStage;
+    VkAccessFlags dstAccess;
+    switch (newLayout)
+    {
+        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+            dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            dstAccess = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+            dstStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+            dstAccess = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+            dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            dstAccess = VK_ACCESS_TRANSFER_WRITE_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+            dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            dstAccess = VK_ACCESS_TRANSFER_READ_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+            dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            dstAccess = VK_ACCESS_SHADER_READ_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
+            dstStage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+            dstAccess = 0;
+            break;
+        default:
+            dstStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            dstAccess = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            break;
+    }
+
+    /* Use tracked layout when available; fall back to the computed oldLayout
+     * for layouts the renderer itself doesn't produce (e.g. PRESENT).     */
+    if (texture->currentLayout != VK_IMAGE_LAYOUT_UNDEFINED)
+        oldLayout = texture->currentLayout;
     VkImageMemoryBarrier barrier = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-        .oldLayout = (VkImageLayout)from_state,
-        .newLayout = (VkImageLayout)to_state,
+        .srcAccessMask = srcAccess,
+        .dstAccessMask = dstAccess,
+        .oldLayout = oldLayout,
+        .newLayout = newLayout,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .image = texture->image,
@@ -689,7 +965,21 @@ static void lpz_vk_renderer_resource_barrier(lpz_renderer_t renderer, lpz_textur
                 .layerCount = VK_REMAINING_ARRAY_LAYERS,
             },
     };
-    vkCmdPipelineBarrier(renderer->currentCmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+    lpz_vk_image_barrier(renderer->currentCmd, &(LpzImageBarrier){
+                                                   .image = barrier.image,
+                                                   .aspect = barrier.subresourceRange.aspectMask,
+                                                   .old_layout = barrier.oldLayout,
+                                                   .new_layout = barrier.newLayout,
+                                                   .src_stage = srcStage,
+                                                   .dst_stage = dstStage,
+                                                   .src_access = barrier.srcAccessMask,
+                                                   .dst_access = barrier.dstAccessMask,
+                                                   .src_stage2 = (VkPipelineStageFlags2KHR)srcStage,
+                                                   .dst_stage2 = (VkPipelineStageFlags2KHR)dstStage,
+                                                   .src_access2 = (VkAccessFlags2KHR)barrier.srcAccessMask,
+                                                   .dst_access2 = (VkAccessFlags2KHR)barrier.dstAccessMask,
+                                               });
+    texture->currentLayout = newLayout;
 }
 // A bundle captures a sequence of draw calls that can be replayed cheaply.
 static lpz_render_bundle_t lpz_vk_record_render_bundle(lpz_device_t device, void (*record_fn)(lpz_renderer_t, void *), void *userdata)
@@ -786,44 +1076,37 @@ static void lpz_vk_renderer_end_query(lpz_renderer_t renderer, lpz_query_pool_t 
 }
 
 // --- Debug labels ---
-
-// Helper: look up a debug utils command by name. Returns NULL when not available.
-static void *get_debug_cmd_fn(lpz_renderer_t renderer, const char *name)
-{
-    return (void *)vkGetDeviceProcAddr(renderer->device->device, name);
-}
+// PFN pointers are loaded once at device creation time (device_t::pfnCmdBeginDebugLabel etc.)
+// to avoid a vkGetDeviceProcAddr hash-map lookup on every labeled region.
 
 static void lpz_vk_renderer_begin_debug_label(lpz_renderer_t renderer, const char *label, float r, float g, float b)
 {
-    PFN_vkCmdBeginDebugUtilsLabelEXT fn = (PFN_vkCmdBeginDebugUtilsLabelEXT)get_debug_cmd_fn(renderer, "vkCmdBeginDebugUtilsLabelEXT");
-    if (!fn)
+    if (!renderer->device->pfnCmdBeginDebugLabel)
         return;
     VkDebugUtilsLabelEXT info = {
         .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT,
         .pLabelName = label,
         .color = {r, g, b, 1.0f},
     };
-    fn(renderer->currentCmd, &info);
+    renderer->device->pfnCmdBeginDebugLabel(renderer->currentCmd, &info);
 }
 
 static void lpz_vk_renderer_end_debug_label(lpz_renderer_t renderer)
 {
-    PFN_vkCmdEndDebugUtilsLabelEXT fn = (PFN_vkCmdEndDebugUtilsLabelEXT)get_debug_cmd_fn(renderer, "vkCmdEndDebugUtilsLabelEXT");
-    if (fn)
-        fn(renderer->currentCmd);
+    if (renderer->device->pfnCmdEndDebugLabel)
+        renderer->device->pfnCmdEndDebugLabel(renderer->currentCmd);
 }
 
 static void lpz_vk_renderer_insert_debug_label(lpz_renderer_t renderer, const char *label, float r, float g, float b)
 {
-    PFN_vkCmdInsertDebugUtilsLabelEXT fn = (PFN_vkCmdInsertDebugUtilsLabelEXT)get_debug_cmd_fn(renderer, "vkCmdInsertDebugUtilsLabelEXT");
-    if (!fn)
+    if (!renderer->device->pfnCmdInsertDebugLabel)
         return;
     VkDebugUtilsLabelEXT info = {
         .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT,
         .pLabelName = label,
         .color = {r, g, b, 1.0f},
     };
-    fn(renderer->currentCmd, &info);
+    renderer->device->pfnCmdInsertDebugLabel(renderer->currentCmd, &info);
 }
 
 // --- Dynamic stencil ---
@@ -886,12 +1169,15 @@ static void lpz_vk_renderer_set_pass_residency(lpz_renderer_t renderer, const Lp
     static bool logged_pass_residency = false;
     lpz_vk_log_api_specific_once("SetPassResidency", "Vulkan memory barrier / residency-style synchronization", &logged_pass_residency);
     (void)desc;
+    // Use the narrowest scope that covers the intended residency fence:
+    // ensure all prior shader writes are visible to subsequent shader reads.
+    // This is tighter than the previous ALL_COMMANDS→ALL_COMMANDS barrier.
     VkMemoryBarrier b = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
     };
-    vkCmdPipelineBarrier(renderer->currentCmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &b, 0, NULL, 0, NULL);
+    lpz_vk_memory_barrier(renderer->currentCmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 }
 
 // ============================================================================
@@ -944,7 +1230,12 @@ static void lpz_vk_renderer_submit_command_buffers(lpz_renderer_t renderer, lpz_
         return;
 
     // Collect raw VkCommandBuffer handles (end any that weren't explicitly ended)
-    VkCommandBuffer *vkCmds = malloc(sizeof(VkCommandBuffer) * count);
+    // Prefer the frame arena; fall back to heap only for very large batches.
+    size_t vkCmdsBytes = sizeof(VkCommandBuffer) * count;
+    VkCommandBuffer *vkCmds = lpz_vk_frame_alloc(renderer, vkCmdsBytes);
+    bool vkCmdsFromHeap = (vkCmds == NULL);
+    if (vkCmdsFromHeap)
+        vkCmds = malloc(vkCmdsBytes);
     for (uint32_t i = 0; i < count; i++)
     {
         if (!cmds[i]->ended)
@@ -984,7 +1275,8 @@ static void lpz_vk_renderer_submit_command_buffers(lpz_renderer_t renderer, lpz_
         vkQueuePresentKHR(renderer->device->graphicsQueue, &presentInfo);
     }
 
-    free(vkCmds);
+    if (vkCmdsFromHeap)
+        free(vkCmds);
 
     // Destroy per-command-buffer pools now that GPU work is queued.
     // (The GPU may still be using them but pool destruction is deferred by the driver.)
@@ -1011,7 +1303,15 @@ static void lpz_vk_submit_compute(lpz_compute_queue_t queue, const LpzComputeSub
     if (!queue || !desc || desc->command_buffer_count == 0)
         return;
 
-    VkCommandBuffer *vkCmds = malloc(sizeof(VkCommandBuffer) * desc->command_buffer_count);
+    // Use a small stack buffer for the common case of few command buffers;
+    // fall back to heap only when the batch is unusually large.
+    VkCommandBuffer stackCmds[LPZ_MAX_FRAMES_IN_FLIGHT * 4];
+    VkCommandBuffer *vkCmds;
+    bool vkCmdsFromHeap = (desc->command_buffer_count > (sizeof(stackCmds) / sizeof(stackCmds[0])));
+    if (vkCmdsFromHeap)
+        vkCmds = malloc(sizeof(VkCommandBuffer) * desc->command_buffer_count);
+    else
+        vkCmds = stackCmds;
     for (uint32_t i = 0; i < desc->command_buffer_count; i++)
     {
         if (!desc->command_buffers[i]->ended)
@@ -1033,7 +1333,8 @@ static void lpz_vk_submit_compute(lpz_compute_queue_t queue, const LpzComputeSub
         .pCommandBuffers = vkCmds,
     };
     vkQueueSubmit(queue->queue, 1, &submitInfo, vkFence);
-    free(vkCmds);
+    if (vkCmdsFromHeap)
+        free(vkCmds);
 
     // Release per-command-buffer pools (submit is already queued, driver defers destruction)
     for (uint32_t i = 0; i < desc->command_buffer_count; i++)

@@ -54,9 +54,10 @@ void main()
     // Build quad in screen space (pixels, top-left origin, +Y down)
     vec2 screen_pos = g.pos + corner * g.size;
 
-    // Map to NDC: [-1, 1], Y flipped (Vulkan Y is -1 at top)
-    vec2 ndc     = screen_pos / g.screen * 2.0 - 1.0;
-    ndc.y        = -ndc.y;
+    // Convert to NDC: [-1, 1], Y flipped (Vulkan Y is -1 at top).
+    // fma(screen_pos, vec2(2,-2)/screen, vec2(-1,1)) performs the
+    // div + scale + shift + Y-flip in a single fused multiply-add.
+    vec2 ndc    = fma(screen_pos, vec2(2.0, -2.0) / g.screen, vec2(-1.0, 1.0));
 
     gl_Position = vec4(ndc, 0.0, 1.0);
     v_uv        = g.uv + corner * g.uv_size;

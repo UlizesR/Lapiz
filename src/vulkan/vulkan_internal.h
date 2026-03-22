@@ -38,6 +38,7 @@ LAPIZ_INLINE void lpz_vk_log_api_specific_once(const char *fn, const char *featu
 // ============================================================================
 
 extern bool g_vk13;
+extern bool g_has_sync2; /* VK_KHR_synchronization2 or Vulkan 1.3 */
 extern bool g_has_dynamic_render;
 extern bool g_has_ext_dyn_state;
 extern bool g_has_mesh_shader;
@@ -49,6 +50,7 @@ extern bool g_has_descriptor_indexing;
 extern bool g_has_pipeline_stats;
 extern float g_timestamp_period;
 
+extern PFN_vkCmdPipelineBarrier2KHR g_vkCmdPipelineBarrier2; /* sync2 */
 extern PFN_vkCmdBeginRenderingKHR g_vkCmdBeginRendering;
 extern PFN_vkCmdEndRenderingKHR g_vkCmdEndRendering;
 extern PFN_vkCmdSetDepthTestEnableEXT g_vkCmdSetDepthTestEnable;
@@ -84,6 +86,11 @@ struct device_t {
     bool debugWarnAttachmentHazards;
     bool debugValidateReadAfterWrite;
     PFN_vkSetDeviceMemoryPriorityEXT pfnSetDeviceMemoryPriority;
+    // Cached debug-utils command function pointers (loaded once at device creation,
+    // avoids a vkGetDeviceProcAddr lookup on every debug label call).
+    PFN_vkCmdBeginDebugUtilsLabelEXT pfnCmdBeginDebugLabel;
+    PFN_vkCmdEndDebugUtilsLabelEXT pfnCmdEndDebugLabel;
+    PFN_vkCmdInsertDebugUtilsLabelEXT pfnCmdInsertDebugLabel;
 };
 
 struct heap_t {
@@ -113,6 +120,14 @@ struct texture_t {
     bool isSwapchainImage;
     bool ownsMemory;
     lpz_device_t device;
+    /* Tracks the current Vulkan image layout so barriers can supply the
+     * correct oldLayout instead of always using UNDEFINED.  UNDEFINED is
+     * only valid for the very first use or when contents are discarded;
+     * using it otherwise forces redundant driver transitions and may discard
+     * contents that were intentionally preserved with LOAD.                */
+    VkImageLayout currentLayout;
+    bool layoutKnown;     /* true once currentLayout has been set by a barrier */
+    uint32_t arrayLayers; /* number of array layers; needed for image view    */
 };
 
 struct texture_view_t {
@@ -229,7 +244,16 @@ struct surface_t {
     VkSemaphore imageAvailableSemaphores[LPZ_MAX_FRAMES_IN_FLIGHT];
     VkSemaphore renderFinishedSemaphores[LPZ_MAX_FRAMES_IN_FLIGHT];
     uint64_t lastPresentTimestamp;
+    // The color space negotiated at swapchain creation time.
+    // Preserved across resize so we don't silently revert to SRGB_NONLINEAR.
+    VkColorSpaceKHR chosenColorSpace;
 };
+
+// Size of the per-renderer frame-lifetime bump allocator.
+// 64 KB comfortably covers attachment info arrays, temporary command-buffer
+// handle lists, and other hot-path transient allocations across a full frame.
+// Increase if validation warns about arena exhaustion.
+#define LPZ_VK_FRAME_ARENA_SIZE (64u * 1024u)
 
 struct renderer_t {
     lpz_device_t device;
@@ -255,6 +279,21 @@ struct renderer_t {
     VkViewport cachedViewport;
     VkRect2D cachedScissor;
     bool transferOwnsDedicatedQueue;
+
+    // -----------------------------------------------------------------------
+    // Frame-lifetime bump allocator (frame arena).
+    // Reset once per BeginFrame — all transient per-frame allocations (render-
+    // pass attachment arrays, temporary VkCommandBuffer handle lists, etc.)
+    // use this arena instead of malloc/free, giving O(1) alloc with zero
+    // fragmentation and no heap traffic in the hot path.
+    // -----------------------------------------------------------------------
+    _Alignas(16) char frameArena[LPZ_VK_FRAME_ARENA_SIZE];
+    size_t frameArenaOffset;
+
+    // Atomic draw-call counter — incremented on every Draw/DrawIndexed call
+    // with memory_order_relaxed (counter only; no ordering guarantee needed).
+    // Useful for per-frame stats and multi-threaded recording diagnostics.
+    _Atomic uint32_t drawCounter;
 };
 
 struct fence_t {
@@ -317,6 +356,148 @@ LAPIZ_INLINE void lpz_vk_renderer_reset_state(lpz_renderer_t renderer)
     renderer->scissorValid = false;
     memset(renderer->activeBindGroups, 0, sizeof(renderer->activeBindGroups));
     memset(renderer->activeVertexBuffers, 0, sizeof(renderer->activeVertexBuffers));
+}
+
+// ============================================================================
+// FRAME ARENA HELPERS
+//
+// lpz_vk_frame_reset()  — call once at BeginFrame; reclaims all arena memory
+//                          in a single store, eliminating heap traffic.
+// lpz_vk_frame_alloc()  — O(1) bump allocation (pointer add + range check).
+//                          Returns NULL when exhausted so callers can fall
+//                          back to malloc for unusually large requests.
+// All returned pointers are guaranteed 16-byte aligned (SIMD/GPU-upload safe).
+// ============================================================================
+
+LAPIZ_INLINE void lpz_vk_frame_reset(struct renderer_t *r)
+{
+    if (r)
+    {
+        r->frameArenaOffset = 0;
+        // Reset per-frame draw counter so stats reflect the current frame only.
+        atomic_store_explicit(&r->drawCounter, 0, memory_order_relaxed);
+    }
+}
+
+LAPIZ_INLINE void *lpz_vk_frame_alloc(struct renderer_t *r, size_t size)
+{
+    if (!r || size == 0)
+        return NULL;
+    // Round up to next 16-byte boundary for alignment safety.
+    size_t aligned = (size + 15u) & ~15u;
+    if (r->frameArenaOffset + aligned > LPZ_VK_FRAME_ARENA_SIZE)
+        return NULL;  // arena exhausted — caller falls back to malloc
+    void *p = r->frameArena + r->frameArenaOffset;
+    r->frameArenaOffset += aligned;
+    return p;
+}
+
+// ============================================================================
+// SYNC2 BARRIER HELPERS
+//
+// Use sync2 (VK_KHR_synchronization2 / Vulkan 1.3) when available.
+// The helpers below issue precisely-scoped image and buffer barriers.
+// On drivers that don't expose sync2 they fall back to the legacy API.
+// ============================================================================
+
+typedef struct LpzImageBarrier {
+    VkImage image;
+    VkImageAspectFlags aspect;
+    VkImageLayout old_layout;
+    VkImageLayout new_layout;
+    VkPipelineStageFlags src_stage; /* legacy stage (fallback) */
+    VkPipelineStageFlags dst_stage; /* legacy stage (fallback) */
+    VkAccessFlags src_access;
+    VkAccessFlags dst_access;
+    /* sync2 stage masks — populated from the above when 0 */
+    VkPipelineStageFlags2KHR src_stage2;
+    VkPipelineStageFlags2KHR dst_stage2;
+    VkAccessFlags2KHR src_access2;
+    VkAccessFlags2KHR dst_access2;
+} LpzImageBarrier;
+
+/* Issue one image memory barrier, preferring sync2.                        */
+LAPIZ_INLINE void lpz_vk_image_barrier(VkCommandBuffer cmd, const LpzImageBarrier *b)
+{
+    VkImageSubresourceRange sr = {
+        .aspectMask = b->aspect,
+        .baseMipLevel = 0,
+        .levelCount = VK_REMAINING_MIP_LEVELS,
+        .baseArrayLayer = 0,
+        .layerCount = VK_REMAINING_ARRAY_LAYERS,
+    };
+
+    if (g_has_sync2 && g_vkCmdPipelineBarrier2)
+    {
+        VkPipelineStageFlags2KHR s2 = b->src_stage2 ? b->src_stage2 : (VkPipelineStageFlags2KHR)b->src_stage;
+        VkPipelineStageFlags2KHR d2 = b->dst_stage2 ? b->dst_stage2 : (VkPipelineStageFlags2KHR)b->dst_stage;
+        VkAccessFlags2KHR sa2 = b->src_access2 ? b->src_access2 : (VkAccessFlags2KHR)b->src_access;
+        VkAccessFlags2KHR da2 = b->dst_access2 ? b->dst_access2 : (VkAccessFlags2KHR)b->dst_access;
+        VkImageMemoryBarrier2KHR imb = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2_KHR,
+            .srcStageMask = s2,
+            .srcAccessMask = sa2,
+            .dstStageMask = d2,
+            .dstAccessMask = da2,
+            .oldLayout = b->old_layout,
+            .newLayout = b->new_layout,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = b->image,
+            .subresourceRange = sr,
+        };
+        VkDependencyInfoKHR dep = {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR,
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &imb,
+        };
+        g_vkCmdPipelineBarrier2(cmd, &dep);
+    }
+    else
+    {
+        VkImageMemoryBarrier imb = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = b->src_access,
+            .dstAccessMask = b->dst_access,
+            .oldLayout = b->old_layout,
+            .newLayout = b->new_layout,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = b->image,
+            .subresourceRange = sr,
+        };
+        vkCmdPipelineBarrier(cmd, b->src_stage, b->dst_stage, 0, 0, NULL, 0, NULL, 1, &imb);
+    }
+}
+
+/* Issue a global memory barrier (no image), preferring sync2.              */
+LAPIZ_INLINE void lpz_vk_memory_barrier(VkCommandBuffer cmd, VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage, VkAccessFlags src_access, VkAccessFlags dst_access)
+{
+    if (g_has_sync2 && g_vkCmdPipelineBarrier2)
+    {
+        VkMemoryBarrier2KHR mb = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR,
+            .srcStageMask = (VkPipelineStageFlags2KHR)src_stage,
+            .srcAccessMask = (VkAccessFlags2KHR)src_access,
+            .dstStageMask = (VkPipelineStageFlags2KHR)dst_stage,
+            .dstAccessMask = (VkAccessFlags2KHR)dst_access,
+        };
+        VkDependencyInfoKHR dep = {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR,
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &mb,
+        };
+        g_vkCmdPipelineBarrier2(cmd, &dep);
+    }
+    else
+    {
+        VkMemoryBarrier mb = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = src_access,
+            .dstAccessMask = dst_access,
+        };
+        vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 1, &mb, 0, NULL, 0, NULL);
+    }
 }
 
 // One-shot command buffer helpers (implemented in vulkan_device.c, used in renderer/surface)
@@ -402,13 +583,20 @@ LAPIZ_INLINE VkCommandBuffer lpz_vk_begin_one_shot(lpz_device_t device)
 LAPIZ_INLINE void lpz_vk_end_one_shot(lpz_device_t device, VkCommandBuffer cmd)
 {
     vkEndCommandBuffer(cmd);
+
+    VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence fence = VK_NULL_HANDLE;
+    vkCreateFence(device->device, &fci, NULL, &fence);
+
     VkSubmitInfo si = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1,
         .pCommandBuffers = &cmd,
     };
-    vkQueueSubmit(device->graphicsQueue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(device->graphicsQueue);
+    vkQueueSubmit(device->graphicsQueue, 1, &si, fence);
+    vkWaitForFences(device->device, 1, &fence, VK_TRUE, UINT64_MAX);
+    vkDestroyFence(device->device, fence, NULL);
+
     vkFreeCommandBuffers(device->device, device->transferCommandPool, 1, &cmd);
 }
 
@@ -447,8 +635,34 @@ LAPIZ_INLINE void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLa
         src = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         dst = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
     }
+    // Upload path: staging copy complete → ready for shader sampling
+    else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+    {
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        src = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dst = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    }
+    // Render-to-texture path: sampled last frame → color attachment this frame
+    else if (oldLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && newLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+    {
+        b.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        src = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        dst = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    }
+    // Resolve / blit source: color attachment → transfer read
+    else if (oldLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL && newLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+    {
+        b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        src = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dst = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    }
     else
     {
+        // Unknown transition — conservative fallback.
+        // If this fires in release, add a precise case above.
         b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         src = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;

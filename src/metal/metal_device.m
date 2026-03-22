@@ -109,8 +109,18 @@ static LpzResult lpz_device_create(lpz_device_t *out_device)
 
 #if LAPIZ_MTL_HAS_METAL3
     device->pipelineCache = lpz_mtl3_create_pipeline_cache(device->device);
+    device->pipelineCacheDirty = false;
     if (device->pipelineCache)
-        LPZ_MTL_INFO("Pipeline cache: %s", lpz_mtl3_pipeline_cache_url().path);
+    {
+        // lpz_mtl3_pipeline_cache_url() now returns a retained NSURL; release
+        // after use.  Logging inside @autoreleasepool keeps all intermediate
+        // NSString objects alive for the duration of the LPZ_MTL_INFO call.
+        @autoreleasepool {
+            NSURL *cacheURL = lpz_mtl3_pipeline_cache_url();
+            LPZ_MTL_INFO("Pipeline cache: %s", cacheURL.path.UTF8String);
+            [cacheURL release];
+        }
+    }
     else
         LPZ_MTL_INFO("Pipeline cache unavailable — compiling from source.");
 #endif
@@ -156,9 +166,9 @@ static void lpz_device_destroy(lpz_device_t device)
 #endif
 
 #if LAPIZ_MTL_HAS_METAL3
-    lpz_mtl3_flush_pipeline_cache(device->pipelineCache);
-    [device->pipelineCache release];
-    device->pipelineCache = nil;
+    if (device->pipelineCacheDirty)
+        lpz_mtl3_flush_pipeline_cache(device->pipelineCache);
+    LPZ_OBJC_RELEASE(device->pipelineCache);
 #endif
 
     [device->commandQueue release];
@@ -375,24 +385,10 @@ static LpzResult lpz_device_create_texture(lpz_device_t device, const LpzTexture
             break;
     }
 
-    // Memoryless render targets (Apple silicon) save bandwidth by never writing
-    // attachment contents to main memory between passes.
-    BOOL supportsMemoryless = NO;
-#if TARGET_OS_IPHONE
-    supportsMemoryless = YES;
-#else
-    if (@available(macOS 11.0, *))
-    {
-        for (MTLGPUFamily fam = MTLGPUFamilyApple1; fam <= MTLGPUFamilyApple7; fam++)
-        {
-            if ([device->device supportsFamily:fam])
-            {
-                supportsMemoryless = YES;
-                break;
-            }
-        }
-    }
-#endif
+    // lpz_supports_memoryless() checks TARGET_OS_IPHONE unconditionally on iOS/tvOS,
+    // and uses supportsFamily:Apple1 on macOS 11+ (forward-compatible with future
+    // Apple GPU families without needing a code change for each new generation).
+    BOOL supportsMemoryless = lpz_supports_memoryless(device->device);
 
     if ((desc->usage & LPZ_TEXTURE_USAGE_TRANSIENT_BIT) && supportsMemoryless)
         mtlDesc.storageMode = MTLStorageModeMemoryless;
@@ -486,7 +482,7 @@ static lpz_texture_view_t lpz_device_create_texture_view(lpz_device_t device, co
     NSUInteger baseLayer = (NSUInteger)desc->base_array_layer;
     NSUInteger layerCount = (desc->array_layer_count == 0) ? (totalLayers - baseLayer) : (NSUInteger)desc->array_layer_count;
 
-    view->texture = [[parent newTextureViewWithPixelFormat:pf textureType:parent.textureType levels:NSMakeRange(baseMip, mipCount) slices:NSMakeRange(baseLayer, layerCount)] retain];
+    view->texture = [parent newTextureViewWithPixelFormat:pf textureType:parent.textureType levels:NSMakeRange(baseMip, mipCount) slices:NSMakeRange(baseLayer, layerCount)];
     if (!view->texture)
     {
         free(view);
@@ -529,7 +525,8 @@ static void lpz_device_read_texture(lpz_device_t device, lpz_texture_t texture, 
     uint32_t mip_w = MAX(1u, (uint32_t)texture->texture.width >> mip_level);
     uint32_t mip_h = MAX(1u, (uint32_t)texture->texture.height >> mip_level);
 
-    id<MTLCommandBuffer> cmd = [device->commandQueue commandBuffer];
+    id<MTLCommandBuffer> cmd = [[device->commandQueue commandBuffer] retain];
+    cmd.label = @"LapizReadTexture";
     id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
 
     [blit copyFromTexture:texture->texture
@@ -542,9 +539,16 @@ static void lpz_device_read_texture(lpz_device_t device, lpz_texture_t texture, 
           destinationBytesPerRow:mip_w * 4  // assumes RGBA8; caller sizes the buffer accordingly
         destinationBytesPerImage:0];
 
+    // On discrete macOS GPUs the destination buffer uses managed storage (separate
+    // CPU and GPU copies).  Without an explicit synchronize the CPU will read stale
+    // data because the GPU-side copy has not been flushed to system memory yet.
+    if (dst_buffer->isManaged)
+        [blit synchronizeResource:dst_buffer->buffers[0]];
+
     [blit endEncoding];
     [cmd commit];
     [cmd waitUntilCompleted];
+    [cmd release];
 }
 
 static void lpz_device_copy_texture(lpz_device_t device, const LpzTextureCopyDesc *desc)
@@ -556,7 +560,8 @@ static void lpz_device_copy_texture(lpz_device_t device, const LpzTextureCopyDes
     uint32_t copy_w = desc->width ? desc->width : src_mip_w;
     uint32_t copy_h = desc->height ? desc->height : src_mip_h;
 
-    id<MTLCommandBuffer> cmd = [device->commandQueue commandBuffer];
+    id<MTLCommandBuffer> cmd = [[device->commandQueue commandBuffer] retain];
+    cmd.label = @"LapizCopyTexture";
     id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
 
     [blit copyFromTexture:src->texture
@@ -572,6 +577,7 @@ static void lpz_device_copy_texture(lpz_device_t device, const LpzTextureCopyDes
     [blit endEncoding];
     [cmd commit];
     [cmd waitUntilCompleted];
+    [cmd release];
 }
 
 // ============================================================================
@@ -581,6 +587,9 @@ static void lpz_device_copy_texture(lpz_device_t device, const LpzTextureCopyDes
 static lpz_sampler_t lpz_device_create_sampler(lpz_device_t device, const LpzSamplerDesc *desc)
 {
     struct sampler_t *samp = (struct sampler_t *)calloc(1, sizeof(struct sampler_t));
+    if (!samp)
+        return NULL;
+
     MTLSamplerDescriptor *mtlDesc = [[MTLSamplerDescriptor alloc] init];
 
     mtlDesc.magFilter = desc->mag_filter_linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
@@ -596,9 +605,20 @@ static lpz_sampler_t lpz_device_create_sampler(lpz_device_t device, const LpzSam
     mtlDesc.lodAverage = NO;
     if (desc->compare_enable)
         mtlDesc.compareFunction = LpzToMetalCompareOp(desc->compare_op);
+#if LAPIZ_MTL_HAS_METAL4
+    if ([mtlDesc respondsToSelector:@selector(setSupportArgumentBuffers:)])
+        mtlDesc.supportArgumentBuffers = YES;
+#endif
 
     samp->sampler = [device->device newSamplerStateWithDescriptor:mtlDesc];
     [mtlDesc release];
+
+    if (!samp->sampler)
+    {
+        LPZ_MTL_ERR(LPZ_FAILURE, "Sampler creation failed.");
+        free(samp);
+        return NULL;
+    }
     return (lpz_sampler_t)samp;
 }
 
@@ -650,7 +670,7 @@ static LpzResult lpz_device_create_shader(lpz_device_t device, const LpzShaderDe
         dispatch_release(data);
     }
 
-    if (error)
+    if (error || !shader->library)
     {
         LPZ_MTL_ERR(LPZ_FAILURE, "Shader compile error: %s", (error ? error.localizedDescription.UTF8String : "(no error)"));
         free(shader);
@@ -659,6 +679,13 @@ static LpzResult lpz_device_create_shader(lpz_device_t device, const LpzShaderDe
 
     NSString *entryName = [NSString stringWithUTF8String:desc->entry_point];
     shader->function = [shader->library newFunctionWithName:entryName];
+    if (!shader->function)
+    {
+        LPZ_MTL_ERR(LPZ_FAILURE, "Shader entry '%s' not found in compiled Metal library.", desc->entry_point ? desc->entry_point : "(null)");
+        [shader->library release];
+        free(shader);
+        return LPZ_FAILURE;
+    }
     *out_shader = (lpz_shader_t)shader;
     return LPZ_SUCCESS;
 }
@@ -933,8 +960,11 @@ static LpzResult lpz_device_create_pipeline(lpz_device_t device, const LpzPipeli
     {
         NSError *archErr = nil;
         [device->pipelineCache addRenderPipelineFunctionsWithDescriptor:mtlDesc error:&archErr];
+        // Mark dirty instead of flushing immediately. The archive is serialized
+        // once on lpz_device_destroy, avoiding repeated disk IO on every pipeline
+        // compile and eliminating potential concurrent-flush races from async handlers.
         if (!archErr)
-            lpz_mtl3_flush_pipeline_cache(device->pipelineCache);
+            device->pipelineCacheDirty = true;
     }
 #endif
 
@@ -967,6 +997,9 @@ static void lpz_device_create_pipeline_async(lpz_device_t device, const LpzPipel
 
 #if LAPIZ_MTL_HAS_METAL3
     id<MTLBinaryArchive> cache = [device->pipelineCache retain];  // may be nil
+    // We need a pointer to the dirty flag for the completion block.
+    // Using a raw pointer is safe because device outlives all pipelines by contract.
+    bool *cacheDirtyPtr = &device->pipelineCacheDirty;
 #endif
 
     [device->device newRenderPipelineStateWithDescriptor:mtlDesc
@@ -993,8 +1026,10 @@ static void lpz_device_create_pipeline_async(lpz_device_t device, const LpzPipel
                                              {
                                                  NSError *archErr = nil;
                                                  [cache addRenderPipelineFunctionsWithDescriptor:mtlDesc error:&archErr];
+                                                 // Mark dirty instead of flushing immediately — completion handlers
+                                                 // fire on driver threads and concurrent flush calls are not safe.
                                                  if (!archErr)
-                                                     lpz_mtl3_flush_pipeline_cache(cache);
+                                                     *cacheDirtyPtr = true;
                                              }
 #endif
                                              if (callback)
@@ -1038,7 +1073,7 @@ static lpz_compute_pipeline_t lpz_device_create_compute_pipeline(lpz_device_t de
             NSError *archErr = nil;
             [device->pipelineCache addComputePipelineFunctionsWithDescriptor:cpDesc error:&archErr];
             if (!archErr)
-                lpz_mtl3_flush_pipeline_cache(device->pipelineCache);
+                device->pipelineCacheDirty = true;
         }
         [cpDesc release];
     }
@@ -1172,10 +1207,10 @@ static struct mesh_pipeline_t *lpz_device_create_mesh_pipeline(lpz_device_t devi
 
         // MTLMeshRenderPipelineDescriptor cannot be passed to
         // addRenderPipelineFunctionsWithDescriptor: (which only accepts
-        // MTLRenderPipelineDescriptor).  Flush any other pending entries so
-        // at least those benefit from the cache on the next launch.
+        // MTLRenderPipelineDescriptor).  Mark the cache dirty so at least
+        // other pending entries get flushed on the next device destroy.
         if (!err && pipeline->meshState && device->pipelineCache)
-            lpz_mtl3_flush_pipeline_cache(device->pipelineCache);
+            device->pipelineCacheDirty = true;
 
         [meshDesc release];
 
@@ -1361,26 +1396,71 @@ static struct argument_table_t *lpz_device_create_argument_table(lpz_device_t de
     static bool logged_argument_table = false;
     lpz_metal_log_api_specific_once("CreateArgumentTable", "Metal argument tables / argument buffers", &logged_argument_table);
 
+    if (!desc)
+        return NULL;
+
     struct argument_table_t *table = (struct argument_table_t *)calloc(1, sizeof(*table));
-    if (!table || !desc)
-        return table;
+    if (!table)
+        return NULL;
 
     uint32_t count = (desc->entry_count < LPZ_MTL_MAX_BIND_ENTRIES) ? desc->entry_count : LPZ_MTL_MAX_BIND_ENTRIES;
+    uint32_t nextTextureSlot = 0;
+    uint32_t nextSamplerSlot = 0;
+    uint32_t nextBufferSlot = 0;
 
     for (uint32_t i = 0; i < count; i++)
     {
         const LpzBindGroupEntry *e = &desc->entries[i];
         struct bind_group_entry_t *g = &table->entries[i];
         g->index = e->binding_index;
-        if (e->texture && e->texture->texture)
+        g->visibility = LPZ_SHADER_STAGE_ALL;
+
+        if (e->textures && e->texture == NULL && e->texture_view == NULL && e->sampler == NULL && e->buffer == NULL)
+        {
+            uint32_t texCount = 0;
+            for (uint32_t t = 0; t < 64; t++)
+            {
+                if (!e->textures[t])
+                    break;
+                texCount++;
+            }
+
+            if (texCount > 0)
+            {
+                g->texture_array = (id<MTLTexture> __strong *)calloc(texCount, sizeof(id<MTLTexture>));
+                if (g->texture_array)
+                {
+                    for (uint32_t t = 0; t < texCount; t++)
+                        g->texture_array[t] = [e->textures[t]->texture retain];
+                    g->texture_count = texCount;
+                    g->metal_slot = nextTextureSlot;
+                    nextTextureSlot += texCount;
+                }
+            }
+        }
+        else if (e->texture_view && e->texture_view->texture)
+        {
+            g->texture = [e->texture_view->texture retain];
+            g->metal_slot = nextTextureSlot++;
+        }
+        else if (e->texture && e->texture->texture)
+        {
             g->texture = [e->texture->texture retain];
+            g->metal_slot = nextTextureSlot++;
+        }
         else if (e->sampler && e->sampler->sampler)
+        {
             g->sampler = [e->sampler->sampler retain];
+            g->metal_slot = nextSamplerSlot++;
+        }
         else if (e->buffer)
         {
             id<MTLBuffer> mb = lpz_buffer_get_mtl(e->buffer, 0);
             if (mb)
                 g->buffer = [mb retain];
+            g->buffer_offset = 0;
+            g->dynamic_offset = e->dynamic_offset;
+            g->metal_slot = nextBufferSlot++;
         }
     }
     table->entry_count = count;
@@ -1388,39 +1468,61 @@ static struct argument_table_t *lpz_device_create_argument_table(lpz_device_t de
 #if LAPIZ_MTL_HAS_METAL4
     {
         MTL4ArgumentTableDescriptor *atd = [[MTL4ArgumentTableDescriptor alloc] init];
-        uint32_t maxIndex = 0;
-        for (uint32_t i = 0; i < count; i++)
-            if (table->entries[i].index > maxIndex)
-                maxIndex = table->entries[i].index;
-        atd.maxBindingIndex = maxIndex;
+        atd.maxTextureBindCount = nextTextureSlot;
+        atd.maxSamplerStateBindCount = nextSamplerSlot;
+        atd.maxBufferBindCount = nextBufferSlot;
 
         NSError *err = nil;
         table->vertexTable = [device->device newArgumentTableWithDescriptor:atd error:&err];
-        if (err)
+        if (err || !table->vertexTable)
             LPZ_MTL_ERR(LPZ_FAILURE, "Argument table (vertex) failed: %s", (err ? err.localizedDescription.UTF8String : "(no error)"));
+
         err = nil;
         table->fragmentTable = [device->device newArgumentTableWithDescriptor:atd error:&err];
-        if (err)
+        if (err || !table->fragmentTable)
             LPZ_MTL_ERR(LPZ_FAILURE, "Argument table (fragment) failed: %s", (err ? err.localizedDescription.UTF8String : "(no error)"));
+
+        err = nil;
+        table->computeTable = [device->device newArgumentTableWithDescriptor:atd error:&err];
+        if (err || !table->computeTable)
+            LPZ_MTL_ERR(LPZ_FAILURE, "Argument table (compute) failed: %s", (err ? err.localizedDescription.UTF8String : "(no error)"));
+
         [atd release];
 
         for (uint32_t i = 0; i < count; i++)
         {
             const struct bind_group_entry_t *e = &table->entries[i];
-            if (e->texture)
+
+            if (e->texture_count > 0 && e->texture_array)
             {
-                [table->vertexTable setTexture:e->texture atIndex:e->metal_slot];
-                [table->fragmentTable setTexture:e->texture atIndex:e->metal_slot];
+                for (uint32_t t = 0; t < e->texture_count; t++)
+                {
+                    MTLResourceID rid = e->texture_array[t].gpuResourceID;
+                    [table->vertexTable setTexture:rid atIndex:(NSUInteger)(e->metal_slot + t)];
+                    [table->fragmentTable setTexture:rid atIndex:(NSUInteger)(e->metal_slot + t)];
+                    [table->computeTable setTexture:rid atIndex:(NSUInteger)(e->metal_slot + t)];
+                }
+            }
+            else if (e->texture)
+            {
+                MTLResourceID rid = e->texture.gpuResourceID;
+                [table->vertexTable setTexture:rid atIndex:e->metal_slot];
+                [table->fragmentTable setTexture:rid atIndex:e->metal_slot];
+                [table->computeTable setTexture:rid atIndex:e->metal_slot];
             }
             else if (e->sampler)
             {
-                [table->vertexTable setSamplerState:e->sampler atIndex:e->metal_slot];
-                [table->fragmentTable setSamplerState:e->sampler atIndex:e->metal_slot];
+                MTLResourceID rid = e->sampler.gpuResourceID;
+                [table->vertexTable setSamplerState:rid atIndex:e->metal_slot];
+                [table->fragmentTable setSamplerState:rid atIndex:e->metal_slot];
+                [table->computeTable setSamplerState:rid atIndex:e->metal_slot];
             }
             else if (e->buffer)
             {
-                [table->vertexTable setBuffer:e->buffer offset:(NSUInteger)e->buffer_offset atIndex:e->metal_slot];
-                [table->fragmentTable setBuffer:e->buffer offset:(NSUInteger)e->buffer_offset atIndex:e->metal_slot];
+                MTLGPUAddress addr = e->buffer.gpuAddress + (MTLGPUAddress)e->buffer_offset;
+                [table->vertexTable setAddress:addr atIndex:e->metal_slot];
+                [table->fragmentTable setAddress:addr atIndex:e->metal_slot];
+                [table->computeTable setAddress:addr atIndex:e->metal_slot];
             }
         }
     }
@@ -1441,6 +1543,12 @@ static void lpz_device_destroy_argument_table(struct argument_table_t *table)
             [table->entries[i].sampler release];
         if (table->entries[i].buffer)
             [table->entries[i].buffer release];
+        if (table->entries[i].texture_array)
+        {
+            for (uint32_t t = 0; t < table->entries[i].texture_count; t++)
+                [table->entries[i].texture_array[t] release];
+            free(table->entries[i].texture_array);
+        }
     }
 #if LAPIZ_MTL_HAS_METAL4
     [table->vertexTable release];
@@ -1686,7 +1794,7 @@ static void lpz_device_destroy_fence(lpz_fence_t fence)
 {
     if (!fence)
         return;
-    fence->event = nil;
+    LPZ_OBJC_RELEASE(fence->event);
     free(fence);
 }
 
@@ -1818,11 +1926,12 @@ static void lpz_device_destroy_query_pool(lpz_query_pool_t pool)
 {
     if (!pool)
         return;
-    pool->visibilityBuffer = nil;
+    LPZ_OBJC_RELEASE(pool->visibilityBuffer);
 #if LAPIZ_MTL_HAS_METAL3
-    pool->gpuCounterBuffer = nil;
+    LPZ_OBJC_RELEASE(pool->gpuCounterBuffer);
 #endif
     free(pool->cpuTimestamps);
+    pool->cpuTimestamps = NULL;
     free(pool);
 }
 

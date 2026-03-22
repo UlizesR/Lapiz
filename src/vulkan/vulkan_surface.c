@@ -10,6 +10,12 @@ extern LpzAPI Lpz;  // for window surface creation (Lpz.window.CreateVulkanSurfa
 static VkPresentModeKHR select_present_mode(VkPhysicalDevice physDev, VkSurfaceKHR surface, LpzPresentMode requested)
 {
     VkPresentModeKHR desired;
+    // Secondary preference when the primary choice is unavailable.
+    // MAILBOX → IMMEDIATE (still uncapped, no tearing on some drivers)
+    // IMMEDIATE → IMMEDIATE (no fallback needed beyond itself)
+    // Anything else → FIFO (guaranteed by spec)
+    VkPresentModeKHR secondary = VK_PRESENT_MODE_FIFO_KHR;
+
     switch (requested)
     {
         case LPZ_PRESENT_MODE_IMMEDIATE:
@@ -17,6 +23,9 @@ static VkPresentModeKHR select_present_mode(VkPhysicalDevice physDev, VkSurfaceK
             break;
         case LPZ_PRESENT_MODE_MAILBOX:
             desired = VK_PRESENT_MODE_MAILBOX_KHR;
+            // On MoltenVK (macOS) MAILBOX is not supported; IMMEDIATE is and
+            // is also uncapped — use it before giving up and returning FIFO.
+            secondary = VK_PRESENT_MODE_IMMEDIATE_KHR;
             break;
         default:
             return VK_PRESENT_MODE_FIFO_KHR;
@@ -27,19 +36,47 @@ static VkPresentModeKHR select_present_mode(VkPhysicalDevice physDev, VkSurfaceK
     if (count == 0)
         return VK_PRESENT_MODE_FIFO_KHR;
 
-    VkPresentModeKHR *modes = malloc(sizeof(VkPresentModeKHR) * count);
-    if (!modes)
-        return VK_PRESENT_MODE_FIFO_KHR;
+    // Drivers typically expose ≤8 present modes; use a stack buffer for the
+    // common case to avoid a heap round-trip on every surface creation/resize.
+    VkPresentModeKHR stackModes[16];
+    VkPresentModeKHR *modes;
+    bool modesFromHeap = (count > 16);
+    if (modesFromHeap)
+    {
+        modes = malloc(sizeof(VkPresentModeKHR) * count);
+        if (!modes)
+            return VK_PRESENT_MODE_FIFO_KHR;
+    }
+    else
+    {
+        modes = stackModes;
+    }
     vkGetPhysicalDeviceSurfacePresentModesKHR(physDev, surface, &count, modes);
 
+    // Two-pass search: prefer the primary desired mode; accept secondary
+    // (e.g. IMMEDIATE) only if the primary is absent.  FIFO is the final
+    // fallback — it is always available per the Vulkan spec.
     VkPresentModeKHR selected = VK_PRESENT_MODE_FIFO_KHR;
+    bool foundSecondary = false;
     for (uint32_t i = 0; i < count; i++)
+    {
         if (modes[i] == desired)
         {
             selected = desired;
-            break;
+            break;  // primary found — done
         }
-    free(modes);
+        if (modes[i] == secondary)
+            foundSecondary = true;  // keep scanning for primary
+    }
+    if (selected == VK_PRESENT_MODE_FIFO_KHR && foundSecondary)
+        selected = secondary;
+
+    if (modesFromHeap)
+        free(modes);
+
+    if (selected != desired)
+        LPZ_VK_WARN("Requested present mode unavailable; using fallback (%d → %d).", (int)desired, (int)selected);
+
     return selected;
 }
 
@@ -54,6 +91,10 @@ static void build_swapchain_image_views(struct surface_t *surf, VkImage *images,
             .isSwapchainImage = true,
             .width = width,
             .height = height,
+            .device = surf->device,
+            .currentLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .layoutKnown = false,
+            .arrayLayers = 1,
         };
         VkImageViewCreateInfo viewCI = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
@@ -70,7 +111,12 @@ static void build_swapchain_image_views(struct surface_t *surf, VkImage *images,
 
 static lpz_surface_t lpz_vk_surface_create(lpz_device_t device, const LpzSurfaceDesc *desc)
 {
+    if (!device || !desc)
+        return NULL;
+
     struct surface_t *surf = calloc(1, sizeof(struct surface_t));
+    if (!surf)
+        return NULL;
     surf->device = device;
     surf->width = desc->width;
     surf->height = desc->height;
@@ -84,53 +130,89 @@ static lpz_surface_t lpz_vk_surface_create(lpz_device_t device, const LpzSurface
     }
 
     // --- HDR / wide-color format negotiation ---
-    // Query available surface formats and pick the best match for the requested format.
+    // Hoist format/colorspace state above the fmtCount guard so that the
+    // swapchain creation below always has valid values regardless of whether
+    // the driver returned any formats.
+    surf->format = VK_FORMAT_B8G8R8A8_UNORM;  // safe default
+    VkColorSpaceKHR chosenCS = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+
     uint32_t fmtCount = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(device->physicalDevice, surf->surface, &fmtCount, NULL);
-    VkSurfaceFormatKHR *fmts = malloc(sizeof(VkSurfaceFormatKHR) * fmtCount);
-    vkGetPhysicalDeviceSurfaceFormatsKHR(device->physicalDevice, surf->surface, &fmtCount, fmts);
-
-    // Build a priority list based on the caller's preferred format.
-    VkFormat wantedFormat = VK_FORMAT_B8G8R8A8_UNORM;
-    VkColorSpaceKHR wantedCS = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-    if (desc->preferred_format == LPZ_FORMAT_RGB10A2_UNORM)
+    if (fmtCount == 0)
     {
-        wantedFormat = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-        wantedCS = VK_COLOR_SPACE_HDR10_ST2084_EXT;
+        // Driver returned no formats — keep the BGRA8/SRGB_NONLINEAR defaults.
+        LPZ_VK_WARN("No surface formats returned by driver; using BGRA8_UNORM fallback.");
     }
-    else if (desc->preferred_format == LPZ_FORMAT_RGBA16_FLOAT)
+    else
     {
-        wantedFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
-        wantedCS = VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT;
-    }
-
-    surf->format = VK_FORMAT_B8G8R8A8_UNORM;  // default fallback
-    VkColorSpaceKHR chosenCS = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-    for (uint32_t i = 0; i < fmtCount; i++)
-    {
-        if (fmts[i].format == wantedFormat && fmts[i].colorSpace == wantedCS)
+        // Use a stack buffer for the common case; most drivers expose ≤32
+        // surface formats, so this avoids a heap allocation on every surface
+        // creation.
+        VkSurfaceFormatKHR stackFmts[32];
+        VkSurfaceFormatKHR *fmts;
+        bool fmtsFromHeap = (fmtCount > 32);
+        if (fmtsFromHeap)
         {
-            surf->format = wantedFormat;
-            chosenCS = wantedCS;
-            break;
+            fmts = malloc(sizeof(VkSurfaceFormatKHR) * fmtCount);
+            if (!fmts)
+            {
+                vkDestroySurfaceKHR(device->instance, surf->surface, NULL);
+                free(surf);
+                return NULL;
+            }
         }
-    }
-    // Second pass: accept the wanted format with any color space if exact didn't match
-    if (surf->format != wantedFormat)
-    {
+        else
+        {
+            fmts = stackFmts;
+        }
+        vkGetPhysicalDeviceSurfaceFormatsKHR(device->physicalDevice, surf->surface, &fmtCount, fmts);
+
+        // Build a priority list based on the caller's preferred format.
+        VkFormat wantedFormat = VK_FORMAT_B8G8R8A8_UNORM;
+        VkColorSpaceKHR wantedCS = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+        if (desc->preferred_format == LPZ_FORMAT_RGB10A2_UNORM)
+        {
+            wantedFormat = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+            wantedCS = VK_COLOR_SPACE_HDR10_ST2084_EXT;
+        }
+        else if (desc->preferred_format == LPZ_FORMAT_RGBA16_FLOAT)
+        {
+            wantedFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+            wantedCS = VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT;
+        }
+
+        // First pass: exact format + colorspace match.
         for (uint32_t i = 0; i < fmtCount; i++)
         {
-            if (fmts[i].format == wantedFormat)
+            if (fmts[i].format == wantedFormat && fmts[i].colorSpace == wantedCS)
             {
                 surf->format = wantedFormat;
-                chosenCS = fmts[i].colorSpace;
+                chosenCS = wantedCS;
                 break;
             }
         }
-    }
-    free(fmts);
+        // Second pass: accept the wanted format with any color space if exact didn't match.
+        if (surf->format != wantedFormat)
+        {
+            for (uint32_t i = 0; i < fmtCount; i++)
+            {
+                if (fmts[i].format == wantedFormat)
+                {
+                    surf->format = wantedFormat;
+                    chosenCS = fmts[i].colorSpace;
+                    break;
+                }
+            }
+        }
+
+        // Only free when we fell back to the heap allocator; stack memory is
+        // reclaimed automatically when the else-block exits.
+        if (fmtsFromHeap)
+            free(fmts);
+    }  // end format negotiation
 
     surf->presentMode = select_present_mode(device->physicalDevice, surf->surface, desc->present_mode);
+    surf->chosenColorSpace = chosenCS;
 
     VkSwapchainCreateInfoKHR createInfo = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
@@ -148,10 +230,19 @@ static lpz_surface_t lpz_vk_surface_create(lpz_device_t device, const LpzSurface
     vkCreateSwapchainKHR(device->device, &createInfo, NULL, &surf->swapchain);
 
     vkGetSwapchainImagesKHR(device->device, surf->swapchain, &surf->imageCount, NULL);
-    VkImage *images = malloc(sizeof(VkImage) * surf->imageCount);
+    // LPZ_MAX_FRAMES_IN_FLIGHT is a small constant; a stack buffer is always
+    // sufficient and avoids a heap allocation on every surface creation.
+    VkImage stackImages[LPZ_MAX_FRAMES_IN_FLIGHT * 2];
+    VkImage *images;
+    bool imagesFromHeap = (surf->imageCount > (sizeof(stackImages) / sizeof(stackImages[0])));
+    if (imagesFromHeap)
+        images = malloc(sizeof(VkImage) * surf->imageCount);
+    else
+        images = stackImages;
     vkGetSwapchainImagesKHR(device->device, surf->swapchain, &surf->imageCount, images);
     build_swapchain_image_views(surf, images, desc->width, desc->height);
-    free(images);
+    if (imagesFromHeap)
+        free(images);
 
     for (int i = 0; i < LPZ_MAX_FRAMES_IN_FLIGHT; i++)
     {
@@ -197,7 +288,7 @@ static void lpz_vk_surface_resize(lpz_surface_t surface, uint32_t width, uint32_
         .surface = surface->surface,
         .minImageCount = LPZ_MAX_FRAMES_IN_FLIGHT,
         .imageFormat = surface->format,
-        .imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+        .imageColorSpace = surface->chosenColorSpace,
         .imageExtent = (VkExtent2D){width, height},
         .imageArrayLayers = 1,
         .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -210,10 +301,17 @@ static void lpz_vk_surface_resize(lpz_surface_t surface, uint32_t width, uint32_
     vkDestroySwapchainKHR(surface->device->device, oldSwapchain, NULL);
 
     vkGetSwapchainImagesKHR(surface->device->device, surface->swapchain, &surface->imageCount, NULL);
-    VkImage *images = malloc(sizeof(VkImage) * surface->imageCount);
+    VkImage stackImages[LPZ_MAX_FRAMES_IN_FLIGHT * 2];
+    VkImage *images;
+    bool imagesFromHeap = (surface->imageCount > (sizeof(stackImages) / sizeof(stackImages[0])));
+    if (imagesFromHeap)
+        images = malloc(sizeof(VkImage) * surface->imageCount);
+    else
+        images = stackImages;
     vkGetSwapchainImagesKHR(surface->device->device, surface->swapchain, &surface->imageCount, images);
     build_swapchain_image_views(surface, images, width, height);
-    free(images);
+    if (imagesFromHeap)
+        free(images);
 
     surface->width = width;
     surface->height = height;
