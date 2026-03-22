@@ -12,6 +12,7 @@
 #endif
 #include <stdarg.h>
 #include <stdatomic.h>
+#include <string.h>
 
 #include "../../include/Lpz.h"
 
