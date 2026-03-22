@@ -242,8 +242,20 @@ struct surface_t {
     struct texture_t *swapchainTextures;
     uint32_t currentImageIndex;
     uint32_t currentFrameIndex;
+    // imageAvailableSemaphores — one per CPU frame slot (LPZ_MAX_FRAMES_IN_FLIGHT).
+    // Used in vkAcquireNextImageKHR, indexed by currentFrameIndex.  The frame
+    // slot cycles independently of the swapchain image index so this is safe.
     VkSemaphore imageAvailableSemaphores[LPZ_MAX_FRAMES_IN_FLIGHT];
-    VkSemaphore renderFinishedSemaphores[LPZ_MAX_FRAMES_IN_FLIGHT];
+    // renderFinishedSemaphores — one per *swapchain image* (imageCount), NOT per
+    // frame slot.  Indexed by currentImageIndex in submit and present.
+    //
+    // Sizing by imageCount (not LPZ_MAX_FRAMES_IN_FLIGHT) is mandatory:
+    // the driver may return more images than minImageCount.  If the semaphores
+    // are indexed by frameIndex (which cycles mod 3) while the swapchain has
+    // 4 images, the same semaphore is signaled in vkQueueSubmit before the
+    // swapchain has consumed it from the previous vkQueuePresentKHR for that
+    // image — a VUID-vkQueueSubmit-pSignalSemaphores-00067 violation.
+    VkSemaphore *renderFinishedSemaphores;  // malloc'd, freed in Destroy/Resize
     uint64_t lastPresentTimestamp;
     // The color space negotiated at swapchain creation time.
     // Preserved across resize so we don't silently revert to SRGB_NONLINEAR.

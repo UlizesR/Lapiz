@@ -623,7 +623,11 @@ static void lpz_vk_renderer_submit(lpz_renderer_t renderer, lpz_surface_t surfac
         si.pWaitSemaphores = &surface->imageAvailableSemaphores[renderer->frameIndex];
         si.pWaitDstStageMask = &waitStages;
         si.signalSemaphoreCount = 1;
-        si.pSignalSemaphores = &surface->renderFinishedSemaphores[renderer->frameIndex];
+        // Index renderFinishedSemaphores by currentImageIndex (not frameIndex).
+        // The swapchain may hand out more images than LPZ_MAX_FRAMES_IN_FLIGHT;
+        // reusing a frame-indexed semaphore before the swapchain has consumed it
+        // violates VUID-vkQueueSubmit-pSignalSemaphores-00067.
+        si.pSignalSemaphores = &surface->renderFinishedSemaphores[surface->currentImageIndex];
     }
     vkQueueSubmit(renderer->device->graphicsQueue, 1, &si, renderer->inFlightFences[renderer->frameIndex]);
 
@@ -632,7 +636,7 @@ static void lpz_vk_renderer_submit(lpz_renderer_t renderer, lpz_surface_t surfac
         VkPresentInfoKHR presentInfo = {
             .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
             .waitSemaphoreCount = 1,
-            .pWaitSemaphores = &surface->renderFinishedSemaphores[renderer->frameIndex],
+            .pWaitSemaphores = &surface->renderFinishedSemaphores[surface->currentImageIndex],
             .swapchainCount = 1,
             .pSwapchains = &surface->swapchain,
             .pImageIndices = &surface->currentImageIndex,
@@ -661,7 +665,8 @@ static void lpz_vk_renderer_submit_with_fence(lpz_renderer_t renderer, lpz_surfa
         .commandBufferCount = 1,
         .pCommandBuffers = &renderer->currentCmd,
         .signalSemaphoreCount = 1,
-        .pSignalSemaphores = &surface->renderFinishedSemaphores[renderer->frameIndex],
+        // Index by currentImageIndex — see Submit for the full explanation.
+        .pSignalSemaphores = &surface->renderFinishedSemaphores[surface->currentImageIndex],
     };
     VkFence vk_fence = fence ? fence->fence : renderer->inFlightFences[renderer->frameIndex];
     vkQueueSubmit(renderer->device->graphicsQueue, 1, &si, vk_fence);
@@ -669,7 +674,7 @@ static void lpz_vk_renderer_submit_with_fence(lpz_renderer_t renderer, lpz_surfa
     VkPresentInfoKHR presentInfo = {
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
         .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &surface->renderFinishedSemaphores[renderer->frameIndex],
+        .pWaitSemaphores = &surface->renderFinishedSemaphores[surface->currentImageIndex],
         .swapchainCount = 1,
         .pSwapchains = &surface->swapchain,
         .pImageIndices = &surface->currentImageIndex,
@@ -1257,7 +1262,8 @@ static void lpz_vk_renderer_submit_command_buffers(lpz_renderer_t renderer, lpz_
         .commandBufferCount = count,
         .pCommandBuffers = vkCmds,
         .signalSemaphoreCount = surface_to_present ? 1 : 0,
-        .pSignalSemaphores = surface_to_present ? &surface_to_present->renderFinishedSemaphores[frame] : NULL,
+        // Index by currentImageIndex — see Submit for the full explanation.
+        .pSignalSemaphores = surface_to_present ? &surface_to_present->renderFinishedSemaphores[surface_to_present->currentImageIndex] : NULL,
     };
     vkQueueSubmit(renderer->device->graphicsQueue, 1, &submitInfo, renderer->inFlightFences[frame]);
 
@@ -1267,7 +1273,7 @@ static void lpz_vk_renderer_submit_command_buffers(lpz_renderer_t renderer, lpz_
         VkPresentInfoKHR presentInfo = {
             .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
             .waitSemaphoreCount = 1,
-            .pWaitSemaphores = &surface_to_present->renderFinishedSemaphores[frame],
+            .pWaitSemaphores = &surface_to_present->renderFinishedSemaphores[surface_to_present->currentImageIndex],
             .swapchainCount = 1,
             .pSwapchains = &surface_to_present->swapchain,
             .pImageIndices = &surface_to_present->currentImageIndex,
