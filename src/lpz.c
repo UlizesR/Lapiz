@@ -448,20 +448,59 @@
  static void lpz_build_text_system(struct LpzAppState *app)
  {
      // -- Locate a system font ------------------------------------------------
-     const char *candidates[] = {
-         NULL,  // $HOME/Library/Fonts/... filled below
+     // Slots 0-3 are filled dynamically from $HOME / $WINDIR below.
+     // Remaining slots are absolute paths covering common distros and macOS.
+     const char *candidates[32] = {
+         NULL,  // [0] $HOME/Library/Fonts           (macOS user install)
+         NULL,  // [1] $HOME/.local/share/fonts       (Linux user install)
+         NULL,  // [2] $HOME/.fonts                   (legacy Linux user dir)
+         NULL,  // [3] %WINDIR%\Fonts                 (Windows)
+         // macOS system / library
          "/System/Library/Fonts/Helvetica.ttc",
          "/System/Library/Fonts/Arial.ttf",
+         "/Library/Fonts/JetBrainsMonoNLNerdFontPropo-Regular.ttf",
+         // Arch: pacman -S ttf-jetbrains-mono-nerd
+         "/usr/share/fonts/TTF/JetBrainsMonoNLNerdFontPropo-Regular.ttf",
+         "/usr/share/fonts/jetbrains-mono/JetBrainsMonoNLNerdFontPropo-Regular.ttf",
+         // Debian / Ubuntu
+         "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMonoNLNerdFontPropo-Regular.ttf",
+         "/usr/share/fonts/truetype/JetBrainsMonoNLNerdFontPropo-Regular.ttf",
+         // Fedora / RHEL
+         "/usr/share/fonts/JetBrainsMono/JetBrainsMonoNLNerdFontPropo-Regular.ttf",
+         // Manual Nerd Fonts install into /usr/local
+         "/usr/local/share/fonts/JetBrainsMonoNLNerdFontPropo-Regular.ttf",
+         "/usr/local/share/fonts/TTF/JetBrainsMonoNLNerdFontPropo-Regular.ttf",
+         // Generic fallbacks
          "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+         "/usr/share/fonts/dejavu/DejaVuSans.ttf",
          "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+         "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
      };
-     char home_font[1024] = {0};
+
+     char home_mac[1024]    = {0};
+     char home_linux[1024]  = {0};
+     char home_linux2[1024] = {0};
      const char *home = getenv("HOME");
      if (home)
      {
-         snprintf(home_font, sizeof(home_font), "%s/Library/Fonts/JetBrainsMonoNLNerdFontPropo-Regular.ttf", home);
-         candidates[0] = home_font;
+         snprintf(home_mac,    sizeof(home_mac),    "%s/Library/Fonts/JetBrainsMonoNLNerdFontPropo-Regular.ttf", home);
+         snprintf(home_linux,  sizeof(home_linux),  "%s/.local/share/fonts/JetBrainsMonoNLNerdFontPropo-Regular.ttf", home);
+         snprintf(home_linux2, sizeof(home_linux2), "%s/.fonts/JetBrainsMonoNLNerdFontPropo-Regular.ttf", home);
+         candidates[0] = home_mac;
+         candidates[1] = home_linux;
+         candidates[2] = home_linux2;
      }
+
+     char win_font[1024] = {0};
+     const char *windir = getenv("WINDIR");
+     if (!windir) windir = getenv("SystemRoot");
+     if (windir)
+     {
+         snprintf(win_font, sizeof(win_font), "%s\\Fonts\\JetBrainsMonoNLNerdFontPropo-Regular.ttf", windir);
+         candidates[3] = win_font;
+     }
+
      const char *font_path = NULL;
      for (size_t i = 0; i < ARRAY_SIZE(candidates); ++i)
          if (candidates[i] && LpzIO_FileExists(candidates[i]))
