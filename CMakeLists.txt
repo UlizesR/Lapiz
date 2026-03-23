@@ -13,6 +13,69 @@ set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ------------------------------------------------------------------------------
+# 0. SUBMODULE GUARD
+# Detect missing submodule content (empty directories) and initialise them
+# automatically.  This is the most common cause of "does not contain a
+# CMakeLists.txt" errors when cloning on a new machine without --recursive.
+# ------------------------------------------------------------------------------
+find_package(Git QUIET)
+if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+    # Check a sentinel file from each expected submodule.
+    set(_LAPIZ_SUBMODULE_SENTINELS
+        "${CMAKE_SOURCE_DIR}/external/glfw/CMakeLists.txt"
+        "${CMAKE_SOURCE_DIR}/external/cglm/CMakeLists.txt"
+        "${CMAKE_SOURCE_DIR}/external/assimp/CMakeLists.txt"
+        "${CMAKE_SOURCE_DIR}/external/SDL/CMakeLists.txt"
+    )
+    set(_LAPIZ_MISSING_SUBMODULES FALSE)
+    foreach(_sentinel ${_LAPIZ_SUBMODULE_SENTINELS})
+        if(NOT EXISTS "${_sentinel}")
+            set(_LAPIZ_MISSING_SUBMODULES TRUE)
+            break()
+        endif()
+    endforeach()
+
+    if(_LAPIZ_MISSING_SUBMODULES)
+        message(STATUS "Lapiz: one or more submodules are missing — running git submodule update --init --recursive")
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" submodule update --init --recursive
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            RESULT_VARIABLE   _git_result
+            OUTPUT_VARIABLE   _git_output
+            ERROR_VARIABLE    _git_error
+        )
+        if(NOT _git_result EQUAL 0)
+            message(FATAL_ERROR
+                "Lapiz: git submodule init failed (exit ${_git_result}).\n"
+                "Run manually:\n"
+                "  git submodule update --init --recursive\n"
+                "Error output:\n${_git_error}"
+            )
+        endif()
+        message(STATUS "Lapiz: submodules initialised successfully.")
+    endif()
+else()
+    # Not a git repo (e.g. source tarball). Verify submodules are present
+    # and give a clear error if they are not.
+    foreach(_sentinel
+        "${CMAKE_SOURCE_DIR}/external/glfw/CMakeLists.txt"
+        "${CMAKE_SOURCE_DIR}/external/cglm/CMakeLists.txt"
+        "${CMAKE_SOURCE_DIR}/external/assimp/CMakeLists.txt"
+    )
+        if(NOT EXISTS "${_sentinel}")
+            get_filename_component(_dir "${_sentinel}" DIRECTORY)
+            message(FATAL_ERROR
+                "Lapiz: required dependency directory is empty: ${_dir}\n"
+                "This source tree was not cloned with --recursive.\n"
+                "If you have a git repo, run:\n"
+                "  git submodule update --init --recursive\n"
+                "Otherwise download and extract the dependency into ${_dir}."
+            )
+        endif()
+    endforeach()
+endif()
+
+# ------------------------------------------------------------------------------
 # 1. BUILD OPTIONS
 # ------------------------------------------------------------------------------
 option(LAPIZ_BACKEND_VULKAN "Enable Vulkan Backend" ON)
