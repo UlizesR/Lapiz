@@ -109,13 +109,16 @@ static LpzResult lpz_device_create(lpz_device_t *out_device)
 
 #if LAPIZ_MTL_HAS_METAL3
     device->pipelineCache = lpz_mtl3_create_pipeline_cache(device->device);
-    device->pipelineCacheDirty = false;
+    // Create the group before any async pipeline creation can happen.
+    // It is released in lpz_device_destroy after the wait.
+    device->asyncPipelineGroup = dispatch_group_create();
     if (device->pipelineCache)
     {
         // lpz_mtl3_pipeline_cache_url() now returns a retained NSURL; release
         // after use.  Logging inside @autoreleasepool keeps all intermediate
         // NSString objects alive for the duration of the LPZ_MTL_INFO call.
-        @autoreleasepool {
+        @autoreleasepool
+        {
             NSURL *cacheURL = lpz_mtl3_pipeline_cache_url();
             LPZ_MTL_INFO("Pipeline cache: %s", cacheURL.path.UTF8String);
             [cacheURL release];
@@ -166,14 +169,40 @@ static void lpz_device_destroy(lpz_device_t device)
 #endif
 
 #if LAPIZ_MTL_HAS_METAL3
-    if (device->pipelineCacheDirty)
-        lpz_mtl3_flush_pipeline_cache(device->pipelineCache);
+    if (device->asyncPipelineGroup)
+    {
+        // Wait for all CreatePipelineAsync completion handlers to finish before
+        // releasing the device.  Handlers capture the device pointer by raw
+        // address (safe because device outlives all pipelines by contract), so
+        // we must ensure they have returned before freeing device memory.
+        dispatch_group_wait(device->asyncPipelineGroup, DISPATCH_TIME_FOREVER);
+        dispatch_release(device->asyncPipelineGroup);
+        device->asyncPipelineGroup = NULL;
+    }
+    // The archive is used read-only for cache-hit lookups; no runtime writes
+    // occur (addRenderPipelineFunctionsWithDescriptor: is not called from a
+    // running app — see lpz_device_create_pipeline for the full explanation).
     LPZ_OBJC_RELEASE(device->pipelineCache);
 #endif
 
     [device->commandQueue release];
     [device->device release];
     free(device);
+}
+
+// lpz_device_flush_pipeline_cache — called from CleanUpApp via FlushPipelineCache.
+//
+// This is permanently a no-op in the current runtime configuration.  The
+// MTLBinaryArchive is attached to pipeline descriptors read-only (for cache-hit
+// lookups on subsequent launches); addRenderPipelineFunctionsWithDescriptor: is
+// never called at runtime because it triggers async XPC work that leaves the
+// archive in an unserializable state.  See lpz_device_create_pipeline.
+//
+// The FlushPipelineCache slot is kept in LpzDeviceExtAPI for API stability and
+// for potential future use with pre-compiled offline archives.
+static void lpz_device_flush_pipeline_cache(lpz_device_t device)
+{
+    (void)device;  // nothing to flush — archive is read-only at runtime
 }
 
 static const char *lpz_device_get_name(lpz_device_t device)
@@ -955,18 +984,15 @@ static LpzResult lpz_device_create_pipeline(lpz_device_t device, const LpzPipeli
         return LPZ_FAILURE;
     }
 
-#if LAPIZ_MTL_HAS_METAL3
-    if (device->pipelineCache)
-    {
-        NSError *archErr = nil;
-        [device->pipelineCache addRenderPipelineFunctionsWithDescriptor:mtlDesc error:&archErr];
-        // Mark dirty instead of flushing immediately. The archive is serialized
-        // once on lpz_device_destroy, avoiding repeated disk IO on every pipeline
-        // compile and eliminating potential concurrent-flush races from async handlers.
-        if (!archErr)
-            device->pipelineCacheDirty = true;
-    }
-#endif
+    // NOTE: We intentionally do NOT call addRenderPipelineFunctionsWithDescriptor:
+    // here.  That API dispatches work to Metal's airnt XPC compiler service
+    // asynchronously from Metal's perspective.  The function returns before the
+    // XPC roundtrip completes, and if the XPC service later fails ("Compiler
+    // failed to build request"), it frees its internal connection object inside
+    // the archive.  Any subsequent call to serializeToURL: then crashes with
+    // EXC_BAD_ACCESS in objc_retain — a hardware fault that bypasses @try/@catch.
+    // The archive is still attached to the pipeline descriptor via binaryArchives
+    // for read-only cache hits; we simply never write back to it at runtime.
 
     [mtlDesc release];
     lpz_pipeline_apply_state(pipeline, desc);
@@ -996,10 +1022,16 @@ static void lpz_device_create_pipeline_async(lpz_device_t device, const LpzPipel
     [mtlDesc retain];  // released inside the block after use
 
 #if LAPIZ_MTL_HAS_METAL3
-    id<MTLBinaryArchive> cache = [device->pipelineCache retain];  // may be nil
-    // We need a pointer to the dirty flag for the completion block.
-    // Using a raw pointer is safe because device outlives all pipelines by contract.
-    bool *cacheDirtyPtr = &device->pipelineCacheDirty;
+    // Enter the async-pipeline group before dispatching so that
+    // lpz_device_destroy can wait for this completion handler to finish
+    // before releasing the device — prevents completion handlers from
+    // running on freed device memory after CleanUpApp.
+    // NOTE: We no longer retain/use the pipeline cache here.  See the
+    // synchronous path for the full explanation of why addRenderPipeline-
+    // FunctionsWithDescriptor: is not safe to call from a running app.
+    dispatch_group_t grp = device->asyncPipelineGroup;
+    if (grp)
+        dispatch_group_enter(grp);
 #endif
 
     [device->device newRenderPipelineStateWithDescriptor:mtlDesc
@@ -1021,23 +1053,13 @@ static void lpz_device_create_pipeline_async(lpz_device_t device, const LpzPipel
                                              captured.topology = capturedTopology;
                                              lpz_pipeline_apply_state(pipeline, &captured);
 
-#if LAPIZ_MTL_HAS_METAL3
-                                             if (cache)
-                                             {
-                                                 NSError *archErr = nil;
-                                                 [cache addRenderPipelineFunctionsWithDescriptor:mtlDesc error:&archErr];
-                                                 // Mark dirty instead of flushing immediately — completion handlers
-                                                 // fire on driver threads and concurrent flush calls are not safe.
-                                                 if (!archErr)
-                                                     *cacheDirtyPtr = true;
-                                             }
-#endif
                                              if (callback)
                                                  callback((lpz_pipeline_t)pipeline, userdata);
                                          }
 
 #if LAPIZ_MTL_HAS_METAL3
-                                         [cache release];
+                                         if (grp)
+                                             dispatch_group_leave(grp);
 #endif
                                          [mtlDesc release];
                                        }];
@@ -1068,13 +1090,9 @@ static lpz_compute_pipeline_t lpz_device_create_compute_pipeline(lpz_device_t de
         cpDesc.binaryArchives = @[device->pipelineCache];
 
         pipeline->computePipelineState = [device->device newComputePipelineStateWithDescriptor:cpDesc options:MTLPipelineOptionNone reflection:nil error:&error];
-        if (!error && pipeline->computePipelineState)
-        {
-            NSError *archErr = nil;
-            [device->pipelineCache addComputePipelineFunctionsWithDescriptor:cpDesc error:&archErr];
-            if (!archErr)
-                device->pipelineCacheDirty = true;
-        }
+        // NOTE: addComputePipelineFunctionsWithDescriptor: removed — same reason
+        // as the render pipeline path: it triggers XPC work that corrupts the
+        // archive's internal state asynchronously.  The archive is read-only here.
         [cpDesc release];
     }
     else
@@ -1205,12 +1223,9 @@ static struct mesh_pipeline_t *lpz_device_create_mesh_pipeline(lpz_device_t devi
         NSError *err = nil;
         pipeline->meshState = [device->device newRenderPipelineStateWithMeshDescriptor:meshDesc options:MTLPipelineOptionNone reflection:nil error:&err];
 
-        // MTLMeshRenderPipelineDescriptor cannot be passed to
-        // addRenderPipelineFunctionsWithDescriptor: (which only accepts
-        // MTLRenderPipelineDescriptor).  Mark the cache dirty so at least
-        // other pending entries get flushed on the next device destroy.
-        if (!err && pipeline->meshState && device->pipelineCache)
-            device->pipelineCacheDirty = true;
+        // NOTE: MTLMeshRenderPipelineDescriptor cannot be passed to
+        // addRenderPipelineFunctionsWithDescriptor:, and we no longer call
+        // any archive-modification API at runtime (see render pipeline path).
 
         [meshDesc release];
 
@@ -2173,6 +2188,7 @@ const LpzDeviceAPI LpzMetalDevice = {
 const LpzDeviceExtAPI LpzMetalDeviceExt = {
     .CreateSpecializedShader = lpz_device_create_specialized_shader,
     .CreatePipelineAsync = lpz_device_create_pipeline_async,
+    .FlushPipelineCache = lpz_device_flush_pipeline_cache,
     .CreateComputePipeline = lpz_device_create_compute_pipeline,
     .DestroyComputePipeline = lpz_device_destroy_compute_pipeline,
     .CreateMeshPipeline = lpz_device_create_mesh_pipeline,

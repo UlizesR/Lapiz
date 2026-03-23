@@ -655,6 +655,16 @@ static void lpz_vk_device_destroy(lpz_device_t device)
     free(device);
 }
 
+// Vulkan pipeline cache is serialized inside lpz_vk_device_destroy via
+// pipeline_cache_save (vkGetPipelineCacheData → write to disk).  That path
+// is safe at destroy time because Vulkan has no XPC compiler service dependency.
+// This stub satisfies the LpzDeviceExtAPI.FlushPipelineCache contract so that
+// the lpz.c call site in CleanUpApp is backend-agnostic.
+static void lpz_vk_device_flush_pipeline_cache(lpz_device_t device)
+{
+    (void)device;  // Vulkan: handled in lpz_vk_device_destroy; nothing to do here.
+}
+
 static const char *lpz_vk_device_get_name(lpz_device_t device)
 {
     static char name[256];
@@ -2915,6 +2925,7 @@ const LpzDeviceAPI LpzVulkanDevice = {
 const LpzDeviceExtAPI LpzVulkanDeviceExt = {
     .CreateSpecializedShader = lpz_vk_device_create_specialized_shader,
     .CreatePipelineAsync = lpz_vk_device_create_pipeline_async,
+    .FlushPipelineCache = lpz_vk_device_flush_pipeline_cache,
     .CreateComputePipeline = lpz_vk_device_create_compute_pipeline,
     .DestroyComputePipeline = lpz_vk_device_destroy_compute_pipeline,
     .CreateMeshPipeline = lpz_vk_device_create_mesh_pipeline,

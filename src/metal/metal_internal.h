@@ -57,11 +57,12 @@ struct device_t {
     id<MTLCommandQueue> commandQueue;
 #if LAPIZ_MTL_HAS_METAL3
     id<MTLBinaryArchive> pipelineCache;
-    // True when at least one pipeline has been added to the archive since the
-    // last flush.  The archive is only serialized to disk on device destroy
-    // (or an explicit flush call), not after every individual pipeline compile.
-    // This avoids repeated disk IO and concurrent flush races from async handlers.
-    bool pipelineCacheDirty;
+    // Tracks all in-flight CreatePipelineAsync completion handlers.
+    // lpz_device_destroy waits on this group before releasing the device so
+    // that completion blocks cannot access device memory after it is freed.
+    // (The archive is attached read-only for cache hits; no archive writes
+    // happen at runtime, so no flush coordination is needed here.)
+    dispatch_group_t asyncPipelineGroup;
 #endif
 #if LAPIZ_MTL_HAS_METAL4
     id<MTLResidencySet> residencySet;
@@ -357,6 +358,26 @@ LAPIZ_INLINE NSURL *lpz_mtl3_pipeline_cache_url(void)
 
 LAPIZ_INLINE id<MTLBinaryArchive> lpz_mtl3_create_pipeline_cache(id<MTLDevice> device)
 {
+    // MTLBinaryArchive is incompatible with Metal debug/validation environments.
+    // When METAL_DEVICE_WRAPPER_TYPE=1, MTL_DEBUG_LAYER=1, or MTL_SHADER_VALIDATION=1
+    // are set, Metal substitutes an MTLDebugDevice proxy.  On macOS 14+ (Apple
+    // Silicon), that proxy crashes with EXC_BAD_ACCESS (SIGSEGV) inside
+    // newBinaryArchiveWithDescriptor:error: — a hardware Mach exception that is
+    // NOT catchable by @try/@catch (which only intercepts NSException).  There is
+    // no way to guard against the crash after the call has started; the only safe
+    // approach is to skip the call entirely when any debug layer is active.
+    //
+    // The binary archive is purely a read-only cache for production runs; skipping
+    // it here has zero functional impact — pipelines compile from source just as
+    // they do on a first launch.
+    if (getenv("METAL_DEVICE_WRAPPER_TYPE") ||
+        getenv("MTL_DEBUG_LAYER")           ||
+        getenv("MTL_SHADER_VALIDATION"))
+    {
+        LPZ_MTL_INFO("Metal debug layer detected — pipeline cache disabled.");
+        return nil;
+    }
+
     id<MTLBinaryArchive> archive = nil;
     @autoreleasepool {
         NSURL *cacheURL = lpz_mtl3_pipeline_cache_url();  // retained — must release
@@ -389,19 +410,21 @@ LAPIZ_INLINE void lpz_mtl3_flush_pipeline_cache(id<MTLBinaryArchive> archive)
 {
     if (!archive)
         return;
-    // @autoreleasepool is mandatory: this function is called from C-level
-    // teardown (lpz_device_destroy) where no pool is active.  Without it,
-    // autoreleased objects created here AND inside Metal's serializeToURL:
-    // implementation land on the thread's root/drained pool, producing the
-    // EXC_BAD_ACCESS crash seen in objc_retain inside _MTLBinaryArchive.
+    // This function serializes an MTLBinaryArchive to disk.
+    //
+    // In debug environments (METAL_DEVICE_WRAPPER_TYPE, MTL_DEBUG_LAYER, etc.)
+    // lpz_mtl3_create_pipeline_cache returns nil before any archive object is
+    // created, so this function cannot be reached in those environments.
+    //
+    // In production, the archive is read-only (no addRenderPipelineFunctions
+    // calls), so this function is also never called at runtime.  It is retained
+    // for offline tooling and future pre-compiled archive support.
     @autoreleasepool {
         NSURL   *url = lpz_mtl3_pipeline_cache_url();  // retained — released below
         NSError *err = nil;
         BOOL     ok  = [archive serializeToURL:url error:&err];
         if (!ok || err)
         {
-            // Delete the stale file so the next launch starts with a fresh
-            // archive rather than repeatedly failing on a broken one.
             LPZ_MTL_WARN("Binary archive flush failed — removing stale cache.");
             [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
         }

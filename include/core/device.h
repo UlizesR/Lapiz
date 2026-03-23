@@ -645,6 +645,16 @@ typedef struct {
 
     void (*CreatePipelineAsync)(lpz_device_t device, const LpzPipelineDesc *desc, void (*callback)(lpz_pipeline_t pipeline, void *userdata), void *userdata);
 
+    // Serialize the backend pipeline cache to disk.
+    // On Metal this is currently a no-op: the MTLBinaryArchive is used read-only
+    // at runtime (addRenderPipelineFunctionsWithDescriptor: is never called
+    // because it triggers async XPC work that leaves the archive in an
+    // unserializable state — see metal_device.m for details).  The slot is
+    // retained for API stability and future pre-compiled offline archive support.
+    // On Vulkan this is also a no-op; vkGetPipelineCacheData is handled inside
+    // lpz_vk_device_destroy where it is safe.
+    void (*FlushPipelineCache)(lpz_device_t device);
+
     lpz_compute_pipeline_t (*CreateComputePipeline)(lpz_device_t device, const LpzComputePipelineDesc *desc);
     void (*DestroyComputePipeline)(lpz_compute_pipeline_t pipeline);
 
