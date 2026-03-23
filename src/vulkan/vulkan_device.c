@@ -207,11 +207,21 @@ static LpzResult lpz_vk_device_create(lpz_device_t *out_device)
     if (!dev)
         return LPZ_OUT_OF_MEMORY;
 
-    if (enableValidationLayers && !checkValidationLayerSupport())
+    // Validation layers are a debug aid, not a runtime requirement.  If they
+    // are not installed on this machine (e.g. vulkan-validation-layers package
+    // missing) continue without them rather than refusing to start.
+    bool useValidationLayers = false;
+    if (enableValidationLayers)
     {
-        LPZ_VK_WARN("Validation layers requested but not available.");
-        free(dev);
-        return LPZ_INITIALIZATION_FAILED;
+        if (checkValidationLayerSupport())
+        {
+            useValidationLayers = true;
+        }
+        else
+        {
+            LPZ_VK_WARN("Validation layers requested but not available on this system "
+                        "(install vulkan-validation-layers) — continuing without them.");
+        }
     }
 
     // --- Detect loader version (1.1 floor, upgrade to 1.3 when available) ---
@@ -261,7 +271,7 @@ static LpzResult lpz_vk_device_create(lpz_device_t *out_device)
         .pfnUserCallback = debugCallback,
     };
 
-    if (enableValidationLayers)
+    if (useValidationLayers)
     {
         instanceExts[instanceExtCount++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
         createInfo.enabledLayerCount = ARRAY_SIZE(validationLayers);
@@ -279,7 +289,7 @@ static LpzResult lpz_vk_device_create(lpz_device_t *out_device)
         return LPZ_INITIALIZATION_FAILED;
     }
 
-    if (enableValidationLayers && CreateDebugUtilsMessengerEXT(dev->instance, &debugCI, NULL, &g_debugMessenger) != VK_SUCCESS)
+    if (useValidationLayers && CreateDebugUtilsMessengerEXT(dev->instance, &debugCI, NULL, &g_debugMessenger) != VK_SUCCESS)
         LPZ_VK_WARN("Warning: debug messenger setup failed.");
 
     // --- Physical device selection (prefer discrete GPU) ---
@@ -380,11 +390,7 @@ static LpzResult lpz_vk_device_create(lpz_device_t *out_device)
     bool hasExtDynSt = g_vk13 || check_device_ext(dev->physicalDevice, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
     bool hasMeshShader = check_device_ext(dev->physicalDevice, VK_EXT_MESH_SHADER_EXTENSION_NAME);
     bool hasDescBuf = check_device_ext(dev->physicalDevice, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
-    bool hasMemPriority = check_device_ext(dev->physicalDevice, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
-    // VK_EXT_pageable_device_local_memory requires VK_EXT_memory_priority as a
-    // mandatory dependency (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
-    // Only enable pageable memory when the prerequisite extension is also present.
-    bool hasPageMem = hasMemPriority && check_device_ext(dev->physicalDevice, VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+    bool hasPageMem = check_device_ext(dev->physicalDevice, VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
     bool hasMemBudget = check_device_ext(dev->physicalDevice, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     // inferring from the Vulkan version.  MoltenVK advertises Vulkan 1.2/1.3 but
     // does not implement every optional feature (e.g. drawIndirectCount), so
@@ -434,12 +440,7 @@ static LpzResult lpz_vk_device_create(lpz_device_t *out_device)
     if (hasDescBuf)
         devExts[devExtCount++] = VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME;
     if (hasPageMem)
-    {
-        // VK_EXT_memory_priority is a required dependency of pageable device local
-        // memory — both must appear in ppEnabledExtensionNames together.
-        devExts[devExtCount++] = VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME;
         devExts[devExtCount++] = VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME;
-    }
     if (hasMemBudget)
         devExts[devExtCount++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
     // Only request the KHR extension when not already core (1.2+) AND ext is present.
@@ -494,18 +495,6 @@ static LpzResult lpz_vk_device_create(lpz_device_t *out_device)
                 .pipelineStatisticsQuery = hasPipelineStats ? VK_TRUE : VK_FALSE,
             },
     };
-    // VK_EXT_memory_priority: enables per-allocation priority hints.
-    // Must be chained whenever VK_EXT_pageable_device_local_memory is enabled.
-    VkPhysicalDeviceMemoryPriorityFeaturesEXT memPriorityFeatures = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT,
-        .memoryPriority = VK_TRUE,
-    };
-    // VK_EXT_pageable_device_local_memory: allows the driver to evict device-local
-    // allocations to system memory under pressure.  Requires memory priority.
-    VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT pageableMemFeatures = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT,
-        .pageableDeviceLocalMemory = VK_TRUE,
-    };
 
     void *chainHead = NULL;
     if (g_vk13)
@@ -539,15 +528,6 @@ static LpzResult lpz_vk_device_create(lpz_device_t *out_device)
     {
         meshFeatures.pNext = chainHead;
         chainHead = &meshFeatures;
-    }
-    if (hasPageMem)
-    {
-        // Chain both structs: memory_priority is a prerequisite and must be
-        // present in the chain alongside pageable_device_local_memory.
-        memPriorityFeatures.pNext = chainHead;
-        chainHead = &memPriorityFeatures;
-        pageableMemFeatures.pNext = chainHead;
-        chainHead = &pageableMemFeatures;
     }
     features2.pNext = chainHead;
 
@@ -649,20 +629,13 @@ static void lpz_vk_device_destroy(lpz_device_t device)
         vkDestroyPipelineCache(device->device, device->pipelineCache, NULL);
     vkDestroyCommandPool(device->device, device->transferCommandPool, NULL);
     vkDestroyDevice(device->device, NULL);
-    if (enableValidationLayers && g_debugMessenger != VK_NULL_HANDLE)
+    // Use the handle check rather than enableValidationLayers: the messenger
+    // is only created when layers are both requested AND available, so
+    // g_debugMessenger == VK_NULL_HANDLE is the definitive "not set up" signal.
+    if (g_debugMessenger != VK_NULL_HANDLE)
         DestroyDebugUtilsMessengerEXT(device->instance, g_debugMessenger, NULL);
     vkDestroyInstance(device->instance, NULL);
     free(device);
-}
-
-// Vulkan pipeline cache is serialized inside lpz_vk_device_destroy via
-// pipeline_cache_save (vkGetPipelineCacheData → write to disk).  That path
-// is safe at destroy time because Vulkan has no XPC compiler service dependency.
-// This stub satisfies the LpzDeviceExtAPI.FlushPipelineCache contract so that
-// the lpz.c call site in CleanUpApp is backend-agnostic.
-static void lpz_vk_device_flush_pipeline_cache(lpz_device_t device)
-{
-    (void)device;  // Vulkan: handled in lpz_vk_device_destroy; nothing to do here.
 }
 
 static const char *lpz_vk_device_get_name(lpz_device_t device)
@@ -2925,7 +2898,6 @@ const LpzDeviceAPI LpzVulkanDevice = {
 const LpzDeviceExtAPI LpzVulkanDeviceExt = {
     .CreateSpecializedShader = lpz_vk_device_create_specialized_shader,
     .CreatePipelineAsync = lpz_vk_device_create_pipeline_async,
-    .FlushPipelineCache = lpz_vk_device_flush_pipeline_cache,
     .CreateComputePipeline = lpz_vk_device_create_compute_pipeline,
     .DestroyComputePipeline = lpz_vk_device_destroy_compute_pipeline,
     .CreateMeshPipeline = lpz_vk_device_create_mesh_pipeline,

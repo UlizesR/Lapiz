@@ -1006,40 +1006,40 @@
  
      LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "LpzApp: backend = %s", app->use_metal ? "Metal" : "Vulkan");
  
-     // -- GPU device (BEFORE window system) ------------------------------------
-     // On Metal, the GPU device must be created before window.Init() / GLFW.
+#if defined(LAPIZ_HAS_METAL)
+     // -- GPU device BEFORE window system (Metal only) -------------------------
+     // When any Metal debug environment variable is set (METAL_DEVICE_WRAPPER_TYPE,
+     // MTL_DEBUG_LAYER, MTL_SHADER_VALIDATION), the Metal framework installs a
+     // debug-device proxy the first time any Metal symbol is touched.  On
+     // macOS 14+ (Apple Silicon), glfwInit() -> [NSApplication sharedApplication]
+     // implicitly touches Metal through the display compositor.  The proxy crashes
+     // with EXC_BAD_ACCESS if it hasn't been seeded with a real MTLDevice yet.
+     // Creating the device first fully initialises the proxy before GLFW runs.
      //
-     // When the Metal debug environment is active (METAL_DEVICE_WRAPPER_TYPE=1,
-     // MTL_SHADER_VALIDATION=1, MTL_DEBUG_LAYER=1), the Metal framework installs
-     // a debug-device proxy the first time any Metal symbol is touched.  On
-     // macOS 14+ (M-series), glfwInit() -> [NSApplication sharedApplication] ->
-     // WindowServer connection implicitly allocates a CAMetalLayer through the
-     // display compositor.  If the debug wrapper has not yet been initialised
-     // with a real MTLDevice at that point, the compositor's Metal call crashes
-     // inside the uninitialised proxy (EXC_BAD_ACCESS in objc_retain) before
-     // any of our log lines can fire.
-     //
-     // Creating the device first lets MTLCreateSystemDefaultDevice() fully
-     // initialise the debug wrapper.  All subsequent Metal calls -- including
-     // the implicit ones triggered by GLFW -- then go through the correctly
-     // set-up proxy and are safe.
-     //
-     // On Vulkan this reordering is harmless: vkCreateInstance has no dependency
-     // on the window system, and GLFW Vulkan surface extensions are queried
-     // later (in CreateContext -> lpz_vk_surface_create) after the window exists.
-     if (app->api.device.Create(&app->device) != LPZ_SUCCESS)
+     // On Vulkan this ordering is WRONG: lpz_vk_device_create calls
+     // GetRequiredVulkanExtensions to populate the VkInstance extension list,
+     // which requires a live GLFW context to know the platform surface extension
+     // (e.g. VK_KHR_wayland_surface).  Vulkan keeps window-first order below.
+     if (app->use_metal)
      {
-         LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_INITIALIZATION_FAILED, "LpzApp: GPU device creation failed.");
-         free(app);
-         return LPZ_INITIALIZATION_FAILED;
+         if (app->api.device.Create(&app->device) != LPZ_SUCCESS)
+         {
+             LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_INITIALIZATION_FAILED, "LpzApp: GPU device creation failed.");
+             free(app);
+             return LPZ_INITIALIZATION_FAILED;
+         }
+         LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "LpzApp: GPU = %s", app->api.device.GetName(app->device));
      }
-     LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "LpzApp: GPU = %s", app->api.device.GetName(app->device));
+#endif
  
      // -- Window system --------------------------------------------------------
      if (!app->api.window.Init())
      {
          LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_INITIALIZATION_FAILED, "LpzApp: window system init failed.");
-         app->api.device.Destroy(app->device);
+#if defined(LAPIZ_HAS_METAL)
+         if (app->use_metal && app->device)
+             app->api.device.Destroy(app->device);
+#endif
          free(app);
          return LPZ_INITIALIZATION_FAILED;
      }
@@ -1048,7 +1048,10 @@
      if (!app->window)
      {
          LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_INITIALIZATION_FAILED, "LpzApp: window creation failed.");
-         app->api.device.Destroy(app->device);
+#if defined(LAPIZ_HAS_METAL)
+         if (app->use_metal && app->device)
+             app->api.device.Destroy(app->device);
+#endif
          app->api.window.Terminate();
          free(app);
          return LPZ_INITIALIZATION_FAILED;
@@ -1056,6 +1059,20 @@
  
      app->api.window.GetFramebufferSize(app->window, &app->fb_width, &app->fb_height);
      app->api.window.SetResizeCallback(app->window, lpz_resize_cb, app);
+ 
+     // -- GPU device (Vulkan path; Metal was created above if LAPIZ_HAS_METAL) -
+     if (!app->device)
+     {
+         if (app->api.device.Create(&app->device) != LPZ_SUCCESS)
+         {
+             LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_GENERAL, LPZ_INITIALIZATION_FAILED, "LpzApp: GPU device creation failed.");
+             app->api.window.DestroyWindow(app->window);
+             app->api.window.Terminate();
+             free(app);
+             return LPZ_INITIALIZATION_FAILED;
+         }
+         LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "LpzApp: GPU = %s", app->api.device.GetName(app->device));
+     }
  
      *out = app;
      return LPZ_SUCCESS;
@@ -1531,9 +1548,15 @@
      if (app->default_scene_ds)
          app->api.device.DestroyDepthStencilState(app->default_scene_ds);
      if (app->default_vert)
+     {
          app->api.device.DestroyShader(app->default_vert);
+         app->default_vert = NULL;
+     }
      if (app->default_frag)
+     {
          app->api.device.DestroyShader(app->default_frag);
+         app->default_frag = NULL;
+     }
  
      // Text
      if (app->text_bg)
@@ -1571,6 +1594,20 @@
          DestroyContext(app);
      if (app->device)
      {
+         // Default shaders may have been compiled by LoadDefaultShaders before
+         // CreateContext was called (or before it failed).  DestroyContext frees
+         // them when context_created is true, but if CreateContext failed they
+         // live outside the context and must be freed here instead.
+         if (app->default_vert)
+         {
+             app->api.device.DestroyShader(app->default_vert);
+             app->default_vert = NULL;
+         }
+         if (app->default_frag)
+         {
+             app->api.device.DestroyShader(app->default_frag);
+             app->default_frag = NULL;
+         }
          // FlushPipelineCache is currently a no-op on both backends
          // (see device.h and metal_device.m for details), but is called here
          // while the device is still fully alive in case the policy changes.
