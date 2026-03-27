@@ -54,7 +54,7 @@ static bool lpz_should_emit(LpzLogLevel level)
 
 static void lpz_write_stderr(const LpzLogMessage *msg)
 {
-    FILE *stream = (msg->level == LPZ_LOG_ERROR) ? stderr : stderr;
+    FILE *stream = stderr;
 
     const char *level_name = LpzLog_LevelName(msg->level);
     const char *category_name = LpzLog_CategoryName(msg->category);

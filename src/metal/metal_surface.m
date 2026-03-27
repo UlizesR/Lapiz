@@ -16,19 +16,13 @@ static void lpz_mtl_update_layer_geometry(struct surface_t *surf, NSWindow *nsWi
     if (!contentView)
         return;
 
-    // Layer frame is in view coordinates (points).
     surf->layer.frame = contentView.bounds;
 
-    // Keep contentsScale in sync with the window so CoreAnimation knows the
-    // view/layer backing scale, but DO NOT multiply drawableSize by this if
-    // the API already passes framebuffer dimensions in pixels.
     CGFloat scale = [nsWindow backingScaleFactor];
     if (scale <= 0.0)
         scale = 1.0;
     surf->layer.contentsScale = scale;
 
-    // Lapiz surface width/height are framebuffer pixel dimensions already.
-    // GLFW framebuffer size callbacks report pixel sizes on macOS.
     surf->layer.drawableSize = CGSizeMake((CGFloat)surf->width, (CGFloat)surf->height);
 }
 
@@ -105,7 +99,6 @@ static lpz_surface_t lpz_surface_create(lpz_device_t device, const LpzSurfaceDes
     [contentView setWantsLayer:YES];
     [contentView setLayer:surf->layer];
 
-    // These are framebuffer pixel dimensions, not logical point sizes.
     surf->width = desc->width;
     surf->height = desc->height;
     surf->currentDrawable = nil;
@@ -147,10 +140,8 @@ static void lpz_surface_resize(lpz_surface_t surface, uint32_t width, uint32_t h
     surface->width = width;
     surface->height = height;
 
-    // Keep drawable size in framebuffer pixels.
     surface->layer.drawableSize = CGSizeMake((CGFloat)width, (CGFloat)height);
 
-    // If attached to a host view/layer, keep frame aligned to the host bounds.
     if (surface->layer.superlayer)
         surface->layer.frame = surface->layer.superlayer.bounds;
 }
@@ -179,10 +170,6 @@ static lpz_texture_t lpz_surface_get_current_texture(lpz_surface_t surface)
     if (!surface || !surface->currentDrawable)
         return NULL;
 
-    // Only rebuild the texture wrapper when the drawable's underlying MTLTexture
-    // has actually changed (i.e. after a new acquire).  Skipping the memset +
-    // pointer assignment on every call eliminates a small but guaranteed write
-    // to the cache line on every frame for no-op calls.
     id<MTLTexture> drawableTex = surface->currentDrawable.texture;
     if (surface->currentTexture.texture != drawableTex)
     {

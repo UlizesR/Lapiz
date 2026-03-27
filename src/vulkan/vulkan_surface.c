@@ -83,6 +83,8 @@ static VkPresentModeKHR select_present_mode(VkPhysicalDevice physDev, VkSurfaceK
 static void build_swapchain_image_views(struct surface_t *surf, VkImage *images, uint32_t width, uint32_t height)
 {
     surf->swapchainTextures = malloc(sizeof(struct texture_t) * surf->imageCount);
+    if (!surf->swapchainTextures)
+        return;
     for (uint32_t i = 0; i < surf->imageCount; i++)
     {
         surf->swapchainTextures[i] = (struct texture_t){
@@ -256,6 +258,8 @@ static lpz_surface_t lpz_vk_surface_create(lpz_device_t device, const LpzSurface
     // semaphore by frame slot while the swapchain still holds it causes
     // VUID-vkQueueSubmit-pSignalSemaphores-00067 (semaphore not unsignaled).
     surf->renderFinishedSemaphores = malloc(sizeof(VkSemaphore) * surf->imageCount);
+    if (!surf->renderFinishedSemaphores)
+        return NULL;
     for (uint32_t i = 0; i < surf->imageCount; i++)
     {
         VkSemaphoreCreateInfo semCI = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
@@ -272,8 +276,7 @@ static void lpz_vk_surface_destroy(lpz_surface_t surface)
         vkDestroySemaphore(surface->device->device, surface->imageAvailableSemaphores[i], NULL);
     for (uint32_t i = 0; i < surface->imageCount; i++)
         vkDestroySemaphore(surface->device->device, surface->renderFinishedSemaphores[i], NULL);
-    free(surface->renderFinishedSemaphores);
-    surface->renderFinishedSemaphores = NULL;
+    LPZ_FREE(surface->renderFinishedSemaphores);
     for (uint32_t i = 0; i < surface->imageCount; i++)
         vkDestroyImageView(surface->device->device, surface->swapchainTextures[i].imageView, NULL);
     free(surface->swapchainTextures);
@@ -291,15 +294,13 @@ static void lpz_vk_surface_resize(lpz_surface_t surface, uint32_t width, uint32_
 
     for (uint32_t i = 0; i < surface->imageCount; i++)
         vkDestroyImageView(surface->device->device, surface->swapchainTextures[i].imageView, NULL);
-    free(surface->swapchainTextures);
-    surface->swapchainTextures = NULL;
+    LPZ_FREE(surface->swapchainTextures);
 
     // Destroy per-image renderFinished semaphores before the swapchain is
     // recreated — the new swapchain may have a different imageCount.
     for (uint32_t i = 0; i < surface->imageCount; i++)
         vkDestroySemaphore(surface->device->device, surface->renderFinishedSemaphores[i], NULL);
-    free(surface->renderFinishedSemaphores);
-    surface->renderFinishedSemaphores = NULL;
+    LPZ_FREE(surface->renderFinishedSemaphores);
 
     VkSwapchainKHR oldSwapchain = surface->swapchain;
     VkSwapchainCreateInfoKHR createInfo = {
@@ -384,7 +385,6 @@ static uint64_t lpz_vk_surface_get_last_presentation_timestamp(lpz_surface_t sur
     return surface ? surface->lastPresentTimestamp : 0;
 }
 
-// ============================================================================
 // ============================================================================
 // SURFACE API TABLE
 // ============================================================================

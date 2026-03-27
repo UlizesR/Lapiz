@@ -1,5 +1,7 @@
 #include "../include/core/log.h"
 #include "../include/core/window.h"
+#include "../include/utils/internals.h"
+#include "platform_common.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -8,15 +10,6 @@
 #include <string.h>
 
 #define LPZ_SDL_PROP_WINDOW "lpz.window"
-#define LPZ_SDL_INITIAL_CHAR_QUEUE_CAPACITY 256
-
-typedef struct {
-    uint32_t *data;
-    uint32_t capacity;
-    uint32_t head;
-    uint32_t tail;
-    uint32_t dropped;
-} lpz_char_queue_t;
 
 struct window_t {
     SDL_Window *handle;
@@ -26,9 +19,6 @@ struct window_t {
 
     float mouse_x;
     float mouse_y;
-    float scroll_x;
-    float scroll_y;
-
     float content_scale_x;
     float content_scale_y;
 
@@ -47,6 +37,14 @@ struct window_t {
     LpzWindowResizeCallback resize_callback;
     void *resize_userdata;
 };
+
+// ============================================================================
+// FORWARD DECLARATIONS
+// ============================================================================
+
+static void lpz_sdl_toggle_fullscreen(lpz_window_t window);
+static void lpz_sdl_toggle_borderless_windowed(lpz_window_t window);
+static bool lpz_sdl_is_fullscreen(lpz_window_t window);
 
 static void sdl_log_output(void *userdata, int category, SDL_LogPriority priority, const char *message)
 {
@@ -72,69 +70,6 @@ static void sdl_log_output(void *userdata, int category, SDL_LogPriority priorit
             LPZ_LOG_BACKEND_ERROR("SDL", LPZ_LOG_CATEGORY_WINDOW, LPZ_FAILURE, "%s", message ? message : "(null)");
             break;
     }
-}
-
-static void char_queue_init(lpz_char_queue_t *q)
-{
-    q->capacity = LPZ_SDL_INITIAL_CHAR_QUEUE_CAPACITY;
-    q->data = (uint32_t *)calloc(q->capacity, sizeof(uint32_t));
-    q->head = q->tail = q->dropped = 0;
-}
-
-static void char_queue_destroy(lpz_char_queue_t *q)
-{
-    free(q->data);
-    q->data = NULL;
-    q->capacity = q->head = q->tail = q->dropped = 0;
-}
-
-static uint32_t char_queue_count(const lpz_char_queue_t *q)
-{
-    if (q->head >= q->tail)
-        return q->head - q->tail;
-    return q->capacity - q->tail + q->head;
-}
-
-static bool char_queue_grow(lpz_char_queue_t *q)
-{
-    uint32_t count = char_queue_count(q);
-    uint32_t new_capacity = q->capacity ? q->capacity * 2u : LPZ_SDL_INITIAL_CHAR_QUEUE_CAPACITY;
-    uint32_t *new_data = (uint32_t *)calloc(new_capacity, sizeof(uint32_t));
-    if (!new_data)
-        return false;
-
-    for (uint32_t i = 0; i < count; ++i)
-        new_data[i] = q->data[(q->tail + i) % q->capacity];
-
-    free(q->data);
-    q->data = new_data;
-    q->capacity = new_capacity;
-    q->tail = 0;
-    q->head = count;
-    return true;
-}
-
-static void char_queue_push(lpz_char_queue_t *q, uint32_t codepoint)
-{
-    uint32_t next = (q->head + 1u) % q->capacity;
-    if (next == q->tail && !char_queue_grow(q))
-    {
-        q->dropped++;
-        return;
-    }
-
-    q->data[q->head] = codepoint;
-    q->head = (q->head + 1u) % q->capacity;
-}
-
-static uint32_t char_queue_pop(lpz_char_queue_t *q)
-{
-    if (q->head == q->tail)
-        return 0;
-
-    uint32_t c = q->data[q->tail];
-    q->tail = (q->tail + 1u) % q->capacity;
-    return c;
 }
 
 static struct window_t *lpz_sdl_get_window_from_id(SDL_WindowID id)
@@ -361,32 +296,6 @@ static int lpz_sdl_button_to_lpz(int sdl_button)
     }
 }
 
-static uint32_t lpz_window_flags_to_sdl(uint32_t flags)
-{
-    uint32_t sdl_flags = 0;
-
-    if (flags & (1u << 0))
-        sdl_flags |= SDL_WINDOW_RESIZABLE;
-    if (flags & (1u << 1))
-        sdl_flags |= SDL_WINDOW_BORDERLESS;
-    if (flags & (1u << 2))
-        sdl_flags |= SDL_WINDOW_HIDDEN;
-    if (flags & (1u << 3))
-        sdl_flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
-    if (flags & (1u << 4))
-        sdl_flags |= SDL_WINDOW_FULLSCREEN;
-    if (flags & (1u << 5))
-        sdl_flags |= SDL_WINDOW_BORDERLESS;
-    if (flags & (1u << 6))
-        sdl_flags |= SDL_WINDOW_ALWAYS_ON_TOP;
-    if (flags & (1u << 7))
-        sdl_flags |= SDL_WINDOW_TRANSPARENT;
-    if (flags & (1u << 8))
-        sdl_flags |= SDL_WINDOW_MOUSE_GRABBED;
-
-    return sdl_flags;
-}
-
 static bool lpz_sdl_init(void)
 {
     SDL_SetLogOutputFunction(sdl_log_output, NULL);
@@ -407,7 +316,7 @@ static void lpz_sdl_terminate(void)
 
 static lpz_window_t lpz_sdl_create_window(const char *title, uint32_t width, uint32_t height)
 {
-    SDL_WindowFlags sdl_flags = SDL_WINDOW_VULKAN | SDL_WINDOW_METAL;
+    SDL_WindowFlags sdl_flags = SDL_WINDOW_VULKAN | SDL_WINDOW_METAL | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     SDL_Window *sdl_window = SDL_CreateWindow(title ? title : "Lapiz", (int)width, (int)height, sdl_flags);
     if (!sdl_window)
     {
@@ -856,22 +765,116 @@ static int lpz_sdl_create_vulkan_surface(lpz_window_t window, void *vk_instance,
     return 0;
 }
 
+static bool lpz_sdl_is_state(lpz_window_t window, uint32_t flags)
+{
+    if (!window)
+        return false;
+    SDL_WindowFlags sdl = SDL_GetWindowFlags(window->handle);
+    if ((flags & LPZ_WINDOW_FLAG_RESIZABLE) && !(sdl & SDL_WINDOW_RESIZABLE))
+        return false;
+    if ((flags & LPZ_WINDOW_FLAG_UNDECORATED) && !(sdl & SDL_WINDOW_BORDERLESS))
+        return false;
+    if ((flags & LPZ_WINDOW_FLAG_HIDDEN) && !(sdl & SDL_WINDOW_HIDDEN))
+        return false;
+    if ((flags & LPZ_WINDOW_FLAG_FULLSCREEN) && !(sdl & SDL_WINDOW_FULLSCREEN))
+        return false;
+    if ((flags & LPZ_WINDOW_FLAG_ALWAYS_ON_TOP) && !(sdl & SDL_WINDOW_ALWAYS_ON_TOP))
+        return false;
+    if ((flags & LPZ_WINDOW_FLAG_TRANSPARENT) && !(sdl & SDL_WINDOW_TRANSPARENT))
+        return false;
+    return true;
+}
+
+static void lpz_sdl_set_state(lpz_window_t window, uint32_t flags)
+{
+    if (!window)
+        return;
+    if (flags & LPZ_WINDOW_FLAG_RESIZABLE)
+        SDL_SetWindowResizable(window->handle, true);
+    if (flags & LPZ_WINDOW_FLAG_UNDECORATED)
+        SDL_SetWindowBordered(window->handle, false);
+    if (flags & LPZ_WINDOW_FLAG_HIDDEN)
+        SDL_HideWindow(window->handle);
+    if (flags & LPZ_WINDOW_FLAG_ALWAYS_ON_TOP)
+        SDL_SetWindowAlwaysOnTop(window->handle, true);
+    if (flags & LPZ_WINDOW_FLAG_FULLSCREEN)
+        lpz_sdl_toggle_fullscreen(window);
+    if (flags & LPZ_WINDOW_FLAG_BORDERLESS_WINDOWED)
+        lpz_sdl_toggle_borderless_windowed(window);
+    window->flags |= flags;
+}
+
+static void lpz_sdl_clear_state(lpz_window_t window, uint32_t flags)
+{
+    if (!window)
+        return;
+    if (flags & LPZ_WINDOW_FLAG_RESIZABLE)
+        SDL_SetWindowResizable(window->handle, false);
+    if (flags & LPZ_WINDOW_FLAG_UNDECORATED)
+        SDL_SetWindowBordered(window->handle, true);
+    if (flags & LPZ_WINDOW_FLAG_HIDDEN)
+        SDL_ShowWindow(window->handle);
+    if (flags & LPZ_WINDOW_FLAG_ALWAYS_ON_TOP)
+        SDL_SetWindowAlwaysOnTop(window->handle, false);
+    if ((flags & LPZ_WINDOW_FLAG_FULLSCREEN) && lpz_sdl_is_fullscreen(window))
+        lpz_sdl_toggle_fullscreen(window);
+    if ((flags & LPZ_WINDOW_FLAG_BORDERLESS_WINDOWED) && !lpz_sdl_is_fullscreen(window))
+    {
+        SDL_SetWindowBordered(window->handle, true);
+        if (window->windowed_w > 0)
+        {
+            SDL_SetWindowSize(window->handle, window->windowed_w, window->windowed_h);
+            SDL_SetWindowPosition(window->handle, window->windowed_x, window->windowed_y);
+        }
+    }
+    window->flags &= ~flags;
+}
+
 const LpzWindowAPI LpzWindow_SDL = {
     .Init = lpz_sdl_init,
     .Terminate = lpz_sdl_terminate,
+
     .CreateWindow = lpz_sdl_create_window,
     .DestroyWindow = lpz_sdl_destroy_window,
+
     .ShouldClose = lpz_sdl_should_close,
     .PollEvents = lpz_sdl_poll_events,
     .SetResizeCallback = lpz_sdl_set_resize_callback,
     .GetFramebufferSize = lpz_sdl_get_framebuffer_size,
     .WasResized = lpz_sdl_was_resized,
+
     .GetKey = lpz_sdl_get_key,
     .GetMouseButton = lpz_sdl_get_mouse_button,
     .GetMousePosition = lpz_sdl_get_mouse_position,
     .PopTypedChar = lpz_sdl_pop_typed_char,
     .SetCursorMode = lpz_sdl_set_cursor_mode,
     .GetTime = lpz_sdl_get_time,
+
+    .IsReady = lpz_sdl_is_ready,
+    .IsFullscreen = lpz_sdl_is_fullscreen,
+    .IsHidden = lpz_sdl_is_hidden,
+    .IsMinimized = lpz_sdl_is_minimized,
+    .IsMaximized = lpz_sdl_is_maximized,
+    .IsFocused = lpz_sdl_is_focused,
+    .IsState = lpz_sdl_is_state,
+
+    .SetState = lpz_sdl_set_state,
+    .ClearState = lpz_sdl_clear_state,
+
+    .ToggleFullscreen = lpz_sdl_toggle_fullscreen,
+    .ToggleBorderlessWindowed = lpz_sdl_toggle_borderless_windowed,
+    .Maximize = lpz_sdl_maximize,
+    .Minimize = lpz_sdl_minimize,
+    .Restore = lpz_sdl_restore,
+
+    .SetTitle = lpz_sdl_set_title,
+    .SetPosition = lpz_sdl_set_position,
+    .SetSize = lpz_sdl_set_size,
+    .SetMinSize = lpz_sdl_set_min_size,
+    .SetMaxSize = lpz_sdl_set_max_size,
+    .SetOpacity = lpz_sdl_set_opacity,
+    .FocusWindow = lpz_sdl_focus_window,
+
     .GetNativeHandle = lpz_sdl_get_native_handle,
     .GetRequiredVulkanExtensions = lpz_sdl_get_required_vulkan_extensions,
     .CreateVulkanSurface = lpz_sdl_create_vulkan_surface,

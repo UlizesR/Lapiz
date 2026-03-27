@@ -26,14 +26,6 @@
 #define LPZ_VK_WARN(fmt, ...) LPZ_LOG_BACKEND_WARNING(LPZ_VK_SUBSYSTEM, LPZ_LOG_CATEGORY_BACKEND, fmt, ##__VA_ARGS__)
 #define LPZ_VK_ERR(res, fmt, ...) LPZ_LOG_BACKEND_ERROR(LPZ_VK_SUBSYSTEM, LPZ_LOG_CATEGORY_BACKEND, res, fmt, ##__VA_ARGS__)
 
-LAPIZ_INLINE void lpz_vk_log_api_specific_once(const char *fn, const char *feature, bool *logged)
-{
-    if (!logged || *logged)
-        return;
-    *logged = true;
-    LPZ_VK_INFO("%s uses %s, which is specific to the Vulkan backend.", fn, feature);
-}
-
 // ============================================================================
 // RUNTIME FEATURE FLAGS (defined in vulkan_device.c, extern here)
 // ============================================================================
@@ -87,11 +79,10 @@ struct device_t {
     bool debugWarnAttachmentHazards;
     bool debugValidateReadAfterWrite;
     PFN_vkSetDeviceMemoryPriorityEXT pfnSetDeviceMemoryPriority;
-    // Cached debug-utils command function pointers (loaded once at device creation,
-    // avoids a vkGetDeviceProcAddr lookup on every debug label call).
     PFN_vkCmdBeginDebugUtilsLabelEXT pfnCmdBeginDebugLabel;
     PFN_vkCmdEndDebugUtilsLabelEXT pfnCmdEndDebugLabel;
     PFN_vkCmdInsertDebugUtilsLabelEXT pfnCmdInsertDebugLabel;
+    char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
 };
 
 struct heap_t {
@@ -121,14 +112,9 @@ struct texture_t {
     bool isSwapchainImage;
     bool ownsMemory;
     lpz_device_t device;
-    /* Tracks the current Vulkan image layout so barriers can supply the
-     * correct oldLayout instead of always using UNDEFINED.  UNDEFINED is
-     * only valid for the very first use or when contents are discarded;
-     * using it otherwise forces redundant driver transitions and may discard
-     * contents that were intentionally preserved with LOAD.                */
     VkImageLayout currentLayout;
-    bool layoutKnown;     /* true once currentLayout has been set by a barrier */
-    uint32_t arrayLayers; /* number of array layers; needed for image view    */
+    bool layoutKnown;
+    uint32_t arrayLayers;
 };
 
 struct texture_view_t {
@@ -242,38 +228,21 @@ struct surface_t {
     struct texture_t *swapchainTextures;
     uint32_t currentImageIndex;
     uint32_t currentFrameIndex;
-    // imageAvailableSemaphores — one per CPU frame slot (LPZ_MAX_FRAMES_IN_FLIGHT).
-    // Used in vkAcquireNextImageKHR, indexed by currentFrameIndex.  The frame
-    // slot cycles independently of the swapchain image index so this is safe.
     VkSemaphore imageAvailableSemaphores[LPZ_MAX_FRAMES_IN_FLIGHT];
-    // renderFinishedSemaphores — one per *swapchain image* (imageCount), NOT per
-    // frame slot.  Indexed by currentImageIndex in submit and present.
-    //
-    // Sizing by imageCount (not LPZ_MAX_FRAMES_IN_FLIGHT) is mandatory:
-    // the driver may return more images than minImageCount.  If the semaphores
-    // are indexed by frameIndex (which cycles mod 3) while the swapchain has
-    // 4 images, the same semaphore is signaled in vkQueueSubmit before the
-    // swapchain has consumed it from the previous vkQueuePresentKHR for that
-    // image — a VUID-vkQueueSubmit-pSignalSemaphores-00067 violation.
-    VkSemaphore *renderFinishedSemaphores;  // malloc'd, freed in Destroy/Resize
+    // One per swapchain image (imageCount), not per frame slot — sized this way
+    // to avoid reusing a semaphore before the swapchain has consumed it.
+    VkSemaphore *renderFinishedSemaphores;
     uint64_t lastPresentTimestamp;
-    // The color space negotiated at swapchain creation time.
-    // Preserved across resize so we don't silently revert to SRGB_NONLINEAR.
     VkColorSpaceKHR chosenColorSpace;
 };
 
-// Size of the per-renderer frame-lifetime bump allocator.
-// 64 KB comfortably covers attachment info arrays, temporary command-buffer
-// handle lists, and other hot-path transient allocations across a full frame.
-// Increase if validation warns about arena exhaustion.
-#define LPZ_VK_FRAME_ARENA_SIZE (64u * 1024u)
-
 struct renderer_t {
     lpz_device_t device;
-    VkCommandPool commandPool;
+    VkCommandPool commandPools[LPZ_MAX_FRAMES_IN_FLIGHT];
     VkCommandBuffer commandBuffers[LPZ_MAX_FRAMES_IN_FLIGHT];
     VkFence inFlightFences[LPZ_MAX_FRAMES_IN_FLIGHT];
     VkCommandBuffer transferCmd;
+    VkFence transferFence;
     uint32_t frameIndex;
     VkCommandBuffer currentCmd;
     lpz_pipeline_t activePipeline;
@@ -293,19 +262,8 @@ struct renderer_t {
     VkRect2D cachedScissor;
     bool transferOwnsDedicatedQueue;
 
-    // -----------------------------------------------------------------------
-    // Frame-lifetime bump allocator (frame arena).
-    // Reset once per BeginFrame — all transient per-frame allocations (render-
-    // pass attachment arrays, temporary VkCommandBuffer handle lists, etc.)
-    // use this arena instead of malloc/free, giving O(1) alloc with zero
-    // fragmentation and no heap traffic in the hot path.
-    // -----------------------------------------------------------------------
-    _Alignas(16) char frameArena[LPZ_VK_FRAME_ARENA_SIZE];
+    _Alignas(16) char frameArena[LPZ_FRAME_ARENA_SIZE];
     size_t frameArenaOffset;
-
-    // Atomic draw-call counter — incremented on every Draw/DrawIndexed call
-    // with memory_order_relaxed (counter only; no ordering guarantee needed).
-    // Useful for per-frame stats and multi-threaded recording diagnostics.
     _Atomic uint32_t drawCounter;
 };
 
@@ -371,23 +329,13 @@ LAPIZ_INLINE void lpz_vk_renderer_reset_state(lpz_renderer_t renderer)
     memset(renderer->activeVertexBuffers, 0, sizeof(renderer->activeVertexBuffers));
 }
 
-// ============================================================================
 // FRAME ARENA HELPERS
-//
-// lpz_vk_frame_reset()  — call once at BeginFrame; reclaims all arena memory
-//                          in a single store, eliminating heap traffic.
-// lpz_vk_frame_alloc()  — O(1) bump allocation (pointer add + range check).
-//                          Returns NULL when exhausted so callers can fall
-//                          back to malloc for unusually large requests.
-// All returned pointers are guaranteed 16-byte aligned (SIMD/GPU-upload safe).
-// ============================================================================
 
 LAPIZ_INLINE void lpz_vk_frame_reset(struct renderer_t *r)
 {
     if (r)
     {
         r->frameArenaOffset = 0;
-        // Reset per-frame draw counter so stats reflect the current frame only.
         atomic_store_explicit(&r->drawCounter, 0, memory_order_relaxed);
     }
 }
@@ -396,9 +344,8 @@ LAPIZ_INLINE void *lpz_vk_frame_alloc(struct renderer_t *r, size_t size)
 {
     if (!r || size == 0)
         return NULL;
-    // Round up to next 16-byte boundary for alignment safety.
     size_t aligned = (size + 15u) & ~15u;
-    if (r->frameArenaOffset + aligned > LPZ_VK_FRAME_ARENA_SIZE)
+    if (r->frameArenaOffset + aligned > LPZ_FRAME_ARENA_SIZE)
         return NULL;  // arena exhausted — caller falls back to malloc
     void *p = r->frameArena + r->frameArenaOffset;
     r->frameArenaOffset += aligned;
@@ -513,11 +460,8 @@ LAPIZ_INLINE void lpz_vk_memory_barrier(VkCommandBuffer cmd, VkPipelineStageFlag
     }
 }
 
-// One-shot command buffer helpers (implemented in vulkan_device.c, used in renderer/surface)
-
 // ============================================================================
-// ============================================================================
-// SHARED HELPERS (used by both device and renderer TUs)
+// SHARED HELPERS
 // ============================================================================
 
 // Temporary host-visible staging buffer used for uploads.
@@ -686,11 +630,7 @@ LAPIZ_INLINE void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLa
 }
 
 // ============================================================================
-// FORMAT / ENUM CONVERTERS (needed by both device and renderer TUs)
-// ============================================================================
-
-// ============================================================================
-// FORMAT / ENUM CONVERTERS (needed by both device and renderer TUs)
+// FORMAT / ENUM CONVERTERS
 // ============================================================================
 
 LAPIZ_INLINE VkFormat LpzToVkFormat(LpzFormat f)

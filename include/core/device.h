@@ -77,13 +77,13 @@ typedef enum {
 // ----------------------------------------------------------------------------
 
 typedef enum {
-    LPZ_BUFFER_USAGE_VERTEX_BIT = 1 << 0,
-    LPZ_BUFFER_USAGE_INDEX_BIT = 1 << 1,
-    LPZ_BUFFER_USAGE_UNIFORM_BIT = 1 << 2,
-    LPZ_BUFFER_USAGE_TRANSFER_SRC = 1 << 3,
-    LPZ_BUFFER_USAGE_TRANSFER_DST = 1 << 4,
-    LPZ_BUFFER_USAGE_STORAGE_BIT = 1 << 5,
-    LPZ_BUFFER_USAGE_INDIRECT_BIT = 1 << 6,
+    LPZ_BUFFER_USAGE_VERTEX_BIT = 1u << 0,
+    LPZ_BUFFER_USAGE_INDEX_BIT = 1u << 1,
+    LPZ_BUFFER_USAGE_UNIFORM_BIT = 1u << 2,
+    LPZ_BUFFER_USAGE_TRANSFER_SRC = 1u << 3,
+    LPZ_BUFFER_USAGE_TRANSFER_DST = 1u << 4,
+    LPZ_BUFFER_USAGE_STORAGE_BIT = 1u << 5,
+    LPZ_BUFFER_USAGE_INDIRECT_BIT = 1u << 6,
 } LpzBufferUsage;
 
 typedef enum {
@@ -93,13 +93,13 @@ typedef enum {
 } LpzMemoryUsage;
 
 typedef enum {
-    LPZ_TEXTURE_USAGE_SAMPLED_BIT = 1 << 0,
-    LPZ_TEXTURE_USAGE_COLOR_ATTACHMENT_BIT = 1 << 1,
-    LPZ_TEXTURE_USAGE_DEPTH_ATTACHMENT_BIT = 1 << 2,
-    LPZ_TEXTURE_USAGE_STORAGE_BIT = 1 << 3,
-    LPZ_TEXTURE_USAGE_TRANSIENT_BIT = 1 << 4,
-    LPZ_TEXTURE_USAGE_TRANSFER_SRC_BIT = 1 << 5,
-    LPZ_TEXTURE_USAGE_TRANSFER_DST_BIT = 1 << 6,
+    LPZ_TEXTURE_USAGE_SAMPLED_BIT = 1u << 0,
+    LPZ_TEXTURE_USAGE_COLOR_ATTACHMENT_BIT = 1u << 1,
+    LPZ_TEXTURE_USAGE_DEPTH_ATTACHMENT_BIT = 1u << 2,
+    LPZ_TEXTURE_USAGE_STORAGE_BIT = 1u << 3,
+    LPZ_TEXTURE_USAGE_TRANSIENT_BIT = 1u << 4,
+    LPZ_TEXTURE_USAGE_TRANSFER_SRC_BIT = 1u << 5,
+    LPZ_TEXTURE_USAGE_TRANSFER_DST_BIT = 1u << 6,
 } LpzTextureUsageFlags;
 
 typedef enum {
@@ -128,14 +128,14 @@ typedef enum {
 
 typedef enum {
     LPZ_SHADER_STAGE_NONE = 0,
-    LPZ_SHADER_STAGE_VERTEX = 1 << 0,
-    LPZ_SHADER_STAGE_FRAGMENT = 1 << 1,
-    LPZ_SHADER_STAGE_COMPUTE = 1 << 2,
-    LPZ_SHADER_STAGE_OBJECT = 1 << 3,
-    LPZ_SHADER_STAGE_MESH = 1 << 4,
-    LPZ_SHADER_STAGE_TILE = 1 << 5,
-    LPZ_SHADER_STAGE_ALL_GRAPHICS = (1 << 0) | (1 << 1),
-    LPZ_SHADER_STAGE_ALL = (1 << 0) | (1 << 1) | (1 << 2),
+    LPZ_SHADER_STAGE_VERTEX = 1u << 0,
+    LPZ_SHADER_STAGE_FRAGMENT = 1u << 1,
+    LPZ_SHADER_STAGE_COMPUTE = 1u << 2,
+    LPZ_SHADER_STAGE_OBJECT = 1u << 3,
+    LPZ_SHADER_STAGE_MESH = 1u << 4,
+    LPZ_SHADER_STAGE_TILE = 1u << 5,
+    LPZ_SHADER_STAGE_ALL_GRAPHICS = (1u << 0) | (1u << 1),
+    LPZ_SHADER_STAGE_ALL = (1u << 0) | (1u << 1) | (1u << 2),
 } LpzShaderStage;
 
 typedef enum {
@@ -218,10 +218,10 @@ typedef enum {
 } LpzBlendOp;
 
 typedef enum {
-    LPZ_COLOR_COMPONENT_R_BIT = 1 << 0,
-    LPZ_COLOR_COMPONENT_G_BIT = 1 << 1,
-    LPZ_COLOR_COMPONENT_B_BIT = 1 << 2,
-    LPZ_COLOR_COMPONENT_A_BIT = 1 << 3,
+    LPZ_COLOR_COMPONENT_R_BIT = 1u << 0,
+    LPZ_COLOR_COMPONENT_G_BIT = 1u << 1,
+    LPZ_COLOR_COMPONENT_B_BIT = 1u << 2,
+    LPZ_COLOR_COMPONENT_A_BIT = 1u << 3,
     LPZ_COLOR_COMPONENT_ALL = 0xF,
 } LpzColorComponentFlags;
 
@@ -254,14 +254,14 @@ typedef enum {
 } LpzQueryType;
 
 typedef enum {
-    LPZ_FORMAT_FEATURE_SAMPLED_IMAGE_BIT = 1 << 0,
-    LPZ_FORMAT_FEATURE_STORAGE_IMAGE_BIT = 1 << 1,
-    LPZ_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT = 1 << 2,
-    LPZ_FORMAT_FEATURE_DEPTH_ATTACHMENT_BIT = 1 << 3,
-    LPZ_FORMAT_FEATURE_BLIT_SRC_BIT = 1 << 4,
-    LPZ_FORMAT_FEATURE_BLIT_DST_BIT = 1 << 5,
-    LPZ_FORMAT_FEATURE_FILTER_LINEAR_BIT = 1 << 6,
-    LPZ_FORMAT_FEATURE_VERTEX_BUFFER_BIT = 1 << 7,
+    LPZ_FORMAT_FEATURE_SAMPLED_IMAGE_BIT = 1u << 0,
+    LPZ_FORMAT_FEATURE_STORAGE_IMAGE_BIT = 1u << 1,
+    LPZ_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT = 1u << 2,
+    LPZ_FORMAT_FEATURE_DEPTH_ATTACHMENT_BIT = 1u << 3,
+    LPZ_FORMAT_FEATURE_BLIT_SRC_BIT = 1u << 4,
+    LPZ_FORMAT_FEATURE_BLIT_DST_BIT = 1u << 5,
+    LPZ_FORMAT_FEATURE_FILTER_LINEAR_BIT = 1u << 6,
+    LPZ_FORMAT_FEATURE_VERTEX_BUFFER_BIT = 1u << 7,
 } LpzFormatFeatureFlags;
 
 // ============================================================================
@@ -645,14 +645,6 @@ typedef struct {
 
     void (*CreatePipelineAsync)(lpz_device_t device, const LpzPipelineDesc *desc, void (*callback)(lpz_pipeline_t pipeline, void *userdata), void *userdata);
 
-    // Serialize the backend pipeline cache to disk.
-    // On Metal this is currently a no-op: the MTLBinaryArchive is used read-only
-    // at runtime (addRenderPipelineFunctionsWithDescriptor: is never called
-    // because it triggers async XPC work that leaves the archive in an
-    // unserializable state — see metal_device.m for details).  The slot is
-    // retained for API stability and future pre-compiled offline archive support.
-    // On Vulkan this is also a no-op; vkGetPipelineCacheData is handled inside
-    // lpz_vk_device_destroy where it is safe.
     void (*FlushPipelineCache)(lpz_device_t device);
 
     lpz_compute_pipeline_t (*CreateComputePipeline)(lpz_device_t device, const LpzComputePipelineDesc *desc);

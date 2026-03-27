@@ -12,10 +12,6 @@ static void lpz_device_destroy_tile_pipeline(struct tile_pipeline_t *pipeline);
 static void lpz_device_destroy_mesh_pipeline(struct mesh_pipeline_t *pipeline);
 static void lpz_device_destroy_argument_table(struct argument_table_t *table);
 
-// ============================================================================
-// INTERNAL HELPERS
-// ============================================================================
-
 static void *lpz_renderer_alloc_transient_bytes(lpz_renderer_t renderer, NSUInteger size, NSUInteger alignment, id<MTLBuffer> *outBuffer, NSUInteger *outOffset)
 {
     if (!renderer || size == 0)
@@ -48,42 +44,6 @@ static void *lpz_renderer_alloc_transient_bytes(lpz_renderer_t renderer, NSUInte
         *outOffset = offset;
     return (uint8_t *)[renderer->transientBuffers[frame] contents] + offset;
 }
-
-// ----------------------------------------------------------------------------
-// Shader-stage visibility predicates.
-// Used by bind-group encoding and push-constant dispatch to decide whether a
-// resource or constant block should be sent to the vertex and/or fragment stage.
-// ----------------------------------------------------------------------------
-
-// ----------------------------------------------------------------------------
-// Bind-entry encoding helpers.
-// These centralise the per-entry resource-binding loops that were previously
-// duplicated across BindBindGroup and BindArgumentTable.
-// ----------------------------------------------------------------------------
-
-// ============================================================================
-// FORMAT / STATE CONVERSION HELPERS
-// ============================================================================
-
-// ============================================================================
-// METAL 3 HELPERS — BINARY ARCHIVE
-// ============================================================================
-
-#if LAPIZ_MTL_HAS_METAL3
-
-// Returns a URL in NSCachesDirectory/com.lapiz/pipeline_cache.metallib.
-// The file is created on the first run and reused on subsequent launches.
-
-// Creates (or loads from disk) the device-level binary archive.
-// Returns nil on failure — callers treat a nil archive as "no caching".
-
-// Serialises the archive to disk after each pipeline compile.
-
-#endif  // LAPIZ_MTL_HAS_METAL3
-
-// ============================================================================
-// METAL 3 HELPERS — IO COMMAND QUEUE
-// ============================================================================
 
 // ============================================================================
 // DEVICE IMPLEMENTATION
@@ -217,6 +177,8 @@ static const char *lpz_device_get_name(lpz_device_t device)
 static lpz_heap_t lpz_device_create_heap(lpz_device_t device, const LpzHeapDesc *desc)
 {
     struct heap_t *heap = (struct heap_t *)calloc(1, sizeof(struct heap_t));
+    if (!heap)
+        return NULL;
     MTLHeapDescriptor *mtlDesc = [[MTLHeapDescriptor alloc] init];
     mtlDesc.size = desc->size_in_bytes;
 
@@ -669,6 +631,8 @@ static LpzResult lpz_device_create_shader(lpz_device_t device, const LpzShaderDe
         return LPZ_FAILURE;
 
     struct shader_t *shader = (struct shader_t *)calloc(1, sizeof(struct shader_t));
+    if (!shader)
+        return LPZ_OUT_OF_MEMORY;
     NSError *error = nil;
 
     if (desc->is_source_code)
@@ -742,7 +706,7 @@ static lpz_shader_t lpz_device_create_specialized_shader(lpz_device_t device, co
     if (!desc || !desc->base_shader || !desc->entry_point)
         return NULL;
 
-    lpz_metal_log_api_specific_once("CreateSpecializedShader", "Metal function specialization", &logged_specialized_shader);
+    lpz_log_backend_api_specific_once(LPZ_MTL_SUBSYSTEM, "CreateSpecializedShader", "Metal function specialization", &logged_specialized_shader);
 
     struct shader_t *shader = (struct shader_t *)calloc(1, sizeof(struct shader_t));
     if (!shader)
@@ -823,6 +787,8 @@ static LpzResult lpz_device_create_depth_stencil_state(lpz_device_t device, cons
         return LPZ_FAILURE;
 
     struct depth_stencil_state_t *ds = (struct depth_stencil_state_t *)calloc(1, sizeof(*ds));
+    if (!ds)
+        return LPZ_OUT_OF_MEMORY;
     MTLDepthStencilDescriptor *dsDesc = [[MTLDepthStencilDescriptor alloc] init];
 
     dsDesc.depthCompareFunction = desc->depth_test_enable ? LpzToMetalCompareOp(desc->depth_compare_op) : MTLCompareFunctionAlways;
@@ -966,6 +932,8 @@ static LpzResult lpz_device_create_pipeline(lpz_device_t device, const LpzPipeli
         return LPZ_FAILURE;
 
     struct pipeline_t *pipeline = (struct pipeline_t *)calloc(1, sizeof(struct pipeline_t));
+    if (!pipeline)
+        return LPZ_OUT_OF_MEMORY;
     MTLRenderPipelineDescriptor *mtlDesc = lpz_build_render_pipeline_desc(desc);
 
 #if LAPIZ_MTL_HAS_METAL3
@@ -1045,6 +1013,12 @@ static void lpz_device_create_pipeline_async(lpz_device_t device, const LpzPipel
                                          else
                                          {
                                              struct pipeline_t *pipeline = (struct pipeline_t *)calloc(1, sizeof(struct pipeline_t));
+                                             if (!pipeline)
+                                             {
+                                                 if (callback)
+                                                     callback(NULL, userdata);
+                                                 return;
+                                             }
                                              pipeline->renderPipelineState = [pso retain];
 
                                              // Apply state from the captured value copies — no live desc pointer needed.
@@ -1080,6 +1054,8 @@ static void lpz_device_destroy_pipeline(lpz_pipeline_t pipeline)
 static lpz_compute_pipeline_t lpz_device_create_compute_pipeline(lpz_device_t device, const LpzComputePipelineDesc *desc)
 {
     struct compute_pipeline_t *pipeline = (struct compute_pipeline_t *)calloc(1, sizeof(*pipeline));
+    if (!pipeline)
+        return NULL;
     NSError *error = nil;
 
 #if LAPIZ_MTL_HAS_METAL3
@@ -1130,7 +1106,7 @@ static struct tile_pipeline_t *lpz_device_create_tile_pipeline(lpz_device_t devi
     if (!desc || !desc->tile_shader || !desc->tile_shader->function)
         return NULL;
 
-    lpz_metal_log_api_specific_once("CreateTilePipeline", "tile shaders / imageblocks", &logged_tile_pipeline);
+    lpz_log_backend_api_specific_once(LPZ_MTL_SUBSYSTEM, "CreateTilePipeline", "tile shaders / imageblocks", &logged_tile_pipeline);
 
     BOOL supported = NO;
     if (@available(macOS 11.0, *))
@@ -1151,6 +1127,8 @@ static struct tile_pipeline_t *lpz_device_create_tile_pipeline(lpz_device_t devi
     }
 
     struct tile_pipeline_t *pipeline = (struct tile_pipeline_t *)calloc(1, sizeof(*pipeline));
+    if (!pipeline)
+        return NULL;
     MTLTileRenderPipelineDescriptor *tileDesc = [[MTLTileRenderPipelineDescriptor alloc] init];
 
     tileDesc.label = @"LapizTilePipeline";
@@ -1191,7 +1169,7 @@ static struct mesh_pipeline_t *lpz_device_create_mesh_pipeline(lpz_device_t devi
     if (!desc || !desc->mesh_shader || !desc->mesh_shader->function)
         return NULL;
 
-    lpz_metal_log_api_specific_once("CreateMeshPipeline", "mesh/object shaders", &logged_mesh_pipeline);
+    lpz_log_backend_api_specific_once(LPZ_MTL_SUBSYSTEM, "CreateMeshPipeline", "mesh/object shaders", &logged_mesh_pipeline);
 
 #if LAPIZ_MTL_HAS_METAL3
     if (@available(macOS 13.0, *))
@@ -1203,6 +1181,8 @@ static struct mesh_pipeline_t *lpz_device_create_mesh_pipeline(lpz_device_t devi
         }
 
         struct mesh_pipeline_t *pipeline = (struct mesh_pipeline_t *)calloc(1, sizeof(*pipeline));
+        if (!pipeline)
+            return NULL;
         MTLMeshRenderPipelineDescriptor *meshDesc = [[MTLMeshRenderPipelineDescriptor alloc] init];
 
         meshDesc.label = @"LapizMeshPipeline";
@@ -1259,7 +1239,9 @@ static lpz_bind_group_layout_t lpz_device_create_bind_group_layout(lpz_device_t 
 {
     (void)device;
     struct bind_group_layout_t *layout = (struct bind_group_layout_t *)calloc(1, sizeof(*layout));
-    if (layout && desc)
+    if (!layout)
+        return NULL;
+    if (desc)
     {
         uint32_t count = (desc->entry_count < LPZ_MTL_MAX_BIND_ENTRIES) ? desc->entry_count : LPZ_MTL_MAX_BIND_ENTRIES;
         layout->entry_count = count;
@@ -1409,7 +1391,7 @@ static void lpz_device_destroy_bind_group(lpz_bind_group_t group)
 static struct argument_table_t *lpz_device_create_argument_table(lpz_device_t device, const LpzArgumentTableDesc *desc)
 {
     static bool logged_argument_table = false;
-    lpz_metal_log_api_specific_once("CreateArgumentTable", "Metal argument tables / argument buffers", &logged_argument_table);
+    lpz_log_backend_api_specific_once(LPZ_MTL_SUBSYSTEM, "CreateArgumentTable", "Metal argument tables / argument buffers", &logged_argument_table);
 
     if (!desc)
         return NULL;
@@ -1580,7 +1562,7 @@ static void lpz_device_destroy_argument_table(struct argument_table_t *table)
 static struct io_command_queue_t *lpz_io_command_queue_create(lpz_device_t device, const LpzIOCommandQueueDesc *desc)
 {
     static bool logged_io_queue = false;
-    lpz_metal_log_api_specific_once("CreateIOCommandQueue", "MTLIOCommandQueue", &logged_io_queue);
+    lpz_log_backend_api_specific_once(LPZ_MTL_SUBSYSTEM, "CreateIOCommandQueue", "MTLIOCommandQueue", &logged_io_queue);
 
     (void)desc;  // priority hint reserved for future use
     struct io_command_queue_t *q = (struct io_command_queue_t *)calloc(1, sizeof(*q));
@@ -1799,6 +1781,8 @@ static void lpz_device_set_error_callback(lpz_device_t device, void (*callback)(
 static lpz_fence_t lpz_device_create_fence(lpz_device_t device)
 {
     struct fence_t *f = (struct fence_t *)calloc(1, sizeof(struct fence_t));
+    if (!f)
+        return NULL;
     f->device = device;
     f->signalValue = 1;
     f->event = [device->device newSharedEvent];
@@ -1847,6 +1831,8 @@ static bool lpz_device_is_fence_signaled(lpz_fence_t fence)
 static lpz_query_pool_t lpz_device_create_query_pool(lpz_device_t device, const LpzQueryPoolDesc *desc)
 {
     struct query_pool_t *qp = (struct query_pool_t *)calloc(1, sizeof(struct query_pool_t));
+    if (!qp)
+        return NULL;
     qp->type = desc->type;
     qp->count = desc->count;
     qp->device = device;
@@ -1857,9 +1843,9 @@ static lpz_query_pool_t lpz_device_create_query_pool(lpz_device_t device, const 
     }
     else if (desc->type == LPZ_QUERY_TYPE_PIPELINE_STATISTICS)
     {
-        // Allocate a zeroed CPU buffer so GetQueryResults returns zeros rather than
-        // crashing.  Real statistics are visible in Xcode Instruments / GPU Frame Debugger.
         qp->cpuTimestamps = (uint64_t *)calloc(desc->count * sizeof(LpzPipelineStatisticsResult) / sizeof(uint64_t) + 1, sizeof(uint64_t));
+        if (!qp->cpuTimestamps)
+            LPZ_MTL_WARN("query pool: failed to allocate CPU timestamp buffer — results will be zero.");
     }
     else  // LPZ_QUERY_TYPE_TIMESTAMP
     {

@@ -86,20 +86,6 @@ static bool checkValidationLayerSupport(void)
 }
 
 // ============================================================================
-// FORWARD DECLARATIONS
-// ============================================================================
-// the implementation of this helper.
-static void lpz_vk_check_attachment_hazards(lpz_renderer_t renderer, const LpzRenderPassDesc *desc);
-
-// One-shot command buffer: allocate, begin, (caller records), end + submit + free.
-
-// Insert an image layout transition barrier.
-
-// ============================================================================
-// FORMAT / ENUM CONVERSIONS
-// ============================================================================
-
-// ============================================================================
 // DEVICE — PIPELINE CACHE (disk-persisted)
 // ============================================================================
 
@@ -124,8 +110,7 @@ static void pipeline_cache_load(VkDevice device, VkPhysicalDevice physDev, VkPip
             data = malloc(dataSize);
             if (data && fread(data, 1, dataSize, f) != dataSize)
             {
-                free(data);
-                data = NULL;
+                LPZ_FREE(data);
                 dataSize = 0;
             }
             fclose(f);
@@ -336,6 +321,12 @@ static LpzResult lpz_vk_device_create(lpz_device_t *out_device)
         return LPZ_INITIALIZATION_FAILED;
     }
     dev->physicalDevice = chosen;
+    {
+        VkPhysicalDeviceProperties p;
+        vkGetPhysicalDeviceProperties(chosen, &p);
+        strncpy(dev->name, p.deviceName, sizeof(dev->name) - 1);
+        dev->name[sizeof(dev->name) - 1] = '\0';
+    }
 
     // --- Queue family discovery ---
     {
@@ -640,12 +631,7 @@ static void lpz_vk_device_destroy(lpz_device_t device)
 
 static const char *lpz_vk_device_get_name(lpz_device_t device)
 {
-    static char name[256];
-    VkPhysicalDeviceProperties props;
-    vkGetPhysicalDeviceProperties(device->physicalDevice, &props);
-    strncpy(name, props.deviceName, sizeof(name) - 1);
-    name[sizeof(name) - 1] = '\0';
-    return name;
+    return device ? device->name : "";
 }
 
 // ============================================================================
@@ -1258,7 +1244,7 @@ static lpz_shader_t lpz_vk_device_create_specialized_shader(lpz_device_t device,
     if (!desc || !desc->base_shader)
         return NULL;
 
-    lpz_vk_log_api_specific_once("CreateSpecializedShader", "VkSpecializationInfo", &logged_specialized_shader);
+    lpz_log_backend_api_specific_once(LPZ_VK_SUBSYSTEM, "CreateSpecializedShader", "VkSpecializationInfo", &logged_specialized_shader);
 
     struct shader_t *spec = calloc(1, sizeof(struct shader_t));
     spec->device = device;
@@ -1571,6 +1557,12 @@ static void *async_pipeline_thread(void *arg)
 static void lpz_vk_device_create_pipeline_async(lpz_device_t device, const LpzPipelineDesc *desc, void (*callback)(lpz_pipeline_t, void *), void *userdata)
 {
     struct AsyncPipelineData *d = malloc(sizeof(struct AsyncPipelineData));
+    if (!d)
+    {
+        if (callback)
+            callback(NULL, userdata);
+        return;
+    }
     d->device = device;
     d->desc = *desc;
     d->callback = callback;
@@ -2012,7 +2004,7 @@ static lpz_mesh_pipeline_t lpz_vk_device_create_mesh_pipeline(lpz_device_t devic
     if (!desc || !desc->mesh_shader || !desc->fragment_shader)
         return NULL;
 
-    lpz_vk_log_api_specific_once("CreateMeshPipeline", "VK_EXT_mesh_shader", &logged_mesh_pipeline);
+    lpz_log_backend_api_specific_once(LPZ_VK_SUBSYSTEM, "CreateMeshPipeline", "VK_EXT_mesh_shader", &logged_mesh_pipeline);
 
     if (!g_has_mesh_shader)
     {
@@ -2133,7 +2125,7 @@ static void lpz_vk_device_destroy_mesh_pipeline(lpz_mesh_pipeline_t pipeline)
 static lpz_tile_pipeline_t lpz_vk_device_create_tile_pipeline(lpz_device_t device, const LpzTilePipelineDesc *desc)
 {
     static bool logged_tile_pipeline = false;
-    lpz_vk_log_api_specific_once("CreateTilePipeline", "tile shaders are Metal-specific and have no Vulkan backend implementation", &logged_tile_pipeline);
+    lpz_log_backend_api_specific_once(LPZ_VK_SUBSYSTEM, "CreateTilePipeline", "tile shaders are Metal-specific and have no Vulkan backend implementation", &logged_tile_pipeline);
     (void)device;
     (void)desc;
     return NULL;
@@ -2151,7 +2143,7 @@ static void lpz_vk_device_destroy_tile_pipeline(lpz_tile_pipeline_t pipeline)
 static lpz_argument_table_t lpz_vk_device_create_argument_table(lpz_device_t device, const LpzArgumentTableDesc *desc)
 {
     static bool logged_argument_table = false;
-    lpz_vk_log_api_specific_once("CreateArgumentTable", "descriptor sets / descriptor buffers", &logged_argument_table);
+    lpz_log_backend_api_specific_once(LPZ_VK_SUBSYSTEM, "CreateArgumentTable", "descriptor sets / descriptor buffers", &logged_argument_table);
     if (!desc)
         return NULL;
 

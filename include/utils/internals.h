@@ -1,15 +1,25 @@
 #ifndef LPZ_INTERNALS_H
 #define LPZ_INTERNALS_H
 
+#include "../core/log.h"
+
 #define LPZ_MAX_FRAMES_IN_FLIGHT 3
 
-// ============================================================================
-// BACKEND IMPLEMENTATION NOTES
-// ============================================================================
-// The Metal and Vulkan backends both use LPZ_MAX_FRAMES_IN_FLIGHT to size
-// per-frame transient rings, staging resources, in-flight fences/semaphores,
-// and command-recording caches. Keeping this value small and fixed avoids
-// unbounded transient memory growth while still allowing CPU/GPU overlap.
+// Per-frame bump allocator capacity (bytes). Both Metal and Vulkan backends use
+// this constant to size their frame arenas. Increase if validation warns about
+// arena exhaustion.
+#define LPZ_FRAME_ARENA_SIZE (64u * 1024u)
+
+// Free a heap pointer and set it to NULL in one step.
+#define LPZ_FREE(x)                                                                                                                                                                                                                                                                                        \
+    do                                                                                                                                                                                                                                                                                                     \
+    {                                                                                                                                                                                                                                                                                                      \
+        free((void *)(x));                                                                                                                                                                                                                                                                                 \
+        (x) = NULL;                                                                                                                                                                                                                                                                                        \
+    } while (0)
+
+#define LPZ_MAX(a, b) ((a) > (b) ? (a) : (b))
+#define LPZ_MIN(a, b) ((a) < (b) ? (a) : (b))
 
 // ============================================================================
 // PLATFORM SEMAPHORE
@@ -102,4 +112,14 @@ typedef sem_t lpz_sem_t;
 #define LAPIZ_ALIGN(X) __attribute__((aligned(X)))
 #endif
 
-#endif  // LPZ_INTERMALS_H
+// Log a one-time info message noting that a function uses a backend-specific
+// feature. *logged is set on first call so subsequent calls are no-ops.
+LAPIZ_INLINE void lpz_log_backend_api_specific_once(const char *subsystem, const char *fn, const char *feature, bool *logged)
+{
+    if (!logged || *logged)
+        return;
+    *logged = true;
+    LPZ_LOG_BACKEND_INFO(subsystem, LPZ_LOG_CATEGORY_BACKEND, "%s uses %s, which is specific to the %s backend.", fn, feature, subsystem);
+}
+
+#endif  // LPZ_INTERNALS_H

@@ -3,6 +3,8 @@
 #import <stdlib.h>
 #import <string.h>
 
+static void lpz_mtl_check_attachment_hazards(lpz_renderer_t renderer, const LpzRenderPassDesc *desc);
+
 // ============================================================================
 // RENDERER
 // ============================================================================
@@ -35,16 +37,14 @@ static void lpz_renderer_destroy(lpz_renderer_t renderer)
         /* Release any objects that were deferred for this slot. */
         for (uint32_t j = 0; j < renderer->pending_free_count[i]; j++)
         {
-            [renderer->pending_free[i][j] release];
-            renderer->pending_free[i][j] = nil;
+            LPZ_OBJC_RELEASE(renderer->pending_free[i][j]);
         }
         renderer->pending_free_count[i] = 0;
     }
 #if LAPIZ_MTL_HAS_METAL3
     if (renderer->cbDesc)
     {
-        [renderer->cbDesc release];
-        renderer->cbDesc = nil;
+        LPZ_OBJC_RELEASE(renderer->cbDesc);
     }
 #endif
     LPZ_SEM_DESTROY(renderer->inFlightSemaphore);
@@ -64,8 +64,7 @@ static void lpz_renderer_begin_frame(lpz_renderer_t renderer)
     uint32_t slot = renderer->frameIndex;
     for (uint32_t i = 0; i < renderer->pending_free_count[slot]; i++)
     {
-        [renderer->pending_free[slot][i] release];
-        renderer->pending_free[slot][i] = nil;
+        LPZ_OBJC_RELEASE(renderer->pending_free[slot][i]);
     }
     renderer->pending_free_count[slot] = 0;
 
@@ -152,14 +151,12 @@ static void lpz_renderer_begin_render_pass(lpz_renderer_t renderer, const LpzRen
 static void lpz_renderer_end_render_pass(lpz_renderer_t renderer)
 {
     [renderer->currentEncoder endEncoding];
-    [renderer->currentEncoder release];
-    renderer->currentEncoder = nil;
+    LPZ_OBJC_RELEASE(renderer->currentEncoder);
 
 #if LAPIZ_MTL_HAS_METAL4
     if (renderer->passResidencySet)
     {
-        [renderer->passResidencySet release];
-        renderer->passResidencySet = nil;
+        LPZ_OBJC_RELEASE(renderer->passResidencySet);
     }
 #endif
 }
@@ -190,8 +187,7 @@ static void lpz_renderer_begin_transfer_pass(lpz_renderer_t renderer)
 static void lpz_renderer_end_transfer_pass(lpz_renderer_t renderer)
 {
     [renderer->currentBlitEncoder endEncoding];
-    [renderer->currentBlitEncoder release];
-    renderer->currentBlitEncoder = nil;
+    LPZ_OBJC_RELEASE(renderer->currentBlitEncoder);
 
     if (renderer->transferCommandBuffer)
     {
@@ -200,8 +196,7 @@ static void lpz_renderer_end_transfer_pass(lpz_renderer_t renderer)
          * committed later by Submit — nothing to do here.                  */
         [renderer->transferCommandBuffer commit];
         [renderer->transferCommandBuffer waitUntilCompleted];
-        [renderer->transferCommandBuffer release];
-        renderer->transferCommandBuffer = nil;
+        LPZ_OBJC_RELEASE(renderer->transferCommandBuffer);
     }
     /* In-frame path: no commit — Submit will commit the frame buffer once. */
 }
@@ -235,14 +230,12 @@ static void lpz_renderer_begin_compute_pass(lpz_renderer_t renderer)
 static void lpz_renderer_end_compute_pass(lpz_renderer_t renderer)
 {
     [renderer->currentComputeEncoder endEncoding];
-    [renderer->currentComputeEncoder release];
-    renderer->currentComputeEncoder = nil;
+    LPZ_OBJC_RELEASE(renderer->currentComputeEncoder);
 
 #if LAPIZ_MTL_HAS_METAL4
     if (renderer->passResidencySet)
     {
-        [renderer->passResidencySet release];
-        renderer->passResidencySet = nil;
+        LPZ_OBJC_RELEASE(renderer->passResidencySet);
     }
 #endif
 }
@@ -262,8 +255,7 @@ static void lpz_renderer_submit(lpz_renderer_t renderer, lpz_surface_t surface_t
       LPZ_SEM_POST(sem);
     }];
     [renderer->currentCommandBuffer commit];
-    [renderer->currentCommandBuffer release];
-    renderer->currentCommandBuffer = nil;
+    LPZ_OBJC_RELEASE(renderer->currentCommandBuffer);
 
     [(NSAutoreleasePool *)renderer->frameAutoreleasePool drain];
     renderer->frameAutoreleasePool = NULL;
@@ -285,8 +277,7 @@ static void lpz_renderer_submit_with_fence(lpz_renderer_t renderer, lpz_surface_
       LPZ_SEM_POST(sem);
     }];
     [renderer->currentCommandBuffer commit];
-    [renderer->currentCommandBuffer release];
-    renderer->currentCommandBuffer = nil;
+    LPZ_OBJC_RELEASE(renderer->currentCommandBuffer);
 
     [(NSAutoreleasePool *)renderer->frameAutoreleasePool drain];
     renderer->frameAutoreleasePool = nil;
@@ -497,7 +488,7 @@ static void lpz_renderer_bind_argument_table(lpz_renderer_t renderer, struct arg
         return;
     renderer->activeArgumentTable = table;
 
-    lpz_metal_log_api_specific_once("BindArgumentTable", "Metal argument tables / argument buffers", &logged_bind_argument_table);
+    lpz_log_backend_api_specific_once(LPZ_MTL_SUBSYSTEM, "BindArgumentTable", "Metal argument tables / argument buffers", &logged_bind_argument_table);
 
 #if LAPIZ_MTL_HAS_METAL4
     if (renderer->currentEncoder && table->vertexTable && table->fragmentTable)
@@ -538,7 +529,7 @@ static void lpz_renderer_dispatch_tile_kernel(lpz_renderer_t renderer, struct ti
     if (!renderer || !pipeline || !renderer->currentEncoder)
         return;
 
-    lpz_metal_log_api_specific_once("DispatchTileKernel", "tile shaders / imageblocks", &logged_dispatch_tile);
+    lpz_log_backend_api_specific_once(LPZ_MTL_SUBSYSTEM, "DispatchTileKernel", "tile shaders / imageblocks", &logged_dispatch_tile);
 
     if (pipeline->threadgroupMemoryLength > 0)
         [renderer->currentEncoder setThreadgroupMemoryLength:pipeline->threadgroupMemoryLength offset:0 atIndex:0];
@@ -560,7 +551,7 @@ static void lpz_renderer_bind_mesh_pipeline(lpz_renderer_t renderer, struct mesh
     if (!renderer || !pipeline || !renderer->currentEncoder)
         return;
 
-    lpz_metal_log_api_specific_once("BindMeshPipeline", "mesh/object shaders", &logged_bind_mesh_pipeline);
+    lpz_log_backend_api_specific_once(LPZ_MTL_SUBSYSTEM, "BindMeshPipeline", "mesh/object shaders", &logged_bind_mesh_pipeline);
     [renderer->currentEncoder setRenderPipelineState:pipeline->meshState];
 }
 
@@ -570,7 +561,7 @@ static void lpz_renderer_draw_mesh_threadgroups(lpz_renderer_t renderer, struct 
     if (!renderer || !pipeline || !renderer->currentEncoder)
         return;
 
-    lpz_metal_log_api_specific_once("DrawMeshThreadgroups", "mesh/object shaders", &logged_draw_mesh);
+    lpz_log_backend_api_specific_once(LPZ_MTL_SUBSYSTEM, "DrawMeshThreadgroups", "mesh/object shaders", &logged_draw_mesh);
 
 #if LAPIZ_MTL_HAS_METAL3
     if (@available(macOS 13.0, *))
@@ -597,7 +588,7 @@ static void lpz_renderer_draw_mesh_threadgroups(lpz_renderer_t renderer, struct 
 static void lpz_renderer_set_pass_resources(lpz_renderer_t renderer, const LpzPassResidencyDesc *desc)
 {
     static bool logged_pass_residency = false;
-    lpz_metal_log_api_specific_once("SetPassResidency", "MTLResidencySet", &logged_pass_residency);
+    lpz_log_backend_api_specific_once(LPZ_MTL_SUBSYSTEM, "SetPassResidency", "MTLResidencySet", &logged_pass_residency);
 #if LAPIZ_MTL_HAS_METAL4
     if (!renderer || !desc)
         return;
@@ -608,8 +599,7 @@ static void lpz_renderer_set_pass_resources(lpz_renderer_t renderer, const LpzPa
 
     if (renderer->passResidencySet)
     {
-        [renderer->passResidencySet release];
-        renderer->passResidencySet = nil;
+        LPZ_OBJC_RELEASE(renderer->passResidencySet);
     }
 
     uint32_t totalResources = desc->buffer_count + desc->texture_count;
@@ -822,7 +812,7 @@ static void lpz_renderer_draw_indirect_count(lpz_renderer_t renderer, lpz_buffer
     if (!renderer->currentEncoder || !buffer || !count_buffer)
         return;
 
-    lpz_metal_log_api_specific_once("DrawIndirectCount", "Metal CPU fallback for indirect-count draws", &logged_draw_indirect_count);
+    lpz_log_backend_api_specific_once(LPZ_MTL_SUBSYSTEM, "DrawIndirectCount", "Metal CPU fallback for indirect-count draws", &logged_draw_indirect_count);
 
     id<MTLBuffer> countMB = lpz_buffer_get_mtl(count_buffer, renderer->frameIndex);
     uint32_t actualCount = max_draw_count;
@@ -1030,8 +1020,7 @@ static void lpz_renderer_submit_command_buffers(lpz_renderer_t renderer, lpz_com
             [cmds[i]->cmdBuf presentDrawable:surface_to_present->currentDrawable];
 
         [cmds[i]->cmdBuf commit];
-        [cmds[i]->cmdBuf release];
-        cmds[i]->cmdBuf = nil;
+        LPZ_OBJC_RELEASE(cmds[i]->cmdBuf);
         free(cmds[i]);
         cmds[i] = NULL;
     }
@@ -1080,8 +1069,7 @@ static void lpz_device_submit_compute(lpz_compute_queue_t queue, const LpzComput
             [cmd->cmdBuf encodeSignalEvent:desc->signal_fence->event value:desc->signal_fence->signalValue];
 
         [cmd->cmdBuf commit];
-        [cmd->cmdBuf release];
-        cmd->cmdBuf = nil;
+        LPZ_OBJC_RELEASE(cmd->cmdBuf);
         free(cmd);
         // Note: callers must not use desc->command_buffers[i] after this point.
     }

@@ -1,8 +1,9 @@
 #include "../include/core/log.h"
 #include "../include/core/window.h"
+#include "../include/utils/internals.h"
+#include "platform_common.h"
 
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -21,15 +22,9 @@
 #endif
 #include <GLFW/glfw3native.h>
 
-#define INITIAL_CHAR_QUEUE_CAPACITY 256
-
-typedef struct {
-    uint32_t *data;
-    uint32_t capacity;
-    uint32_t head;
-    uint32_t tail;
-    uint32_t dropped;
-} lpz_char_queue_t;
+// ============================================================================
+// WINDOW STATE
+// ============================================================================
 
 struct window_t {
     GLFWwindow *handle;
@@ -40,87 +35,28 @@ struct window_t {
     bool resized_last_frame;
     bool ready;
     uint32_t state_flags;
-
-    int windowed_x;
-    int windowed_y;
-    int windowed_w;
-    int windowed_h;
-
+    int windowed_x, windowed_y;
+    int windowed_w, windowed_h;
     lpz_char_queue_t char_queue;
     LpzWindowResizeCallback resize_callback;
     void *resize_userdata;
 };
 
-/* forward declarations for functions used before their definitions */
+// ============================================================================
+// FORWARD DECLARATIONS
+// ============================================================================
+
 static void lpz_glfw_toggle_fullscreen(lpz_window_t window);
 static void lpz_glfw_toggle_borderless_windowed(lpz_window_t window);
+static bool lpz_glfw_is_fullscreen(lpz_window_t window);
+
+// ============================================================================
+// INTERNAL HELPERS
+// ============================================================================
 
 static void glfw_error_callback(int code, const char *description)
 {
     LPZ_LOG_BACKEND_ERROR("GLFW", LPZ_LOG_CATEGORY_WINDOW, LPZ_FAILURE, "GLFW error %d: %s", code, description ? description : "(unknown)");
-}
-
-static void char_queue_init(lpz_char_queue_t *q)
-{
-    q->capacity = INITIAL_CHAR_QUEUE_CAPACITY;
-    q->data = (uint32_t *)calloc(q->capacity, sizeof(uint32_t));
-    q->head = q->tail = q->dropped = 0;
-}
-
-static void char_queue_destroy(lpz_char_queue_t *q)
-{
-    free(q->data);
-    q->data = NULL;
-    q->capacity = q->head = q->tail = q->dropped = 0;
-}
-
-static uint32_t char_queue_count(const lpz_char_queue_t *q)
-{
-    if (q->head >= q->tail)
-        return q->head - q->tail;
-    return q->capacity - q->tail + q->head;
-}
-
-static bool char_queue_grow(lpz_char_queue_t *q)
-{
-    uint32_t count = char_queue_count(q);
-    uint32_t new_capacity = q->capacity ? q->capacity * 2u : INITIAL_CHAR_QUEUE_CAPACITY;
-    uint32_t *new_data = (uint32_t *)calloc(new_capacity, sizeof(uint32_t));
-    if (!new_data)
-        return false;
-
-    for (uint32_t i = 0; i < count; ++i)
-        new_data[i] = q->data[(q->tail + i) % q->capacity];
-
-    free(q->data);
-    q->data = new_data;
-    q->capacity = new_capacity;
-    q->tail = 0;
-    q->head = count;
-    return true;
-}
-
-static void char_queue_push(lpz_char_queue_t *q, uint32_t codepoint)
-{
-    uint32_t next = (q->head + 1u) % q->capacity;
-    if (next == q->tail && !char_queue_grow(q))
-    {
-        q->dropped++;
-        return;
-    }
-
-    q->data[q->head] = codepoint;
-    q->head = (q->head + 1u) % q->capacity;
-}
-
-static uint32_t char_queue_pop(lpz_char_queue_t *q)
-{
-    if (q->head == q->tail)
-        return 0;
-
-    uint32_t c = q->data[q->tail];
-    q->tail = (q->tail + 1u) % q->capacity;
-    return c;
 }
 
 static uint8_t normalize_key_action(int action)
@@ -135,6 +71,58 @@ static uint8_t normalize_key_action(int action)
             return (uint8_t)LPZ_KEY_RELEASE;
     }
 }
+
+static void lpz_glfw_remember_windowed_rect(lpz_window_t window)
+{
+    if (!window || glfwGetWindowMonitor(window->handle))
+        return;
+    glfwGetWindowPos(window->handle, &window->windowed_x, &window->windowed_y);
+    glfwGetWindowSize(window->handle, &window->windowed_w, &window->windowed_h);
+}
+
+static GLFWmonitor *lpz_glfw_get_current_monitor(lpz_window_t window)
+{
+    if (!window)
+        return NULL;
+
+    int wx, wy, ww, wh;
+    glfwGetWindowPos(window->handle, &wx, &wy);
+    glfwGetWindowSize(window->handle, &ww, &wh);
+
+    int monitor_count = 0;
+    GLFWmonitor **monitors = glfwGetMonitors(&monitor_count);
+    if (!monitors || monitor_count <= 0)
+        return glfwGetPrimaryMonitor();
+
+    GLFWmonitor *best = monitors[0];
+    int best_overlap = 0;
+
+    for (int i = 0; i < monitor_count; ++i)
+    {
+        int mx, my;
+        glfwGetMonitorPos(monitors[i], &mx, &my);
+        const GLFWvidmode *mode = glfwGetVideoMode(monitors[i]);
+        if (!mode)
+            continue;
+
+        int ow = (wx + ww < mx + mode->width ? wx + ww : mx + mode->width) - (wx > mx ? wx : mx);
+        int oh = (wy + wh < my + mode->height ? wy + wh : my + mode->height) - (wy > my ? wy : my);
+        if (ow > 0 && oh > 0)
+        {
+            int overlap = ow * oh;
+            if (overlap > best_overlap)
+            {
+                best_overlap = overlap;
+                best = monitors[i];
+            }
+        }
+    }
+    return best;
+}
+
+// ============================================================================
+// GLFW CALLBACKS
+// ============================================================================
 
 static void key_callback(GLFWwindow *gw, int key, int scancode, int action, int mods)
 {
@@ -168,7 +156,6 @@ static void framebuffer_size_callback(GLFWwindow *gw, int width, int height)
     struct window_t *win = (struct window_t *)glfwGetWindowUserPointer(gw);
     if (!win)
         return;
-
     win->resized_last_frame = true;
     if (win->resize_callback)
         win->resize_callback((lpz_window_t)win, (uint32_t)width, (uint32_t)height, win->resize_userdata);
@@ -179,7 +166,6 @@ static void content_scale_callback(GLFWwindow *gw, float xscale, float yscale)
     struct window_t *win = (struct window_t *)glfwGetWindowUserPointer(gw);
     if (!win)
         return;
-
     win->content_scale_x = xscale;
     win->content_scale_y = yscale;
 }
@@ -191,59 +177,9 @@ static void char_callback(GLFWwindow *gw, unsigned int codepoint)
         char_queue_push(&win->char_queue, (uint32_t)codepoint);
 }
 
-static void lpz_glfw_remember_windowed_rect(lpz_window_t window)
-{
-    if (!window)
-        return;
-
-    if (!glfwGetWindowMonitor(window->handle))
-    {
-        glfwGetWindowPos(window->handle, &window->windowed_x, &window->windowed_y);
-        glfwGetWindowSize(window->handle, &window->windowed_w, &window->windowed_h);
-    }
-}
-
-static GLFWmonitor *lpz_glfw_get_current_monitor(lpz_window_t window)
-{
-    if (!window)
-        return NULL;
-
-    int wx, wy, ww, wh;
-    glfwGetWindowPos(window->handle, &wx, &wy);
-    glfwGetWindowSize(window->handle, &ww, &wh);
-
-    int monitor_count = 0;
-    GLFWmonitor **monitors = glfwGetMonitors(&monitor_count);
-    if (!monitors || monitor_count <= 0)
-        return glfwGetPrimaryMonitor();
-
-    GLFWmonitor *best = monitors[0];
-    int best_overlap = 0;
-
-    for (int i = 0; i < monitor_count; ++i)
-    {
-        int mx, my;
-        glfwGetMonitorPos(monitors[i], &mx, &my);
-        const GLFWvidmode *mode = glfwGetVideoMode(monitors[i]);
-        if (!mode)
-            continue;
-
-        int overlap_w = (wx + ww < mx + mode->width ? wx + ww : mx + mode->width) - (wx > mx ? wx : mx);
-        int overlap_h = (wy + wh < my + mode->height ? wy + wh : my + mode->height) - (wy > my ? wy : my);
-
-        if (overlap_w > 0 && overlap_h > 0)
-        {
-            int overlap = overlap_w * overlap_h;
-            if (overlap > best_overlap)
-            {
-                best_overlap = overlap;
-                best = monitors[i];
-            }
-        }
-    }
-
-    return best;
-}
+// ============================================================================
+// LIFECYCLE
+// ============================================================================
 
 static bool lpz_glfw_init(void)
 {
@@ -269,7 +205,7 @@ static lpz_window_t lpz_glfw_create_window(const char *title, uint32_t width, ui
         return NULL;
 
     struct window_t *win = (struct window_t *)calloc(1, sizeof(struct window_t));
-    if (!win)
+    if (LAPIZ_UNLIKELY(!win))
     {
         glfwDestroyWindow(handle);
         return NULL;
@@ -279,7 +215,6 @@ static lpz_window_t lpz_glfw_create_window(const char *title, uint32_t width, ui
     win->ready = true;
     win->windowed_w = (int)width;
     win->windowed_h = (int)height;
-    win->state_flags = 0;
 
     char_queue_init(&win->char_queue);
     glfwGetWindowContentScale(handle, &win->content_scale_x, &win->content_scale_y);
@@ -300,11 +235,14 @@ static void lpz_glfw_destroy_window(lpz_window_t window)
 {
     if (!window)
         return;
-
     char_queue_destroy(&window->char_queue);
     glfwDestroyWindow(window->handle);
     free(window);
 }
+
+// ============================================================================
+// EVENTS & INPUT
+// ============================================================================
 
 static bool lpz_glfw_should_close(lpz_window_t window)
 {
@@ -316,11 +254,18 @@ static void lpz_glfw_poll_events(void)
     glfwPollEvents();
 }
 
+static void lpz_glfw_set_resize_callback(lpz_window_t window, LpzWindowResizeCallback callback, void *userdata)
+{
+    if (!window)
+        return;
+    window->resize_callback = callback;
+    window->resize_userdata = userdata;
+}
+
 static void lpz_glfw_get_framebuffer_size(lpz_window_t window, uint32_t *width, uint32_t *height)
 {
     if (!window)
         return;
-
     int w = 0, h = 0;
     glfwGetFramebufferSize(window->handle, &w, &h);
     if (width)
@@ -333,10 +278,9 @@ static bool lpz_glfw_was_resized(lpz_window_t window)
 {
     if (!window)
         return false;
-
-    bool resized = window->resized_last_frame;
+    bool r = window->resized_last_frame;
     window->resized_last_frame = false;
-    return resized;
+    return r;
 }
 
 static LpzInputAction lpz_glfw_get_key(lpz_window_t window, int key)
@@ -365,9 +309,7 @@ static void lpz_glfw_get_mouse_position(lpz_window_t window, float *x, float *y)
 
 static uint32_t lpz_glfw_pop_typed_char(lpz_window_t window)
 {
-    if (!window)
-        return 0;
-    return char_queue_pop(&window->char_queue);
+    return window ? char_queue_pop(&window->char_queue) : 0;
 }
 
 static void lpz_glfw_set_cursor_mode(lpz_window_t window, bool locked_and_hidden)
@@ -382,45 +324,9 @@ static double lpz_glfw_get_time(void)
     return glfwGetTime();
 }
 
-static void *lpz_glfw_get_native_handle(lpz_window_t window)
-{
-    if (!window)
-        return NULL;
-#if defined(_WIN32)
-    return (void *)glfwGetWin32Window(window->handle);
-#elif defined(__APPLE__)
-    return (void *)glfwGetCocoaWindow(window->handle);
-#elif defined(__linux__)
-#if defined(_GLFW_X11)
-    return (void *)(uintptr_t)glfwGetX11Window(window->handle);
-#elif defined(_GLFW_WAYLAND)
-    return (void *)glfwGetWaylandWindow(window->handle);
-#endif
-#endif
-    return NULL;
-}
-
-static const char **lpz_glfw_get_required_vulkan_extensions(lpz_window_t window, uint32_t *out_count)
-{
-    (void)window;
-    return glfwGetRequiredInstanceExtensions(out_count);
-}
-
-static int lpz_glfw_create_vulkan_surface(lpz_window_t window, void *vk_instance, void *vk_allocator, void *out_surface)
-{
-    if (!window)
-        return -1;
-
-    return (int)glfwCreateWindowSurface((VkInstance)vk_instance, window->handle, (const VkAllocationCallbacks *)vk_allocator, (VkSurfaceKHR *)out_surface);
-}
-
-static void lpz_glfw_set_resize_callback(lpz_window_t window, LpzWindowResizeCallback callback, void *userdata)
-{
-    if (!window)
-        return;
-    window->resize_callback = callback;
-    window->resize_userdata = userdata;
-}
+// ============================================================================
+// WINDOW STATE QUERIES
+// ============================================================================
 
 static bool lpz_glfw_is_ready(lpz_window_t window)
 {
@@ -456,7 +362,6 @@ static bool lpz_glfw_is_state(lpz_window_t window, uint32_t flags)
 {
     if (!window)
         return false;
-
     if ((flags & LPZ_WINDOW_FLAG_FULLSCREEN) && !lpz_glfw_is_fullscreen(window))
         return false;
     if ((flags & LPZ_WINDOW_FLAG_HIDDEN) && !lpz_glfw_is_hidden(window))
@@ -474,34 +379,30 @@ static bool lpz_glfw_is_state(lpz_window_t window, uint32_t flags)
     return true;
 }
 
+// ============================================================================
+// WINDOW STATE MUTATIONS
+// ============================================================================
+
 static void lpz_glfw_set_state(lpz_window_t window, uint32_t flags)
 {
     if (!window)
         return;
-
     if (flags & LPZ_WINDOW_FLAG_RESIZABLE)
         glfwSetWindowAttrib(window->handle, GLFW_RESIZABLE, GLFW_TRUE);
-
     if (flags & LPZ_WINDOW_FLAG_UNDECORATED)
         glfwSetWindowAttrib(window->handle, GLFW_DECORATED, GLFW_FALSE);
-
     if (flags & LPZ_WINDOW_FLAG_HIDDEN)
         glfwHideWindow(window->handle);
-
     if (flags & LPZ_WINDOW_FLAG_ALWAYS_ON_TOP)
         glfwSetWindowAttrib(window->handle, GLFW_FLOATING, GLFW_TRUE);
-
 #if defined(GLFW_MOUSE_PASSTHROUGH)
     if (flags & LPZ_WINDOW_FLAG_MOUSE_PASSTHROUGH)
         glfwSetWindowAttrib(window->handle, GLFW_MOUSE_PASSTHROUGH, GLFW_TRUE);
 #endif
-
     if (flags & LPZ_WINDOW_FLAG_FULLSCREEN)
         lpz_glfw_toggle_fullscreen(window);
-
     if (flags & LPZ_WINDOW_FLAG_BORDERLESS_WINDOWED)
         lpz_glfw_toggle_borderless_windowed(window);
-
     window->state_flags |= flags;
 }
 
@@ -509,27 +410,20 @@ static void lpz_glfw_clear_state(lpz_window_t window, uint32_t flags)
 {
     if (!window)
         return;
-
     if (flags & LPZ_WINDOW_FLAG_RESIZABLE)
         glfwSetWindowAttrib(window->handle, GLFW_RESIZABLE, GLFW_FALSE);
-
     if (flags & LPZ_WINDOW_FLAG_UNDECORATED)
         glfwSetWindowAttrib(window->handle, GLFW_DECORATED, GLFW_TRUE);
-
     if (flags & LPZ_WINDOW_FLAG_HIDDEN)
         glfwShowWindow(window->handle);
-
     if (flags & LPZ_WINDOW_FLAG_ALWAYS_ON_TOP)
         glfwSetWindowAttrib(window->handle, GLFW_FLOATING, GLFW_FALSE);
-
 #if defined(GLFW_MOUSE_PASSTHROUGH)
     if (flags & LPZ_WINDOW_FLAG_MOUSE_PASSTHROUGH)
         glfwSetWindowAttrib(window->handle, GLFW_MOUSE_PASSTHROUGH, GLFW_FALSE);
 #endif
-
     if ((flags & LPZ_WINDOW_FLAG_FULLSCREEN) && lpz_glfw_is_fullscreen(window))
         lpz_glfw_toggle_fullscreen(window);
-
     if ((flags & LPZ_WINDOW_FLAG_BORDERLESS_WINDOWED) && !lpz_glfw_is_fullscreen(window) && glfwGetWindowAttrib(window->handle, GLFW_DECORATED) == GLFW_FALSE)
     {
         glfwSetWindowAttrib(window->handle, GLFW_DECORATED, GLFW_TRUE);
@@ -537,7 +431,6 @@ static void lpz_glfw_clear_state(lpz_window_t window, uint32_t flags)
         glfwSetWindowPos(window->handle, window->windowed_x, window->windowed_y);
         glfwSetWindowSize(window->handle, window->windowed_w, window->windowed_h);
     }
-
     window->state_flags &= ~flags;
 }
 
@@ -545,7 +438,6 @@ static void lpz_glfw_toggle_fullscreen(lpz_window_t window)
 {
     if (!window)
         return;
-
     GLFWmonitor *monitor = glfwGetWindowMonitor(window->handle);
     if (monitor)
     {
@@ -559,7 +451,6 @@ static void lpz_glfw_toggle_fullscreen(lpz_window_t window)
         const GLFWvidmode *mode = target ? glfwGetVideoMode(target) : NULL;
         if (!target || !mode)
             return;
-
         glfwSetWindowMonitor(window->handle, target, 0, 0, mode->width, mode->height, mode->refreshRate);
         window->state_flags |= LPZ_WINDOW_FLAG_FULLSCREEN;
     }
@@ -569,13 +460,11 @@ static void lpz_glfw_toggle_borderless_windowed(lpz_window_t window)
 {
     if (!window)
         return;
-
     if (lpz_glfw_is_fullscreen(window))
     {
         lpz_glfw_toggle_fullscreen(window);
         return;
     }
-
     if (glfwGetWindowAttrib(window->handle, GLFW_DECORATED) == GLFW_FALSE && !(window->state_flags & LPZ_WINDOW_FLAG_FULLSCREEN))
     {
         glfwSetWindowAttrib(window->handle, GLFW_DECORATED, GLFW_TRUE);
@@ -585,19 +474,15 @@ static void lpz_glfw_toggle_borderless_windowed(lpz_window_t window)
         window->state_flags &= ~LPZ_WINDOW_FLAG_BORDERLESS_WINDOWED;
         return;
     }
-
     lpz_glfw_remember_windowed_rect(window);
-
     GLFWmonitor *monitor = lpz_glfw_get_current_monitor(window);
     if (!monitor)
         return;
-
     int mx, my;
     glfwGetMonitorPos(monitor, &mx, &my);
     const GLFWvidmode *mode = glfwGetVideoMode(monitor);
     if (!mode)
         return;
-
     glfwSetWindowAttrib(window->handle, GLFW_DECORATED, GLFW_FALSE);
     glfwSetWindowPos(window->handle, mx, my);
     glfwSetWindowSize(window->handle, mode->width, mode->height);
@@ -609,18 +494,20 @@ static void lpz_glfw_maximize(lpz_window_t window)
     if (window)
         glfwMaximizeWindow(window->handle);
 }
-
 static void lpz_glfw_minimize(lpz_window_t window)
 {
     if (window)
         glfwIconifyWindow(window->handle);
 }
-
 static void lpz_glfw_restore(lpz_window_t window)
 {
     if (window)
         glfwRestoreWindow(window->handle);
 }
+
+// ============================================================================
+// WINDOW PROPERTIES
+// ============================================================================
 
 static void lpz_glfw_set_title(lpz_window_t window, const char *title)
 {
@@ -632,6 +519,12 @@ static void lpz_glfw_set_position(lpz_window_t window, int x, int y)
 {
     if (window)
         glfwSetWindowPos(window->handle, x, y);
+}
+
+static void lpz_glfw_set_size(lpz_window_t window, int width, int height)
+{
+    if (window)
+        glfwSetWindowSize(window->handle, width, height);
 }
 
 static void lpz_glfw_set_min_size(lpz_window_t window, int width, int height)
@@ -646,17 +539,10 @@ static void lpz_glfw_set_max_size(lpz_window_t window, int width, int height)
         glfwSetWindowSizeLimits(window->handle, GLFW_DONT_CARE, GLFW_DONT_CARE, width, height);
 }
 
-static void lpz_glfw_set_size(lpz_window_t window, int width, int height)
-{
-    if (window)
-        glfwSetWindowSize(window->handle, width, height);
-}
-
 static void lpz_glfw_set_opacity(lpz_window_t window, float opacity)
 {
     if (!window)
         return;
-
     if (opacity < 0.0f)
         opacity = 0.0f;
     if (opacity > 1.0f)
@@ -670,16 +556,58 @@ static void lpz_glfw_focus_window(lpz_window_t window)
         glfwFocusWindow(window->handle);
 }
 
+// ============================================================================
+// VULKAN INTEGRATION
+// ============================================================================
+
+static void *lpz_glfw_get_native_handle(lpz_window_t window)
+{
+    if (!window)
+        return NULL;
+#if defined(_WIN32)
+    return (void *)glfwGetWin32Window(window->handle);
+#elif defined(__APPLE__)
+    return (void *)glfwGetCocoaWindow(window->handle);
+#elif defined(__linux__)
+#if defined(_GLFW_X11)
+    return (void *)(uintptr_t)glfwGetX11Window(window->handle);
+#elif defined(_GLFW_WAYLAND)
+    return (void *)glfwGetWaylandWindow(window->handle);
+#endif
+#endif
+    return NULL;
+}
+
+static const char **lpz_glfw_get_required_vulkan_extensions(lpz_window_t window, uint32_t *out_count)
+{
+    (void)window;
+    return glfwGetRequiredInstanceExtensions(out_count);
+}
+
+static int lpz_glfw_create_vulkan_surface(lpz_window_t window, void *vk_instance, void *vk_allocator, void *out_surface)
+{
+    if (!window)
+        return -1;
+    return (int)glfwCreateWindowSurface((VkInstance)vk_instance, window->handle, (const VkAllocationCallbacks *)vk_allocator, (VkSurfaceKHR *)out_surface);
+}
+
+// ============================================================================
+// API TABLE
+// ============================================================================
+
 const LpzWindowAPI LpzWindow_GLFW = {
     .Init = lpz_glfw_init,
     .Terminate = lpz_glfw_terminate,
+
     .CreateWindow = lpz_glfw_create_window,
     .DestroyWindow = lpz_glfw_destroy_window,
+
     .ShouldClose = lpz_glfw_should_close,
     .PollEvents = lpz_glfw_poll_events,
     .SetResizeCallback = lpz_glfw_set_resize_callback,
     .GetFramebufferSize = lpz_glfw_get_framebuffer_size,
     .WasResized = lpz_glfw_was_resized,
+
     .GetKey = lpz_glfw_get_key,
     .GetMouseButton = lpz_glfw_get_mouse_button,
     .GetMousePosition = lpz_glfw_get_mouse_position,

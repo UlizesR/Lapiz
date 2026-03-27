@@ -63,35 +63,14 @@ typedef struct Mesh {
     uint32_t vertex_stride;
 } Mesh;
 
-/* C11 §6.7.9 — static storage duration; zero-initialised padding.  */
-static const Vertex TRIANGLE_VERTICES[3] = {
-    {{0.0f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.5f, 0.0f}, {1.f, 1.f, 1.f, 1.f}},
-    {{0.5f, -0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}, {1.f, 1.f, 1.f, 1.f}},
-    {{-0.5f, -0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}, {1.f, 1.f, 1.f, 1.f}},
-};
-static const uint16_t TRIANGLE_INDICES[3] = {0, 1, 2};
+extern const Vertex TRIANGLE_VERTICES[3];
+extern const uint16_t TRIANGLE_INDICES[3];
 
-static const Vertex QUAD_VERTICES[4] = {
-    {{-0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 0.0f}, {1.f, 1.f, 1.f, 1.f}},
-    {{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 0.0f}, {1.f, 1.f, 1.f, 1.f}},
-    {{0.5f, -0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}, {1.f, 1.f, 1.f, 1.f}},
-    {{-0.5f, -0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}, {1.f, 1.f, 1.f, 1.f}},
-};
-static const uint16_t QUAD_INDICES[6] = {0, 1, 2, 2, 3, 0};
+extern const Vertex QUAD_VERTICES[4];
+extern const uint16_t QUAD_INDICES[6];
 
-static const Vertex CUBE_VERTICES[24] = {
-    {{-0.5f, 0.5f, 0.5f}, {0.f, 0.f, 1.f}, {0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},    {{0.5f, 0.5f, 0.5f}, {0.f, 0.f, 1.f}, {1.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},    {{0.5f, -0.5f, 0.5f}, {0.f, 0.f, 1.f}, {1.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},
-    {{-0.5f, -0.5f, 0.5f}, {0.f, 0.f, 1.f}, {0.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},   {{0.5f, 0.5f, -0.5f}, {0.f, 0.f, -1.f}, {0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},  {{-0.5f, 0.5f, -0.5f}, {0.f, 0.f, -1.f}, {1.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
-    {{-0.5f, -0.5f, -0.5f}, {0.f, 0.f, -1.f}, {1.f, 1.f}, {1.f, 1.f, 1.f, 1.f}}, {{0.5f, -0.5f, -0.5f}, {0.f, 0.f, -1.f}, {0.f, 1.f}, {1.f, 1.f, 1.f, 1.f}}, {{-0.5f, 0.5f, -0.5f}, {-1.f, 0.f, 0.f}, {0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
-    {{-0.5f, 0.5f, 0.5f}, {-1.f, 0.f, 0.f}, {1.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},   {{-0.5f, -0.5f, 0.5f}, {-1.f, 0.f, 0.f}, {1.f, 1.f}, {1.f, 1.f, 1.f, 1.f}}, {{-0.5f, -0.5f, -0.5f}, {-1.f, 0.f, 0.f}, {0.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},
-    {{0.5f, 0.5f, 0.5f}, {1.f, 0.f, 0.f}, {0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},     {{0.5f, 0.5f, -0.5f}, {1.f, 0.f, 0.f}, {1.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},   {{0.5f, -0.5f, -0.5f}, {1.f, 0.f, 0.f}, {1.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},
-    {{0.5f, -0.5f, 0.5f}, {1.f, 0.f, 0.f}, {0.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},    {{-0.5f, 0.5f, -0.5f}, {0.f, 1.f, 0.f}, {0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},  {{0.5f, 0.5f, -0.5f}, {0.f, 1.f, 0.f}, {1.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
-    {{0.5f, 0.5f, 0.5f}, {0.f, 1.f, 0.f}, {1.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},     {{-0.5f, 0.5f, 0.5f}, {0.f, 1.f, 0.f}, {0.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},   {{-0.5f, -0.5f, 0.5f}, {0.f, -1.f, 0.f}, {0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
-    {{0.5f, -0.5f, 0.5f}, {0.f, -1.f, 0.f}, {1.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},   {{0.5f, -0.5f, -0.5f}, {0.f, -1.f, 0.f}, {1.f, 1.f}, {1.f, 1.f, 1.f, 1.f}}, {{-0.5f, -0.5f, -0.5f}, {0.f, -1.f, 0.f}, {0.f, 1.f}, {1.f, 1.f, 1.f, 1.f}},
-};
-static const uint16_t CUBE_INDICES[36] = {
-    0, 2, 1, 0, 3, 2, 4, 6, 5, 4, 7, 6, 8, 10, 9, 8, 11, 10, 12, 14, 13, 12, 15, 14, 16, 18, 17, 16, 19, 18, 20, 22, 21, 20, 23, 22,
-};
+extern const Vertex CUBE_VERTICES[24];
+extern const uint16_t CUBE_INDICES[36];
 
 typedef enum LpzLoadFlags {
     LPZ_LOAD_DEFAULT = 0,
@@ -104,8 +83,10 @@ typedef enum LpzLoadFlags {
 bool LoadMesh(const char *path, LpzLoadFlags flags, Mesh *out_mesh);
 bool LoadScene(const char *path, LpzLoadFlags flags, Mesh *out_meshes, uint32_t *out_count);
 
-void FreeMesh(Mesh *mesh);
+void FreeMesh(Mesh *mesh);  // frees CPU vertices/indices, resets fields
 void FreeScene(Mesh *meshes, uint32_t count);
+// DestroyMesh frees CPU memory only. Callers must destroy mesh->vb and mesh->ib
+// via Lpz.device.DestroyBuffer before calling this if the mesh was GPU-uploaded.
 void DestroyMesh(Mesh *mesh);
 
 Mesh GeneratePolygon(uint32_t sides);

@@ -132,6 +132,41 @@ typedef enum LpzBackend {
 // APP DESCRIPTOR  (passed to InitApp)
 // ============================================================================
 
+// ============================================================================
+// LIFECYCLE
+//
+//   InitApp(desc, argc, argv, &app)
+//     Creates: window system, window, GPU device.
+//
+//   LoadDefaultShaders(app)      [optional]
+//     Resolves and compiles built-in shaders. Pipelines built in CreateContext.
+//     Search order: $LAPIZ_SHADER_DIR → install prefix → source tree.
+//
+//   LoadShaders(app, ...)        [optional, custom shaders only]
+//     Caller supplies paths; returned handles are caller-owned.
+//     May be called before or after CreateContext.
+//
+//   GetPipelineOverrides(app)    [optional]
+//     Returns a writable pointer to override built-in pipelines before
+//     CreateContext is called.
+//
+//   CreateContext(app)
+//     Creates: surface, renderer, depth texture, text pipeline, scene and
+//     primitive pipelines. App is ready to enter the main loop after this.
+//
+//   Main loop:
+//     while (Run(app)) {
+//         PollEvents(app);
+//         if (BeginDraw(app, &frame) != LPZ_SUCCESS) continue;
+//         // ... draw calls ...
+//         EndDraw(app);
+//     }
+//
+//   DestroyContext(app)  — frees all GPU resources, keeps window alive.
+//   CleanUpApp(app)      — destroys window, terminates windowing system, frees app.
+//                          Calls DestroyContext if not already called.
+// ============================================================================
+
 typedef struct LpzAppDesc {
     const char *title;
     uint32_t width;
@@ -382,9 +417,10 @@ LpzResult BeginDraw(lpz_app_t app, LpzFrameInfo *out_frame);
 /*
  * EndDraw — end the current frame.
  *
- *   1. Close the main render pass.
- *   2. Auto-flush any DrawText / DrawTextFmt calls (overlay pass).
- *   3. Submit the command buffer and present.
+ *   1. Flush any accumulated DrawPoint / DrawLine calls.
+ *   2. Flush any DrawText / DrawTextFmt calls (same pass, no extra RenderPass).
+ *   3. Close the main render pass.
+ *   4. Submit the command buffer and present.
  */
 void EndDraw(lpz_app_t app);
 
@@ -437,11 +473,11 @@ double GetTime(lpz_app_t app);
  * Pass an array of these to DrawPointCloud.
  */
 typedef struct LpzPoint {
-    vec3 position;                                                                                  /* world-space XYZ                    */
-    float size;                                                                                     /* sprite diameter in screen pixels   */
-    vec4 color;                                                                                     /* linear RGBA                        */
-} LpzPoint;                                                                                         /* 32 bytes — 2 × vec4 */
-_Static_assert(sizeof(LpzPoint) == 32, "LpzPoint must be 32 bytes (2 × vec4) to match GPU layout"); /* 32 bytes — 2 × vec4 */
+    vec3 position; /* world-space XYZ                  */
+    float size;    /* sprite diameter in screen pixels */
+    vec4 color;    /* linear RGBA                      */
+} LpzPoint;        /* 32 bytes — 2 × vec4 */
+_Static_assert(sizeof(LpzPoint) == 32, "LpzPoint must be 32 bytes (2 × vec4) to match GPU layout");
 
 /*
  * LpzLine — one line segment.
@@ -455,15 +491,15 @@ _Static_assert(sizeof(LpzPoint) == 32, "LpzPoint must be 32 bytes (2 × vec4) to
  * Pass an array of these to DrawLineSegments.
  */
 typedef struct LpzLine {
-    vec3 start;                                                                                   /* world-space start point         */
-    float _pad0;                                                                                  /* pad vec4[0].w — do not use      */
-    vec3 end;                                                                                     /* world-space end point           */
-    float _pad1;                                                                                  /* pad vec4[1].w — do not use      */
-    vec4 color;                                                                                   /* linear RGBA                     */
-    float thickness;                                                                              /* screen-space pixel width        */
-    float _p0, _p1, _p2;                                                                          /* pad vec4[3] to 16 bytes         */
-} LpzLine;                                                                                        /* 64 bytes — 4 × vec4 */
-_Static_assert(sizeof(LpzLine) == 64, "LpzLine must be 64 bytes (4 × vec4) to match GPU layout"); /* 64 bytes — 4 × vec4 */
+    vec3 start;          /* world-space start point     */
+    float _pad0;         /* pad vec4[0].w — do not use */
+    vec3 end;            /* world-space end point       */
+    float _pad1;         /* pad vec4[1].w — do not use */
+    vec4 color;          /* linear RGBA                 */
+    float thickness;     /* screen-space pixel width    */
+    float _p0, _p1, _p2; /* pad vec4[3] to 16 bytes     */
+} LpzLine;               /* 64 bytes — 4 × vec4 */
+_Static_assert(sizeof(LpzLine) == 64, "LpzLine must be 64 bytes (4 × vec4) to match GPU layout");
 
 // ============================================================================
 // MESH HELPERS
@@ -564,12 +600,10 @@ lpz_texture_t LoadTexture(lpz_app_t app, const char *path);
  * Coordinates are screen pixels (top-left origin, +Y down).
  * May be called anywhere between BeginDraw and EndDraw; the entire batch is
  * flushed in a single instanced draw call inside EndDraw.
- */
-/*
- * DrawText / DrawTextFmt — add text to the per-frame batch.
- * pos        screen-space position in pixels (top-left origin, +Y down)
+ *
+ * pos        screen-space position in pixels
  * font_size  display size in pixels
- * color      linear RGBA — includes alpha
+ * color      linear RGBA
  */
 void DrawText(lpz_app_t app, vec2 pos, float font_size, vec4 color, const char *text);
 
@@ -582,32 +616,55 @@ float GetTextWidth(lpz_app_t app, const char *text, float font_size);
 // ============================================================================
 
 typedef enum LpzGridFlags {
-    LPZ_GRID_DRAW_GRID = 1u << 0,  // draw the XZ-plane grid lines
-    LPZ_GRID_DRAW_AXES = 1u << 1,  // draw the X / Y / Z axis lines
+    LPZ_GRID_DRAW_GRID = 1u << 0,  // bounded XZ-plane grid lines
+    LPZ_GRID_DRAW_AXES = 1u << 1,  // X / Y / Z axis arrows from origin
+    LPZ_GRID_INFINITE = 1u << 2,   // shader-based infinite grid
     LPZ_GRID_DRAW_ALL = (1u << 0) | (1u << 1),
+    LPZ_GRID_INFINITE_AXES = (1u << 1) | (1u << 2),
+    LPZ_GRID_ALL = (1u << 0) | (1u << 1) | (1u << 2),
 } LpzGridFlags;
 
 /*
- * DrawGridAndAxes — draw a world-space grid and/or XYZ axes in one GPU call.
+ * LpzGridDesc — parameters for DrawGrid.
  *
- *   mvp         column-major view-projection matrix (cglm mat4)
- *   grid_size   half-extent of the XZ grid in world units  (grid: ±grid_size)
- *   axis_size   length of each positive axis line in world units
- *   thickness   screen-pixel width of the axis lines;
- *               grid lines are drawn at half this thickness
- *   flags       LPZ_GRID_DRAW_GRID | LPZ_GRID_DRAW_AXES  (or either alone)
- *
- * Axes are drawn in the positive quadrant only  (0 → +axis_size).
- * Grid lines use a subtle dark colour; axes use the standard palette:
- *   X — red    (1, 0.25, 0.25, 1)
- *   Y — green  (0.25, 1, 0.25, 1)
- *   Z — blue   (0.25, 0.5, 1, 1)
- *
- * The grid geometry is cached internally; rebuilding only happens when
- * grid_size, axis_size, thickness, or flags change between calls.
- * All geometry is submitted as a single DrawLineSegments call.
+ *   grid_size  half-extent of the bounded XZ grid (lines at -N..N, integer cells).
+ *              Ignored when LPZ_GRID_INFINITE is set.
+ *   axis_size  length of the positive axis arrows from origin.
+ *              Independent of grid_size; set to 0 to skip axes.
+ *   spacing    world-unit cell size for the infinite grid.
+ *   thickness  pixel width of axis arrows; grid lines use a fraction of this.
+ *   flags      combination of LpzGridFlags values.
  */
+typedef struct LpzGridDesc {
+    int grid_size;
+    float axis_size;
+    float spacing;
+    float thickness;
+    LpzGridFlags flags;
+} LpzGridDesc;
+
+/*
+ * DrawGrid — draw a grid, axes, or infinite grid (or any combination).
+ *
+ *   LPZ_GRID_DRAW_GRID — bounded XZ line grid (lines at integer offsets from -grid_size
+ *                        to +grid_size).  Centre lines (x=0 and z=0) are slightly brighter
+ *                        and thicker than ordinary grid lines.
+ *
+ *   LPZ_GRID_INFINITE  — shader-based infinite grid that fades at the horizon.
+ *                        X-axis (z=0) is red; Z-axis (x=0) is blue.
+ *                        Requires grid.metal / spv/grid.vert.spv + spv/grid.frag.spv.
+ *
+ *   LPZ_GRID_DRAW_AXES — short arrows from origin (+X red, +Y green, +Z blue).
+ *                        Length is axis_size, independent of grid_size.
+ *
+ * All modes use the same view_proj.  Bounded-grid geometry is cached and only
+ * rebuilt when desc fields change.
+ */
+void DrawGrid(lpz_app_t app, mat4 view_proj, const LpzGridDesc *desc);
+
+// Legacy wrappers kept for source compatibility.
 void DrawGridAndAxes(lpz_app_t app, mat4 mvp, int grid_size, float axis_size, float thickness, LpzGridFlags flags);
+void DrawInfiniteGrid(lpz_app_t app, mat4 view_proj, float spacing);
 
 // ============================================================================
 // DEBUG LABELS

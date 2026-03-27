@@ -125,7 +125,7 @@ endif()
 # 3. CORE ENGINE SOURCES
 # ------------------------------------------------------------------------------
 set(LAPIZ_SOURCES
-    src/platform_glfw.c
+    src/platform/platform_glfw.c
     src/text.c
     src/io.c
     src/lpz.c
@@ -135,7 +135,7 @@ set(LAPIZ_LIBS glfw cglm assimp)
 
 # --- SDL3 PLATFORM ---
 if(LAPIZ_BACKEND_SDL3)
-    list(APPEND LAPIZ_SOURCES src/platform_sdl3.c)
+    list(APPEND LAPIZ_SOURCES src/platform/platform_sdl3.c)
     
     # Note: Even if the folder is named 'SDL', the CMake target 
     # exported by the library is still 'SDL3::SDL3-static'

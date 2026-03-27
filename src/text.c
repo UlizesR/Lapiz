@@ -1,33 +1,3 @@
-/*
- * Text.c — Implementation of Text.h
- *
- * Changes from the original version (aligned with deep-research-report.md):
- *
- *   1. IO LAYER — font files are loaded via LpzIO_ReadFile / LpzIO_FreeBlob
- *      instead of the previous private fopen/fread helper.  This ensures that
- *      the project-root path set by InitApp is respected for font loads.
- *
- *   2. FRAME TRACKING CONSTANT — LPZ_TEXT_MAX_TRACKED_FRAMES is now defined
- *      as LPZ_MAX_FRAMES_IN_FLIGHT (in Text.h).  A C11 _Static_assert
- *      and a runtime guard enforce the invariant at compile and init time.
- *
- *   3. EXPLICIT TEXT RENDERER — new TextRenderer struct and the four
- *      functions: TextRendererCreate, TextRendererDestroy,
- *      TextRendererDrawBatch, TextRendererGetPipeline/GetBindGroup.
- *      It owns exactly: pipeline, DS state, BGL, bind group, sampler.
- *
- *   4. DEBUG GLYPH LIMIT — a LPZ_LOG_WARNING is emitted once when the CPU
- *      glyph array is full (clip rather than silent drop, so the batch-
- *      overflow case is diagnosable in debug builds).
- *
- * DEPENDENCIES
- *   stb_truetype.h  — SDF glyph rasterization (included exactly once here)
- *   utils/io.h      — font file loading
- *   core/device.h   — GPU resource handles
- *   core/renderer.h — draw call dispatch
- *   core/log.h      — LPZ_LOG_* macros
- */
-
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "../include/utils/stb/stb_truetype.h"
 
@@ -41,7 +11,6 @@
 #include "../include/Lpz.h"
 extern LpzAPI Lpz;
 
-#include <assert.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,8 +19,6 @@ extern LpzAPI Lpz;
 // COMPILE-TIME INVARIANTS
 // ============================================================================
 
-/* Ensure the frame-slot count never falls behind the engine's in-flight cap.
-  * If you raise LPZ_MAX_FRAMES_IN_FLIGHT you get an immediate build error. */
 _Static_assert(LPZ_TEXT_MAX_TRACKED_FRAMES >= LPZ_MAX_FRAMES_IN_FLIGHT, "LPZ_TEXT_MAX_TRACKED_FRAMES must be >= LPZ_MAX_FRAMES_IN_FLIGHT");
 
 _Static_assert(sizeof(LpzGlyphInstance) == 64, "LpzGlyphInstance must be exactly 64 bytes");
@@ -102,6 +69,19 @@ struct LpzFontAtlas {
     float descent;
     float line_gap;
     lpz_texture_t texture;
+
+    // ── Kern cache ────────────────────────────────────────────────────────
+    // Flat 2-D table: kern_table[prev_idx * cp_range + cur_idx]
+    // Each entry is the raw stbtt kern value in font units (int16_t).
+    // Only populated when the codepoint set is a contiguous ASCII block.
+    int16_t *kern_table;     // NULL if kern caching is not active
+    uint32_t kern_cp_min;    // lowest codepoint index in the kern table
+    uint32_t kern_cp_range;  // number of codepoints (table is cp_range²)
+
+    // ── Scaled advance-width cache ────────────────────────────────────────
+    // advance_scaled[i] = glyphs[i].advance_width * font_scale  (float)
+    // Eliminates the per-glyph multiply in TextBatchAdd / TextMeasureWidth.
+    float *advance_scaled;  // parallel to glyphs[], NULL if not built
 };
 
 // ============================================================================
@@ -130,8 +110,6 @@ struct TextRenderer {
     lpz_bind_group_t bind_group;
     lpz_sampler_t sampler;
 
-    /* Track which resources were created internally so Destroy knows what to
-      * release.  Resources supplied via desc overrides are NOT released.    */
     bool owns_pipeline;
     bool owns_ds_state;
     bool owns_bgl;
@@ -253,10 +231,6 @@ LpzFontAtlas *LpzFontAtlasCreate(lpz_device_t device, const LpzFontAtlasDesc *de
     uint32_t aw = desc->atlas_width ? desc->atlas_width : LPZ_TEXT_DEFAULT_ATLAS_SIZE;
     uint32_t ah = desc->atlas_height ? desc->atlas_height : LPZ_TEXT_DEFAULT_ATLAS_SIZE;
 
-    // ── Font file load via the Lapiz IO layer ─────────────────────────────
-    // Previously used a private read_entire_file(fopen) helper.  The IO layer
-    // ensures consistent error reporting and respects any project-root set by
-    // InitApp via LpzIO_SetBasePath (future extension).
     LpzFileBlob font_blob = LpzIO_ReadFile(desc->path);
     if (!font_blob.data)
     {
@@ -408,6 +382,57 @@ LpzFontAtlas *LpzFontAtlasCreate(lpz_device_t device, const LpzFontAtlasDesc *de
     Lpz.device.WriteTexture(device, atlas->texture, pixels, aw, ah, 1);
     free(pixels);
 
+    // ── Build kern table ─────────────────────────────────────────────────────
+    // Only for contiguous codepoint blocks (the common case: printable ASCII).
+    // codepoints[] was sorted above (qsort); check for contiguity.
+    {
+        uint32_t first_cp = atlas->glyphs[0].codepoint;
+        uint32_t last_cp = atlas->glyphs[atlas->glyph_count - 1].codepoint;
+        uint32_t range = last_cp - first_cp + 1u;
+        bool contiguous = (range == atlas->glyph_count);
+
+        if (contiguous && range <= 512u)
+        {
+            size_t table_sz = (size_t)range * range * sizeof(int16_t);
+            atlas->kern_table = (int16_t *)calloc(1, table_sz);
+            if (atlas->kern_table)
+            {
+                atlas->kern_cp_min = first_cp;
+                atlas->kern_cp_range = range;
+
+                for (uint32_t pi = 0; pi < atlas->glyph_count; pi++)
+                {
+                    uint32_t prev = atlas->glyphs[pi].codepoint;
+                    for (uint32_t ci = 0; ci < atlas->glyph_count; ci++)
+                    {
+                        uint32_t cur = atlas->glyphs[ci].codepoint;
+                        int k = stbtt_GetCodepointKernAdvance(&atlas->font_info, (int)prev, (int)cur);
+                        if (k)
+                        {
+                            uint32_t row = prev - first_cp;
+                            uint32_t col = cur - first_cp;
+                            int16_t clamped = (k > 32767) ? 32767 : (k < -32768) ? -32768 : (int16_t)k;
+                            atlas->kern_table[row * range + col] = clamped;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Build scaled advance cache ────────────────────────────────────────────
+    // Precompute advance_width * font_scale so TextBatchAdd only does a
+    // per-call multiply by (font_size / atlas_size) rather than two multiplies.
+    {
+        float font_scale_pre = stbtt_ScaleForPixelHeight(&atlas->font_info, atlas->atlas_size);
+        atlas->advance_scaled = (float *)malloc(atlas->glyph_count * sizeof(float));
+        if (atlas->advance_scaled)
+        {
+            for (uint32_t i = 0; i < atlas->glyph_count; i++)
+                atlas->advance_scaled[i] = (float)atlas->glyphs[i].advance_width * font_scale_pre;
+        }
+    }
+
     LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "LpzFontAtlas: '%s'  atlas=%u×%u  glyphs=%u/%u packed", desc->path, aw, ah, atlas->packed_glyph_count, atlas->glyph_count);
     return atlas;
 }
@@ -418,6 +443,8 @@ void LpzFontAtlasDestroy(lpz_device_t device, LpzFontAtlas *atlas)
         return;
     if (atlas->texture)
         Lpz.device.DestroyTexture(atlas->texture);
+    free(atlas->kern_table);
+    free(atlas->advance_scaled);
     free(atlas->glyphs);
     free(atlas->font_data);
     free(atlas);
@@ -437,9 +464,6 @@ TextBatch *TextBatchCreate(lpz_device_t device, const TextBatchDesc *desc)
 {
     if (!device)
         return NULL;
-
-    /* Runtime guard in case the constant was overridden to something invalid */
-    assert(LPZ_TEXT_MAX_TRACKED_FRAMES >= LPZ_MAX_FRAMES_IN_FLIGHT && "LPZ_TEXT_MAX_TRACKED_FRAMES < LPZ_MAX_FRAMES_IN_FLIGHT");
 
     uint32_t max = (desc && desc->max_glyphs) ? desc->max_glyphs : LPZ_TEXT_DEFAULT_MAX_GLYPHS;
 
@@ -531,8 +555,19 @@ uint32_t TextBatchAdd(TextBatch *batch, const TextDesc *desc)
 
         if (prev_cp)
         {
-            int kern = stbtt_GetCodepointKernAdvance(&atlas->font_info, (int)prev_cp, (int)cp);
-            cursor_x += (float)kern * font_scale * scale;
+            int kern;
+            if (atlas->kern_table && prev_cp >= atlas->kern_cp_min && prev_cp < atlas->kern_cp_min + atlas->kern_cp_range && cp >= atlas->kern_cp_min && cp < atlas->kern_cp_min + atlas->kern_cp_range)
+            {
+                uint32_t row = prev_cp - atlas->kern_cp_min;
+                uint32_t col = cp - atlas->kern_cp_min;
+                kern = atlas->kern_table[row * atlas->kern_cp_range + col];
+            }
+            else
+            {
+                kern = stbtt_GetCodepointKernAdvance(&atlas->font_info, (int)prev_cp, (int)cp);
+            }
+            if (kern)
+                cursor_x += (float)kern * font_scale * scale;
         }
 
         if (g->atlas_w > 0)
@@ -571,7 +606,11 @@ uint32_t TextBatchAdd(TextBatch *batch, const TextDesc *desc)
             written++;
         }
 
-        cursor_x += (float)g->advance_width * font_scale * scale;
+        // advance_scaled[i] = advance_width * font_scale; only need * scale here.
+        if (atlas->advance_scaled)
+            cursor_x += atlas->advance_scaled[g - atlas->glyphs] * scale;
+        else
+            cursor_x += (float)g->advance_width * font_scale * scale;
         prev_cp = cp;
     }
     return written;
@@ -601,7 +640,6 @@ void TextBatchFlush(lpz_device_t device, TextBatch *batch, uint32_t frame_index)
     memcpy(mapped, batch->cpu, (size_t)batch->glyph_count * sizeof(LpzGlyphInstance));
     batch->flushed_glyph_count = batch->glyph_count;
 
-    /* Reset overflow warning each frame so the caller notices a change     */
     batch->overflow_warned = false;
 }
 
@@ -640,10 +678,24 @@ float TextMeasureWidth(const LpzFontAtlas *atlas, const char *text, float font_s
 
         if (prev_cp)
         {
-            int kern = stbtt_GetCodepointKernAdvance(&atlas->font_info, (int)prev_cp, (int)cp);
-            width += (float)kern * font_scale * scale;
+            int kern;
+            if (atlas->kern_table && prev_cp >= atlas->kern_cp_min && prev_cp < atlas->kern_cp_min + atlas->kern_cp_range && cp >= atlas->kern_cp_min && cp < atlas->kern_cp_min + atlas->kern_cp_range)
+            {
+                uint32_t row = prev_cp - atlas->kern_cp_min;
+                uint32_t col = cp - atlas->kern_cp_min;
+                kern = atlas->kern_table[row * atlas->kern_cp_range + col];
+            }
+            else
+            {
+                kern = stbtt_GetCodepointKernAdvance(&atlas->font_info, (int)prev_cp, (int)cp);
+            }
+            if (kern)
+                width += (float)kern * font_scale * scale;
         }
-        width += (float)g->advance_width * font_scale * scale;
+        if (atlas->advance_scaled)
+            width += atlas->advance_scaled[g - atlas->glyphs] * scale;
+        else
+            width += (float)g->advance_width * font_scale * scale;
         prev_cp = cp;
     }
     return width;
@@ -754,12 +806,6 @@ LpzResult TextRendererCreate(lpz_device_t device, LpzFormat color_format, const 
     struct TextRenderer *tr = (struct TextRenderer *)calloc(1, sizeof(*tr));
     if (!tr)
         return LPZ_OUT_OF_MEMORY;
-
-    const bool use_metal = Lpz.device.GetName && false; /* resolved at link time */
-    /* Detect Metal vs Vulkan via the Lpz global backend flag injected by lpz.c.
-      * The simplest stable indicator is whether .is_source_code would be used
-      * for shaders; rather than duplicating backend detection here we use the
-      * same candidate-search strategy as the implicit text path in lpz.c.     */
 
     // ── Sampler ──────────────────────────────────────────────────────────────
     if (desc && desc->sampler)
@@ -954,10 +1000,6 @@ void TextRendererDrawBatch(lpz_renderer_t renderer, lpz_text_renderer_t tr, uint
     if (!renderer || !tr || glyph_count == 0)
         return;
 
-    /* Bind once — pipeline, DS state, bind group — then draw.
-      * This is exactly ONE draw call for all glyphs accumulated this frame.
-      * The vertex shader generates a quad (6 vertices) per instance using
-      * gl_VertexIndex / [[vertex_id]] to address the glyph instance SSBO.  */
     Lpz.renderer.BindPipeline(renderer, tr->pipeline);
     Lpz.renderer.BindDepthStencilState(renderer, tr->ds_state);
     Lpz.renderer.BindBindGroup(renderer, 0, tr->bind_group, NULL, 0);

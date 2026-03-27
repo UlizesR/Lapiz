@@ -1,5 +1,6 @@
 #include "../include/utils/geometry.h"
 #include "../include/core/log.h"
+#include "../include/utils/internals.h"
 
 /* Require C11 (N1570). */
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ < 201112L
@@ -38,8 +39,6 @@ static void mesh_finalize_topology(Mesh *mesh)
     mesh->edge_count = mesh->wireframe ? mesh->index_count : (mesh->face_count * 3u);
 }
 
-/* set_white removed — use glm_vec4_one() directly */
-
 static bool mesh_alloc(Mesh *mesh, uint32_t vertex_count, uint32_t index_count)
 {
     if (!mesh)
@@ -66,7 +65,7 @@ static bool mesh_alloc(Mesh *mesh, uint32_t vertex_count, uint32_t index_count)
         if (!mesh->indices)
         {
             LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_MEMORY, LPZ_OUT_OF_MEMORY, "Failed to allocate %u geometry indices", index_count);
-            free(mesh->vertices);
+            LPZ_FREE(mesh->vertices);
             mesh_reset(mesh);
             return false;
         }
@@ -118,8 +117,6 @@ static bool convert_ai_mesh(const struct aiMesh *src, Mesh *out)
         if (src->mColors[0])
             glm_vec4_copy((vec4){src->mColors[0][i].r, src->mColors[0][i].g, src->mColors[0][i].b, src->mColors[0][i].a}, v->color);
         else
-            glm_vec4_one(v->color);
-        else
         {
             glm_vec4_one(v->color);
         }
@@ -137,8 +134,6 @@ static bool convert_ai_mesh(const struct aiMesh *src, Mesh *out)
     mesh_finalize_topology(out);
     return true;
 }
-
-/* copy_color removed — use glm_vec4_copy() directly */
 
 _Static_assert(sizeof(Vertex) == 48, "Vertex must be 48 bytes: vec3(12)+vec3(12)+vec2(8)+vec4(16)");
 
@@ -270,6 +265,7 @@ Mesh GenerateCylinder(uint32_t segments)
         glm_vec3_copy((vec3){px, 0.5f, pz}, top->position);
         glm_vec3_copy((vec3){nx, 0.0f, nz}, top->normal);
         top->uv[0] = u;
+        top->uv[1] = 0.0f;
         glm_vec4_one(top->color);
 
         Vertex *bottom = &mesh.vertices[i + side_ring];
@@ -622,9 +618,8 @@ void FreeMesh(Mesh *mesh)
 {
     if (!mesh)
         return;
-
-    free(mesh->vertices);
-    free(mesh->indices);
+    LPZ_FREE(mesh->vertices);
+    LPZ_FREE(mesh->indices);
     mesh_reset(mesh);
 }
 

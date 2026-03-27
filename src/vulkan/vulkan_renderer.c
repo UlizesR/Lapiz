@@ -42,28 +42,54 @@ static lpz_renderer_t lpz_vk_renderer_create(lpz_device_t device)
     struct renderer_t *renderer = calloc(1, sizeof(struct renderer_t));
     renderer->device = device;
 
+    // Create one command pool per in-flight frame slot.  Each pool is reset
+    // in full (vkResetCommandPool) at BeginFrame for its slot, which is
+    // cheaper than resetting individual command buffers: the pool reset
+    // releases all sub-allocations in a single driver call without the
+    // per-buffer tracking overhead of RESET_COMMAND_BUFFER_BIT.
     VkCommandPoolCreateInfo poolCI = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        // No RESET_COMMAND_BUFFER_BIT — we reset the whole pool, never
+        // individual buffers.
         .queueFamilyIndex = device->graphicsQueueFamily,
     };
-    vkCreateCommandPool(device->device, &poolCI, NULL, &renderer->commandPool);
+    for (int i = 0; i < LPZ_MAX_FRAMES_IN_FLIGHT; i++)
+    {
+        vkCreateCommandPool(device->device, &poolCI, NULL, &renderer->commandPools[i]);
+        VkCommandBufferAllocateInfo allocCI = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = renderer->commandPools[i],
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+        if (vkAllocateCommandBuffers(device->device, &allocCI, &renderer->commandBuffers[i]) != VK_SUCCESS)
+            LPZ_VK_WARN("Failed to allocate command buffer for frame slot %d.", i);
+    }
 
-    VkCommandBufferAllocateInfo allocCI = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool = renderer->commandPool,
-        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = LPZ_MAX_FRAMES_IN_FLIGHT,
-    };
-    if (vkAllocateCommandBuffers(device->device, &allocCI, renderer->commandBuffers) != VK_SUCCESS)
-        LPZ_VK_WARN("Failed to allocate command buffers.");
-
+    // In-flight fences — pre-signaled so the first BeginFrame doesn't stall
+    // waiting for a fence that was never submitted.
     VkFenceCreateInfo fenceCI = {
         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        .flags = VK_FENCE_CREATE_SIGNALED_BIT,  // pre-signaled so first BeginFrame doesn't stall
+        .flags = VK_FENCE_CREATE_SIGNALED_BIT,
     };
     for (int i = 0; i < LPZ_MAX_FRAMES_IN_FLIGHT; i++)
         vkCreateFence(device->device, &fenceCI, NULL, &renderer->inFlightFences[i]);
+
+    // Pre-allocate a persistent transfer command buffer and fence.
+    // BeginTransferPass resets + re-records it; EndTransferPass resets the
+    // fence and reuses it — eliminating per-upload vkAllocate/FreeCommandBuffers
+    // + vkCreateFence/DestroyFence, each of which touches the driver allocator.
+    VkCommandBufferAllocateInfo xferAllocCI = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = device->transferCommandPool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    if (vkAllocateCommandBuffers(device->device, &xferAllocCI, &renderer->transferCmd) != VK_SUCCESS)
+        LPZ_VK_WARN("Failed to allocate transfer command buffer.");
+
+    VkFenceCreateInfo xferFenceCI = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    vkCreateFence(device->device, &xferFenceCI, NULL, &renderer->transferFence);
 
     return renderer;
 }
@@ -73,8 +99,14 @@ static void lpz_vk_renderer_destroy(lpz_renderer_t renderer)
     if (!renderer)
         return;
     for (int i = 0; i < LPZ_MAX_FRAMES_IN_FLIGHT; i++)
+    {
         vkDestroyFence(renderer->device->device, renderer->inFlightFences[i], NULL);
-    vkDestroyCommandPool(renderer->device->device, renderer->commandPool, NULL);
+        // Destroying the pool implicitly frees the command buffer allocated from it.
+        vkDestroyCommandPool(renderer->device->device, renderer->commandPools[i], NULL);
+    }
+    // Free the persistent transfer command buffer + fence.
+    vkFreeCommandBuffers(renderer->device->device, renderer->device->transferCommandPool, 1, &renderer->transferCmd);
+    vkDestroyFence(renderer->device->device, renderer->transferFence, NULL);
     free(renderer);
 }
 
@@ -91,7 +123,12 @@ static void lpz_vk_renderer_begin_frame(lpz_renderer_t renderer)
     lpz_vk_frame_reset(renderer);
 
     renderer->currentCmd = renderer->commandBuffers[frame];
-    vkResetCommandBuffer(renderer->currentCmd, 0);
+
+    // Pool reset is cheaper than individual command buffer reset: it releases
+    // all internal sub-allocations in a single driver call, avoids per-buffer
+    // tracking, and is safe here because the fence wait above guarantees this
+    // frame slot's pool is not in use by the GPU.
+    vkResetCommandPool(renderer->device->device, renderer->commandPools[frame], 0);
 
     VkCommandBufferBeginInfo bi = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -338,7 +375,7 @@ static void lpz_vk_renderer_begin_render_pass(lpz_renderer_t renderer, const Lpz
     if (g_vkCmdBeginRendering)
     {
         static bool logged_dynamic_rendering = false;
-        lpz_vk_log_api_specific_once("BeginRenderPass", "dynamic rendering", &logged_dynamic_rendering);
+        lpz_log_backend_api_specific_once(LPZ_VK_SUBSYSTEM, "BeginRenderPass", "dynamic rendering", &logged_dynamic_rendering);
         g_vkCmdBeginRendering(renderer->currentCmd, &renderingInfo);
     }
 
@@ -358,13 +395,13 @@ static void lpz_vk_renderer_end_render_pass(lpz_renderer_t renderer)
 static void lpz_vk_renderer_begin_transfer_pass(lpz_renderer_t renderer)
 {
     renderer->transferOwnsDedicatedQueue = renderer->device->hasDedicatedTransferQueue;
-    VkCommandBufferAllocateInfo allocCI = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandPool = renderer->device->transferCommandPool,
-        .commandBufferCount = 1,
-    };
-    vkAllocateCommandBuffers(renderer->device->device, &allocCI, &renderer->transferCmd);
+
+    // Reset the pre-allocated persistent transfer command buffer.
+    // This is cheaper than vkAllocateCommandBuffers + vkFreeCommandBuffers per
+    // upload (each of which acquires the pool allocator lock and touches the
+    // driver heap).  The RESET_COMMAND_BUFFER_BIT on the transfer pool allows
+    // individual buffer reset without touching all others in the pool.
+    vkResetCommandBuffer(renderer->transferCmd, 0);
 
     VkCommandBufferBeginInfo bi = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -563,12 +600,9 @@ static void lpz_vk_renderer_end_transfer_pass(lpz_renderer_t renderer)
 {
     vkEndCommandBuffer(renderer->transferCmd);
 
-    // Use a transient fence instead of vkQueueWaitIdle.
-    // This is equivalent for the current synchronous upload model and is the
-    // correct primitive to replace with async fence tracking in the future.
-    VkFenceCreateInfo fenceCI = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    VkFence transferFence = VK_NULL_HANDLE;
-    vkCreateFence(renderer->device->device, &fenceCI, NULL, &transferFence);
+    // Reset the persistent transfer fence and reuse it — avoids per-upload
+    // vkCreateFence / vkDestroyFence which hit the driver allocator each time.
+    vkResetFences(renderer->device->device, 1, &renderer->transferFence);
 
     VkSubmitInfo si = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -576,11 +610,10 @@ static void lpz_vk_renderer_end_transfer_pass(lpz_renderer_t renderer)
         .pCommandBuffers = &renderer->transferCmd,
     };
     VkQueue queue = renderer->transferOwnsDedicatedQueue ? renderer->device->transferQueue : renderer->device->graphicsQueue;
-    vkQueueSubmit(queue, 1, &si, transferFence);
-    vkWaitForFences(renderer->device->device, 1, &transferFence, VK_TRUE, UINT64_MAX);
-    vkDestroyFence(renderer->device->device, transferFence, NULL);
-
-    vkFreeCommandBuffers(renderer->device->device, renderer->device->transferCommandPool, 1, &renderer->transferCmd);
+    vkQueueSubmit(queue, 1, &si, renderer->transferFence);
+    vkWaitForFences(renderer->device->device, 1, &renderer->transferFence, VK_TRUE, UINT64_MAX);
+    // Command buffer is NOT freed — it is pre-allocated and will be reset at
+    // the next BeginTransferPass.
 }
 
 static void lpz_vk_renderer_begin_compute_pass(lpz_renderer_t renderer)
@@ -611,25 +644,68 @@ static void lpz_vk_renderer_submit(lpz_renderer_t renderer, lpz_surface_t surfac
 
     vkEndCommandBuffer(renderer->currentCmd);
 
-    VkPipelineStageFlags waitStages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    VkSubmitInfo si = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &renderer->currentCmd,
-    };
-    if (surface)
+    VkFence fence = renderer->inFlightFences[renderer->frameIndex];
+
+    if (g_vk13)
     {
-        si.waitSemaphoreCount = 1;
-        si.pWaitSemaphores = &surface->imageAvailableSemaphores[renderer->frameIndex];
-        si.pWaitDstStageMask = &waitStages;
-        si.signalSemaphoreCount = 1;
-        // Index renderFinishedSemaphores by currentImageIndex (not frameIndex).
-        // The swapchain may hand out more images than LPZ_MAX_FRAMES_IN_FLIGHT;
-        // reusing a frame-indexed semaphore before the swapchain has consumed it
-        // violates VUID-vkQueueSubmit-pSignalSemaphores-00067.
-        si.pSignalSemaphores = &surface->renderFinishedSemaphores[surface->currentImageIndex];
+        // vkQueueSubmit2 (Vulkan 1.3 core, promoted from VK_KHR_synchronization2):
+        // — Removes the pWaitDstStageMask indirection (no extra VkPipelineStageFlags
+        //   on the stack, no pointer in the submit struct).
+        // — Per-semaphore stage masks use the full VkPipelineStageFlags2 precision,
+        //   allowing tighter pipeline overlap on tile-based and desktop GPUs.
+        // — The wait semaphore fires only at COLOR_ATTACHMENT_OUTPUT, letting the
+        //   vertex/compute stages run while acquire is in flight.
+        VkCommandBufferSubmitInfo cbInfo = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+            .commandBuffer = renderer->currentCmd,
+        };
+        VkSubmitInfo2 si2 = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+            .commandBufferInfoCount = 1,
+            .pCommandBufferInfos = &cbInfo,
+        };
+        VkSemaphoreSubmitInfo waitInfo, signalInfo;
+        if (surface)
+        {
+            waitInfo = (VkSemaphoreSubmitInfo){
+                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                .semaphore = surface->imageAvailableSemaphores[renderer->frameIndex],
+                .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            };
+            // Index renderFinishedSemaphores by currentImageIndex (not frameIndex).
+            // The swapchain may hand out more images than LPZ_MAX_FRAMES_IN_FLIGHT;
+            // reusing a frame-indexed semaphore before the swapchain has consumed it
+            // violates VUID-vkQueueSubmit-pSignalSemaphores-00067.
+            signalInfo = (VkSemaphoreSubmitInfo){
+                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                .semaphore = surface->renderFinishedSemaphores[surface->currentImageIndex],
+                .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            };
+            si2.waitSemaphoreInfoCount = 1;
+            si2.pWaitSemaphoreInfos = &waitInfo;
+            si2.signalSemaphoreInfoCount = 1;
+            si2.pSignalSemaphoreInfos = &signalInfo;
+        }
+        vkQueueSubmit2(renderer->device->graphicsQueue, 1, &si2, fence);
     }
-    vkQueueSubmit(renderer->device->graphicsQueue, 1, &si, renderer->inFlightFences[renderer->frameIndex]);
+    else
+    {
+        VkPipelineStageFlags waitStages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        VkSubmitInfo si = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &renderer->currentCmd,
+        };
+        if (surface)
+        {
+            si.waitSemaphoreCount = 1;
+            si.pWaitSemaphores = &surface->imageAvailableSemaphores[renderer->frameIndex];
+            si.pWaitDstStageMask = &waitStages;
+            si.signalSemaphoreCount = 1;
+            si.pSignalSemaphores = &surface->renderFinishedSemaphores[surface->currentImageIndex];
+        }
+        vkQueueSubmit(renderer->device->graphicsQueue, 1, &si, fence);
+    }
 
     if (surface)
     {
@@ -654,22 +730,52 @@ static void lpz_vk_renderer_submit_with_fence(lpz_renderer_t renderer, lpz_surfa
     if (surface)
         lpz_vk_transition_tracked_texture(renderer, &surface->swapchainTextures[surface->currentImageIndex], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_ASPECT_COLOR_BIT);
 
-    VkPipelineStageFlags waitStages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     vkEndCommandBuffer(renderer->currentCmd);
 
-    VkSubmitInfo si = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &surface->imageAvailableSemaphores[renderer->frameIndex],
-        .pWaitDstStageMask = &waitStages,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &renderer->currentCmd,
-        .signalSemaphoreCount = 1,
-        // Index by currentImageIndex — see Submit for the full explanation.
-        .pSignalSemaphores = &surface->renderFinishedSemaphores[surface->currentImageIndex],
-    };
     VkFence vk_fence = fence ? fence->fence : renderer->inFlightFences[renderer->frameIndex];
-    vkQueueSubmit(renderer->device->graphicsQueue, 1, &si, vk_fence);
+
+    if (g_vk13)
+    {
+        VkCommandBufferSubmitInfo cbInfo = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+            .commandBuffer = renderer->currentCmd,
+        };
+        VkSemaphoreSubmitInfo waitInfo = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = surface->imageAvailableSemaphores[renderer->frameIndex],
+            .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        };
+        VkSemaphoreSubmitInfo signalInfo = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = surface->renderFinishedSemaphores[surface->currentImageIndex],
+            .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        };
+        VkSubmitInfo2 si2 = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+            .waitSemaphoreInfoCount = 1,
+            .pWaitSemaphoreInfos = &waitInfo,
+            .commandBufferInfoCount = 1,
+            .pCommandBufferInfos = &cbInfo,
+            .signalSemaphoreInfoCount = 1,
+            .pSignalSemaphoreInfos = &signalInfo,
+        };
+        vkQueueSubmit2(renderer->device->graphicsQueue, 1, &si2, vk_fence);
+    }
+    else
+    {
+        VkPipelineStageFlags waitStages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        VkSubmitInfo si = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &surface->imageAvailableSemaphores[renderer->frameIndex],
+            .pWaitDstStageMask = &waitStages,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &renderer->currentCmd,
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = &surface->renderFinishedSemaphores[surface->currentImageIndex],
+        };
+        vkQueueSubmit(renderer->device->graphicsQueue, 1, &si, vk_fence);
+    }
 
     VkPresentInfoKHR presentInfo = {
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -827,7 +933,7 @@ static void lpz_vk_renderer_draw_indirect_count(lpz_renderer_t renderer, lpz_buf
     if (!g_has_draw_indirect_count || !g_vkCmdDrawIndirectCount)
         return;
 
-    lpz_vk_log_api_specific_once("DrawIndirectCount", "VK_KHR_draw_indirect_count / Vulkan indirect-count draws", &logged_draw_indirect_count);
+    lpz_log_backend_api_specific_once(LPZ_VK_SUBSYSTEM, "DrawIndirectCount", "VK_KHR_draw_indirect_count / Vulkan indirect-count draws", &logged_draw_indirect_count);
     VkBuffer vk_buf = buffer->isRing ? buffer->buffers[renderer->frameIndex] : buffer->buffers[0];
     VkBuffer vk_cnt = count_buffer->isRing ? count_buffer->buffers[renderer->frameIndex] : count_buffer->buffers[0];
     g_vkCmdDrawIndirectCount(renderer->currentCmd, vk_buf, offset, vk_cnt, count_offset, max_draw_count, sizeof(VkDrawIndirectCommand));
@@ -1129,7 +1235,7 @@ static void lpz_vk_renderer_bind_tile_pipeline(lpz_renderer_t r, lpz_tile_pipeli
 static void lpz_vk_renderer_dispatch_tile_kernel(lpz_renderer_t r, lpz_tile_pipeline_t p, uint32_t w, uint32_t h)
 {
     static bool logged_dispatch_tile = false;
-    lpz_vk_log_api_specific_once("DispatchTileKernel", "tile shaders are Metal-specific and have no Vulkan backend implementation", &logged_dispatch_tile);
+    lpz_log_backend_api_specific_once(LPZ_VK_SUBSYSTEM, "DispatchTileKernel", "tile shaders are Metal-specific and have no Vulkan backend implementation", &logged_dispatch_tile);
     (void)r;
     (void)p;
     (void)w;
@@ -1142,7 +1248,7 @@ static void lpz_vk_renderer_bind_mesh_pipeline(lpz_renderer_t renderer, lpz_mesh
     if (!pipeline || !g_has_mesh_shader)
         return;
 
-    lpz_vk_log_api_specific_once("BindMeshPipeline", "VK_EXT_mesh_shader", &logged_bind_mesh_pipeline);
+    lpz_log_backend_api_specific_once(LPZ_VK_SUBSYSTEM, "BindMeshPipeline", "VK_EXT_mesh_shader", &logged_bind_mesh_pipeline);
     vkCmdBindPipeline(renderer->currentCmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
 }
 
@@ -1155,7 +1261,7 @@ static void lpz_vk_renderer_draw_mesh_threadgroups(lpz_renderer_t renderer, lpz_
     (void)oz;
     if (!g_has_mesh_shader || !g_vkCmdDrawMeshTasksEXT)
         return;
-    lpz_vk_log_api_specific_once("DrawMeshThreadgroups", "VK_EXT_mesh_shader", &logged_draw_mesh);
+    lpz_log_backend_api_specific_once(LPZ_VK_SUBSYSTEM, "DrawMeshThreadgroups", "VK_EXT_mesh_shader", &logged_draw_mesh);
     g_vkCmdDrawMeshTasksEXT(renderer->currentCmd, mx, my, mz);
 }
 
@@ -1165,14 +1271,14 @@ static void lpz_vk_renderer_bind_argument_table(lpz_renderer_t renderer, lpz_arg
     if (!table || table->set == VK_NULL_HANDLE || !renderer->activePipeline)
         return;
 
-    lpz_vk_log_api_specific_once("BindArgumentTable", table->useDescriptorBuffer ? "VK_EXT_descriptor_buffer" : "VkDescriptorSet fallback", &logged_bind_argument_table);
+    lpz_log_backend_api_specific_once(LPZ_VK_SUBSYSTEM, "BindArgumentTable", table->useDescriptorBuffer ? "VK_EXT_descriptor_buffer" : "VkDescriptorSet fallback", &logged_bind_argument_table);
     vkCmdBindDescriptorSets(renderer->currentCmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer->activePipeline->pipelineLayout, 0, 1, &table->set, 0, NULL);
 }
 
 static void lpz_vk_renderer_set_pass_residency(lpz_renderer_t renderer, const LpzPassResidencyDesc *desc)
 {
     static bool logged_pass_residency = false;
-    lpz_vk_log_api_specific_once("SetPassResidency", "Vulkan memory barrier / residency-style synchronization", &logged_pass_residency);
+    lpz_log_backend_api_specific_once(LPZ_VK_SUBSYSTEM, "SetPassResidency", "Vulkan memory barrier / residency-style synchronization", &logged_pass_residency);
     (void)desc;
     // Use the narrowest scope that covers the intended residency fence:
     // ensure all prior shader writes are visible to subsequent shader reads.

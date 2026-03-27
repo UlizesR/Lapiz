@@ -1,34 +1,23 @@
 #version 450
-// scene.vert.glsl — Lapiz default mesh vertex shader  (Vulkan / SPIR-V)
+// scene.vert — Lapiz default mesh vertex shader  (Vulkan)
+// Compile: glslc scene.vert -o spv/scene.vert.spv
 //
-// Compile:
-//   glslc scene.vert.glsl -o spv/scene.vert.spv
+// Push constants (80 bytes):
+//   [  0] mat4  view_proj
+//   [ 64] float time        (unused in VS)
+//   [ 68] uint  flags       0x1 = SCENE_DRAW_INSTANCED_BIT
+//   [ 72] float viewport_w  (unused in VS)
+//   [ 76] float viewport_h  (unused in VS)
 //
-// Push-constant layout  (80 bytes)
-//   bytes  0–63 : mat4  view_proj
-//   bytes 64–67 : float time      (unused in vertex)
-//   bytes 68–71 : uint  flags     — SCENE_DRAW_INSTANCED_BIT
-//   bytes 72–75 : float viewport_w (layout filler, unused)
-//   bytes 76–79 : float viewport_h (layout filler, unused)
+// Vertex attributes (binding 0, per-vertex):
+//   location 0 : vec3 position
+//   location 1 : vec3 normal
+//   location 2 : vec2 uv    (present for layout compatibility; unused here)
+//   location 3 : vec4 color
 //
-// model is NOT in push constants.  Non-instanced draws use mat4(1.0).
+// Instance SSBO (set=0, binding=0) — only read when INSTANCED_BIT is set.
 
-layout(location = 0) in vec3 in_position;
-layout(location = 1) in vec3 in_normal;
-layout(location = 2) in vec2 in_uv;
-layout(location = 3) in vec4 in_vertex_color;
-
-layout(location = 0) out vec4 v_color;
-layout(location = 1) out vec3 v_normal_world;
-layout(location = 2) out vec2 v_uv;
-
-struct InstanceData { mat4 model; vec4 color; };
-
-layout(set = 0, binding = 0) readonly buffer InstanceBuffer {
-    InstanceData instances[];
-};
-
-layout(push_constant) uniform ScenePC {
+layout(push_constant) uniform PC {
     mat4  view_proj;
     float time;
     uint  flags;
@@ -38,24 +27,35 @@ layout(push_constant) uniform ScenePC {
 
 const uint SCENE_DRAW_INSTANCED_BIT = 0x1u;
 
+struct InstanceData {
+    mat4 model;
+    vec4 color;
+};
+
+layout(set = 0, binding = 0) readonly buffer InstanceBuffer {
+    InstanceData instances[];
+};
+
+layout(location = 0) in vec3 in_position;
+layout(location = 1) in vec3 in_normal;
+layout(location = 2) in vec2 in_uv;
+layout(location = 3) in vec4 in_color;
+
+layout(location = 0) out vec4 v_color;
+layout(location = 1) out vec3 v_normal_world;
+
 void main()
 {
     mat4 model = mat4(1.0);
-    vec4 color = in_vertex_color;
+    vec4 color = in_color;
 
     if ((pc.flags & SCENE_DRAW_INSTANCED_BIT) != 0u) {
-        InstanceData inst = instances[gl_InstanceIndex];
-        model = inst.model;
-        color = inst.color * in_vertex_color;
+        model = instances[gl_InstanceIndex].model;
+        color = instances[gl_InstanceIndex].color * in_color;
     }
 
     vec4 world_pos = model * vec4(in_position, 1.0);
     gl_Position    = pc.view_proj * world_pos;
-    // Pass the world-space normal without normalizing: the fragment shader
-    // must re-normalize after rasterizer interpolation regardless, so a
-    // per-vertex normalize here costs ALU without benefit.
-    // mat3(model) = upper-left 3×3, valid for uniform-scale transforms.
     v_normal_world = mat3(model) * in_normal;
     v_color        = color;
-    v_uv           = in_uv;
 }

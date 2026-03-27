@@ -264,6 +264,8 @@ int main(int argc, char **argv)
     float fps = 60.f, fps_acc = 0;
     int fps_n = 0;
     const char *backend = IsMetalBackend(app) ? "Backend: Metal" : "Backend: Vulkan";
+    // 0 = no grid, 1 = bounded grid (DrawGridAndAxes), 2 = infinite grid (DrawInfiniteGrid)
+    int grid_mode = 2;
 
     // ---- Main loop ----------------------------------------------------------
     while (Run(app))
@@ -271,6 +273,8 @@ int main(int argc, char **argv)
         PollEvents(app);
         if (KeyPressed(app, LPZ_KEY_ESCAPE))
             CloseWindow(app);
+        if (KeyPressed(app, LPZ_KEY_G))
+            grid_mode = (grid_mode + 1) % 3;
 
         LpzFrameInfo frame;
         if (BeginDraw(app, &frame) != LPZ_SUCCESS)
@@ -290,10 +294,29 @@ int main(int argc, char **argv)
         mat4 mvp;
         cam_vp(&cam, mvp, frame.aspect);
 
-        // ---- Draw world grid and axes first (always visible) ---------------
-        PushDebugLabel(app, "Grid & Axes", (vec3){0.6f, 0.8f, 1.0f});
-        DrawGridAndAxes(app, mvp, 10, 5.0f, 2.0f, LPZ_GRID_DRAW_ALL);
-        PopDebugLabel(app);
+        // ---- Grid (G cycles: off → bounded → infinite) ----------------------
+        if (grid_mode == 1)
+        {
+            PushDebugLabel(app, "Grid & Axes", (vec3){0.6f, 0.8f, 1.0f});
+            DrawGrid(app, mvp,
+                     &(LpzGridDesc){
+                         .grid_size = 10,
+                         .axis_size = 5.0f,
+                         .thickness = 2.0f,
+                         .flags = LPZ_GRID_DRAW_ALL,
+                     });
+            PopDebugLabel(app);
+        }
+        else if (grid_mode == 2)
+        {
+            DrawGrid(app, mvp,
+                     &(LpzGridDesc){
+                         .axis_size = 5.0f,
+                         .spacing = 1.0f,
+                         .thickness = 2.0f,
+                         .flags = LPZ_GRID_INFINITE_AXES,
+                     });
+        }
 
         // ---- Draw 1M point sprites ------------------------------------------
         PushDebugLabel(app, "Galaxy", (vec3){0.4f, 0.7f, 1.0f});
@@ -306,7 +329,9 @@ int main(int argc, char **argv)
         // ---- HUD ------------------------------------------------------------
         DrawTextFmt(app, (vec2){20, 20}, 34, (vec4){0.35f, 0.92f, 0.48f, 1.0f}, "FPS %.0f", (double)fps);
         DrawText(app, (vec2){20, 64}, 24, (vec4){0.92f, 0.92f, 0.92f, 1.0f}, backend);
-        DrawText(app, (vec2){20, 94}, 16, (vec4){0.55f, 0.65f, 0.80f, 1.0f}, "LMB: orbit  RMB: pan  Q/E: zoom  WASD: move  R: reset");
+        DrawText(app, (vec2){20, 94}, 16, (vec4){0.55f, 0.65f, 0.80f, 1.0f}, "LMB: orbit  RMB: pan  Q/E: zoom  WASD: move  R: reset  G: grid");
+        const char *grid_label = grid_mode == 0 ? "Grid: off" : grid_mode == 1 ? "Grid: bounded" : "Grid: infinite";
+        DrawText(app, (vec2){20, 116}, 16, (vec4){0.55f, 0.65f, 0.80f, 1.0f}, grid_label);
 
         EndDraw(app);
         Present(app);
