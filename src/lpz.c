@@ -61,6 +61,15 @@ static bool lpz_event_pop(LpzEventQueue *q, LpzEvent *out)
 // APP STATE
 // ============================================================================
 
+typedef struct {
+    float x, y, w, h;      // screen-space rect in pixels
+    float u, v, uw, vh;    // atlas UV rect [0,1]
+    float r, g, b, a;      // tint color
+    float screen_w, screen_h; // framebuffer size for NDC
+    float _p0, _p1;        // padding to 64 bytes
+} LpzSpriteInstance;
+_Static_assert(sizeof(LpzSpriteInstance) == 64, "LpzSpriteInstance must be 64 bytes");
+
 struct LpzAppState {
     LpzAPI api;
     bool use_metal;
@@ -191,6 +200,39 @@ struct LpzAppState {
     bool text_pending;
     uint32_t text_draw_calls;
 
+    // -- Blend mode pipeline cache (DrawMesh with different blend modes) ------
+    // Index matches LpzBlendMode enum: 0=OPAQUE, 1=ALPHA, 2=ADDITIVE, 3=PREMUL
+    lpz_pipeline_t blend_pipelines[4];
+    uint32_t active_blend_mode;  // current LpzBlendMode, default 0 = OPAQUE
+
+    // -- Textured mesh pipeline -----------------------------------------------
+    lpz_pipeline_t textured_pipeline;
+    lpz_bind_group_layout_t textured_bgl;
+    bool textured_pipeline_ready;
+
+    // -- Sprite system --------------------------------------------------------
+    lpz_pipeline_t sprite_pipeline;
+    lpz_bind_group_layout_t sprite_bgl;
+    lpz_depth_stencil_state_t sprite_ds;
+    bool sprite_pipeline_ready;
+    // Ring-buffered SSBO for sprite instances (persistent mapping)
+    lpz_buffer_t        sprite_buf;
+    uint32_t            sprite_buf_cap;      // capacity in LpzSpriteInstance records
+    lpz_bind_group_t    sprite_bg;
+    lpz_texture_t       sprite_bg_tex;       // texture bound in sprite_bg
+    lpz_sampler_t       sprite_bg_sampler;   // sampler bound in sprite_bg
+    void               *sprite_mapped[LPZ_MAX_FRAMES_IN_FLIGHT];
+    bool                sprite_map_valid[LPZ_MAX_FRAMES_IN_FLIGHT];
+    // Per-frame sprite batch
+    LpzSpriteInstance  *sprite_cpu;
+    uint32_t            sprite_count;
+    uint32_t            sprite_cap_cpu;
+    lpz_texture_t       sprite_frame_tex;
+    lpz_sampler_t       sprite_frame_sampler;
+
+    // -- Render target stack (BeginRenderTarget / EndRenderTarget) ------------
+    // Only one level of nesting is supported in the easy API.
+    bool in_render_target;
     // ── Deferred MVP (written by Draw*, read in EndDraw flush) ────────────────
     LAPIZ_ALIGN(16) float prim_mvp[16]; /* 16-byte-aligned for SIMD mat4 stores */
     uint64_t prim_mvp_hash;             // XOR fingerprint of prim_mvp; 0 = never set
@@ -380,10 +422,7 @@ static LpzFileBlob lpz_find_default_blob(bool is_metal, const char *filename)
 
 #undef LPZ_TRY_PATH
 
-    LPZ_LOG_WARNING(LPZ_LOG_CATEGORY_SHADER,
-                    "LpzApp: default shader '%s' not found. "
-                    "Set LAPIZ_SHADER_DIR or install Lapiz to a prefix.",
-                    filename);
+    LPZ_LOG_WARNING(LPZ_LOG_CATEGORY_SHADER, "LpzApp: default shader '%s' not found. Set LAPIZ_SHADER_DIR or install Lapiz to a prefix.", filename);
     return (LpzFileBlob){NULL, 0};
 }
 
@@ -834,6 +873,8 @@ typedef struct {
 } LpzPrimPC;
 _Static_assert(sizeof(LpzPrimPC) == 80, "LpzPrimPC must be exactly 80 bytes to match the GPU push-constant range");
 
+static void lpz_flush_sprites(struct LpzAppState *app);  /* defined after EndDraw */
+
 // Cheap 64-bit fingerprint of a 16-float mat4: XOR of first and last qword.
 // False positives are possible but vanishingly rare for camera matrices.
 static inline uint64_t lpz_mvp_hash(const void *m)
@@ -1075,6 +1116,221 @@ static void lpz_build_infinite_grid_pipeline(struct LpzAppState *app)
     else
     {
         LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_PIPELINE, LPZ_PIPELINE_COMPILE_FAILED, "LpzApp: infinite grid pipeline creation failed.");
+    }
+}
+
+
+// ============================================================================
+// BLEND PIPELINE CACHE  (indices match LpzBlendMode enum in Lpz.h)
+// ============================================================================
+
+static void lpz_build_blend_pipelines(struct LpzAppState *app)
+{
+    if (!app->default_vert || !app->default_frag)
+        return;
+    if (!app->default_scene_ds)
+        return;
+
+    LpzFormat sc_fmt    = app->api.surface.GetFormat(app->surface);
+    LpzFormat depth_fmt = app->enable_depth ? LPZ_FORMAT_DEPTH32_FLOAT : LPZ_FORMAT_UNDEFINED;
+
+    LpzVertexBindingDesc b0   = {.binding = 0, .stride = sizeof(Vertex), .input_rate = LPZ_VERTEX_INPUT_RATE_VERTEX};
+    LpzVertexAttributeDesc attrs[4] = {
+        {0, 0, LPZ_FORMAT_RGB32_FLOAT, (uint32_t)offsetof(Vertex, position)},
+        {1, 0, LPZ_FORMAT_RGB32_FLOAT, (uint32_t)offsetof(Vertex, normal)},
+        {2, 0, LPZ_FORMAT_RG32_FLOAT,  (uint32_t)offsetof(Vertex, uv)},
+        {3, 0, LPZ_FORMAT_RGBA32_FLOAT,(uint32_t)offsetof(Vertex, color)},
+    };
+
+    static const LpzColorBlendState kBlends[4] = {
+        // 0 OPAQUE
+        {.blend_enable = false, .write_mask = LPZ_COLOR_COMPONENT_ALL},
+        // 1 ALPHA
+        {.blend_enable = true,
+         .src_color_factor = LPZ_BLEND_FACTOR_SRC_ALPHA,
+         .dst_color_factor = LPZ_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+         .color_blend_op   = LPZ_BLEND_OP_ADD,
+         .src_alpha_factor = LPZ_BLEND_FACTOR_ONE,
+         .dst_alpha_factor = LPZ_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+         .alpha_blend_op   = LPZ_BLEND_OP_ADD,
+         .write_mask       = LPZ_COLOR_COMPONENT_ALL},
+        // 2 ADDITIVE
+        {.blend_enable = true,
+         .src_color_factor = LPZ_BLEND_FACTOR_SRC_ALPHA,
+         .dst_color_factor = LPZ_BLEND_FACTOR_ONE,
+         .color_blend_op   = LPZ_BLEND_OP_ADD,
+         .src_alpha_factor = LPZ_BLEND_FACTOR_ONE,
+         .dst_alpha_factor = LPZ_BLEND_FACTOR_ONE,
+         .alpha_blend_op   = LPZ_BLEND_OP_ADD,
+         .write_mask       = LPZ_COLOR_COMPONENT_ALL},
+        // 3 PREMULTIPLIED
+        {.blend_enable = true,
+         .src_color_factor = LPZ_BLEND_FACTOR_ONE,
+         .dst_color_factor = LPZ_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+         .color_blend_op   = LPZ_BLEND_OP_ADD,
+         .src_alpha_factor = LPZ_BLEND_FACTOR_ONE,
+         .dst_alpha_factor = LPZ_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+         .alpha_blend_op   = LPZ_BLEND_OP_ADD,
+         .write_mask       = LPZ_COLOR_COMPONENT_ALL},
+    };
+
+    for (int i = 0; i < 4; i++) {
+        // Slot 0 (OPAQUE) reuses the already-built default_scene_pipeline.
+        if (i == 0) {
+            app->blend_pipelines[0] = app->default_scene_pipeline;
+            continue;
+        }
+        LpzPipelineDesc pso = {
+            .vertex_shader           = app->default_vert,
+            .fragment_shader         = app->default_frag,
+            .color_attachment_format = sc_fmt,
+            .depth_attachment_format = depth_fmt,
+            .sample_count            = 1,
+            .topology                = LPZ_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+            .vertex_bindings         = &b0,
+            .vertex_binding_count    = 1,
+            .vertex_attributes       = attrs,
+            .vertex_attribute_count  = 4,
+            .bind_group_layouts      = &app->default_inst_bgl,
+            .bind_group_layout_count = 1,
+            .rasterizer_state        = {.cull_mode = LPZ_CULL_MODE_BACK, .front_face = LPZ_FRONT_FACE_COUNTER_CLOCKWISE},
+            .blend_state             = kBlends[i],
+        };
+        app->api.device.CreatePipeline(app->device, &pso, &app->blend_pipelines[i]);
+    }
+    LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "LpzApp: blend-mode pipelines ready.");
+}
+
+// ============================================================================
+// TEXTURED MESH PIPELINE  (slot 0: SSBO, slot 1: texture, slot 2: sampler)
+// ============================================================================
+
+static void lpz_build_textured_pipeline(struct LpzAppState *app)
+{
+    if (!app->default_vert || !app->default_frag)
+        return;
+
+    LpzFormat sc_fmt    = app->api.surface.GetFormat(app->surface);
+    LpzFormat depth_fmt = app->enable_depth ? LPZ_FORMAT_DEPTH32_FLOAT : LPZ_FORMAT_UNDEFINED;
+
+    // BGL: SSBO(VS) + Texture(FS) + Sampler(FS)
+    LpzBindGroupLayoutEntry bgl_entries[3] = {
+        {.binding_index = 0, .type = LPZ_BINDING_TYPE_STORAGE_BUFFER, .visibility = LPZ_SHADER_STAGE_VERTEX},
+        {.binding_index = 1, .type = LPZ_BINDING_TYPE_TEXTURE,        .visibility = LPZ_SHADER_STAGE_FRAGMENT},
+        {.binding_index = 2, .type = LPZ_BINDING_TYPE_SAMPLER,        .visibility = LPZ_SHADER_STAGE_FRAGMENT},
+    };
+    app->textured_bgl = app->api.device.CreateBindGroupLayout(
+        app->device, &(LpzBindGroupLayoutDesc){.entries = bgl_entries, .entry_count = 3});
+    if (!app->textured_bgl) return;
+
+    LpzVertexBindingDesc b0 = {.binding = 0, .stride = sizeof(Vertex), .input_rate = LPZ_VERTEX_INPUT_RATE_VERTEX};
+    LpzVertexAttributeDesc attrs[4] = {
+        {0, 0, LPZ_FORMAT_RGB32_FLOAT, (uint32_t)offsetof(Vertex, position)},
+        {1, 0, LPZ_FORMAT_RGB32_FLOAT, (uint32_t)offsetof(Vertex, normal)},
+        {2, 0, LPZ_FORMAT_RG32_FLOAT,  (uint32_t)offsetof(Vertex, uv)},
+        {3, 0, LPZ_FORMAT_RGBA32_FLOAT,(uint32_t)offsetof(Vertex, color)},
+    };
+    LpzPipelineDesc pso = {
+        .vertex_shader           = app->default_vert,
+        .fragment_shader         = app->default_frag,
+        .color_attachment_format = sc_fmt,
+        .depth_attachment_format = depth_fmt,
+        .sample_count            = 1,
+        .topology                = LPZ_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        .vertex_bindings         = &b0, .vertex_binding_count = 1,
+        .vertex_attributes       = attrs, .vertex_attribute_count = 4,
+        .bind_group_layouts      = &app->textured_bgl,
+        .bind_group_layout_count = 1,
+        .rasterizer_state        = {.cull_mode = LPZ_CULL_MODE_BACK, .front_face = LPZ_FRONT_FACE_COUNTER_CLOCKWISE},
+        .blend_state             = {.blend_enable = false, .write_mask = LPZ_COLOR_COMPONENT_ALL},
+    };
+    if (app->api.device.CreatePipeline(app->device, &pso, &app->textured_pipeline) == LPZ_SUCCESS) {
+        app->textured_pipeline_ready = true;
+        LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "LpzApp: textured mesh pipeline ready.");
+    }
+}
+
+// ============================================================================
+// SPRITE PIPELINE  (no vertex buffer; instances carry pos/size/uv/color)
+// ============================================================================
+
+static void lpz_build_sprite_pipeline(struct LpzAppState *app)
+{
+    LpzFileBlob vs_blob = {0}, fs_blob = {0};
+    lpz_shader_t svs = NULL, sfs = NULL;
+    if (app->use_metal) {
+        vs_blob = lpz_find_default_blob(true, "sprite.metal");
+        fs_blob = vs_blob;
+    } else {
+        vs_blob = lpz_find_default_blob(false, "spv/sprite.vert.spv");
+        fs_blob = lpz_find_default_blob(false, "spv/sprite.frag.spv");
+    }
+    if (!vs_blob.data || !fs_blob.data) {
+        LPZ_LOG_WARNING(LPZ_LOG_CATEGORY_SHADER, "LpzApp: sprite shaders not found — DrawSprite disabled.");
+        LpzIO_FreeBlob(&vs_blob);
+        if (!app->use_metal) LpzIO_FreeBlob(&fs_blob);
+        return;
+    }
+    LpzShaderDesc vd = {.bytecode = vs_blob.data, .bytecode_size = vs_blob.size,
+                         .is_source_code = app->use_metal,
+                         .entry_point = app->use_metal ? "sprite_vertex" : "main",
+                         .stage = LPZ_SHADER_STAGE_VERTEX};
+    LpzShaderDesc fd = {.bytecode = fs_blob.data, .bytecode_size = fs_blob.size,
+                         .is_source_code = app->use_metal,
+                         .entry_point = app->use_metal ? "sprite_fragment" : "main",
+                         .stage = LPZ_SHADER_STAGE_FRAGMENT};
+    bool ok = (app->api.device.CreateShader(app->device, &vd, &svs) == LPZ_SUCCESS &&
+               app->api.device.CreateShader(app->device, &fd, &sfs) == LPZ_SUCCESS);
+    LpzIO_FreeBlob(&vs_blob);
+    if (!app->use_metal) LpzIO_FreeBlob(&fs_blob);
+    if (!ok) {
+        if (svs) app->api.device.DestroyShader(svs);
+        if (sfs) app->api.device.DestroyShader(sfs);
+        return;
+    }
+
+    LpzBindGroupLayoutEntry bgl_entries[3] = {
+        {.binding_index = 0, .type = LPZ_BINDING_TYPE_STORAGE_BUFFER, .visibility = LPZ_SHADER_STAGE_VERTEX},
+        {.binding_index = 1, .type = LPZ_BINDING_TYPE_TEXTURE,        .visibility = LPZ_SHADER_STAGE_FRAGMENT},
+        {.binding_index = 2, .type = LPZ_BINDING_TYPE_SAMPLER,        .visibility = LPZ_SHADER_STAGE_FRAGMENT},
+    };
+    app->sprite_bgl = app->api.device.CreateBindGroupLayout(
+        app->device, &(LpzBindGroupLayoutDesc){.entries = bgl_entries, .entry_count = 3});
+
+    LpzFormat sc_fmt = app->api.surface.GetFormat(app->surface);
+    LpzColorBlendState alpha = {
+        .blend_enable = true,
+        .src_color_factor = LPZ_BLEND_FACTOR_SRC_ALPHA,
+        .dst_color_factor = LPZ_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .color_blend_op   = LPZ_BLEND_OP_ADD,
+        .src_alpha_factor = LPZ_BLEND_FACTOR_ONE,
+        .dst_alpha_factor = LPZ_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .alpha_blend_op   = LPZ_BLEND_OP_ADD,
+        .write_mask       = LPZ_COLOR_COMPONENT_ALL,
+    };
+    app->api.device.CreateDepthStencilState(app->device,
+        &(LpzDepthStencilStateDesc){.depth_test_enable = false, .depth_write_enable = false,
+                                     .depth_compare_op = LPZ_COMPARE_OP_ALWAYS},
+        &app->sprite_ds);
+
+    LpzPipelineDesc pso = {
+        .vertex_shader           = svs,
+        .fragment_shader         = sfs,
+        .color_attachment_format = sc_fmt,
+        .depth_attachment_format = LPZ_FORMAT_UNDEFINED,
+        .sample_count            = 1,
+        .topology                = LPZ_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        .bind_group_layouts      = &app->sprite_bgl,
+        .bind_group_layout_count = 1,
+        .rasterizer_state        = {.cull_mode = LPZ_CULL_MODE_NONE},
+        .blend_state             = alpha,
+    };
+    bool pipeline_ok = (app->api.device.CreatePipeline(app->device, &pso, &app->sprite_pipeline) == LPZ_SUCCESS);
+    app->api.device.DestroyShader(svs);
+    app->api.device.DestroyShader(sfs);
+    if (pipeline_ok) {
+        app->sprite_pipeline_ready = true;
+        LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL, "LpzApp: sprite pipeline ready.");
     }
 }
 
@@ -1623,6 +1879,11 @@ LpzResult CreateContext(lpz_app_t app)
     // -- Default scene pipelines (if LoadShaders was called first) ------------
     lpz_build_default_pipelines(app);  // non-fatal; DrawMesh works without them
 
+    // -- Blend-mode + textured + sprite pipelines --------------------------
+    lpz_build_blend_pipelines(app);        // non-fatal
+    lpz_build_textured_pipeline(app);      // non-fatal
+    lpz_build_sprite_pipeline(app);        // non-fatal
+
     // -- Primitive pipelines (points + lines, same scene.metal source) --------
     lpz_build_prim_pipelines(app);          // non-fatal; DrawPoint/DrawLine won't render
     lpz_build_infinite_grid_pipeline(app);  // non-fatal; DrawInfiniteGrid won't render
@@ -1694,6 +1955,30 @@ void DestroyContext(lpz_app_t app)
     if (app->inst_buf)
         app->api.device.DestroyBuffer(app->inst_buf);
 
+    // Blend-mode pipeline cache (slot 0 = default_scene_pipeline, already freed below)
+    for (uint32_t _bi = 1; _bi < 4; _bi++)
+        if (app->blend_pipelines[_bi])
+            app->api.device.DestroyPipeline(app->blend_pipelines[_bi]);
+    // Textured mesh pipeline
+    if (app->textured_pipeline)
+        app->api.device.DestroyPipeline(app->textured_pipeline);
+    if (app->textured_bgl)
+        app->api.device.DestroyBindGroupLayout(app->textured_bgl);
+    // Sprite pipeline
+    if (app->sprite_pipeline)
+        app->api.device.DestroyPipeline(app->sprite_pipeline);
+    if (app->sprite_bgl)
+        app->api.device.DestroyBindGroupLayout(app->sprite_bgl);
+    if (app->sprite_ds)
+        app->api.device.DestroyDepthStencilState(app->sprite_ds);
+    if (app->sprite_buf) {
+        for (uint32_t _s = 0; _s < LPZ_MAX_FRAMES_IN_FLIGHT; _s++)
+            if (app->sprite_map_valid[_s])
+                app->api.device.UnmapMemory(app->device, app->sprite_buf, _s);
+        app->api.device.DestroyBuffer(app->sprite_buf);
+    }
+    if (app->sprite_bg) app->api.device.DestroyBindGroup(app->sprite_bg);
+    LPZ_FREE(app->sprite_cpu);
     // Default pipelines
     if (app->default_inst_pipeline)
         app->api.device.DestroyPipeline(app->default_inst_pipeline);
@@ -2011,6 +2296,14 @@ void EndDraw(lpz_app_t app)
     if (app->prim_line_count > 0)
         lpz_flush_lines(app, app->prim_mvp);
 
+    // Flush sprite batch
+    if (app->sprite_count > 0 && app->sprite_pipeline_ready)
+        lpz_flush_sprites(app);
+    // Reset sprite batch for next frame
+    app->sprite_count = 0;
+    app->sprite_frame_tex = NULL;
+    app->sprite_frame_sampler = NULL;
+
     // Flush text into the still-open main pass, before EndRenderPass.
     //
     // Previously text was rendered in a second overlay pass opened with
@@ -2272,68 +2565,138 @@ void DrawMeshInstanced(lpz_app_t app, const Mesh *mesh, const void *instance_dat
 // TEXTURE
 // ============================================================================
 
-lpz_texture_t LoadTexture(lpz_app_t app, const char *path)
+// Internal: shared texture upload used by LoadTexture and LoadCubemap.
+static lpz_texture_t lpz_upload_texture_from_memory(
+    struct LpzAppState *app, const void *pixels, int w, int h,
+    uint32_t mip_levels, LpzTextureType type, uint32_t array_layers,
+    uint32_t face_index, lpz_texture_t existing_tex)
 {
-    if (!app || !path)
-        return NULL;
-
-    LpzFileBlob blob = LpzIO_ReadFile(path);
-    if (!blob.data)
-    {
-        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_IO, LPZ_IO_ERROR, "LoadTexture: cannot read '%s'.", path);
-        return NULL;
-    }
-
-    int w = 0, h = 0, ch = 0;
-    unsigned char *px = stbi_load_from_memory((const unsigned char *)blob.data, (int)blob.size, &w, &h, &ch, 4);
-    LpzIO_FreeBlob(&blob);
-
-    if (!px)
-    {
-        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_IO, LPZ_IO_ERROR, "LoadTexture: stbi_load failed for '%s': %s", path, stbi_failure_reason());
-        return NULL;
-    }
-
-    lpz_texture_t tex = NULL;
-    LpzTextureDesc td = {
-        .width = (uint32_t)w,
-        .height = (uint32_t)h,
-        .sample_count = 1,
-        .mip_levels = 1,
-        .format = LPZ_FORMAT_RGBA8_UNORM,
-        .usage = LPZ_TEXTURE_USAGE_SAMPLED_BIT | LPZ_TEXTURE_USAGE_TRANSFER_DST_BIT,
-        .texture_type = LPZ_TEXTURE_TYPE_2D,
-    };
-    if (app->api.device.CreateTexture(app->device, &td, &tex) != LPZ_SUCCESS)
-    {
-        stbi_image_free(px);
-        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_DEVICE, LPZ_ALLOCATION_FAILED, "LoadTexture: CreateTexture failed for '%s'.", path);
-        return NULL;
-    }
-
     size_t bytes = (size_t)w * (size_t)h * 4;
+    uint32_t usage = LPZ_TEXTURE_USAGE_SAMPLED_BIT | LPZ_TEXTURE_USAGE_TRANSFER_DST_BIT;
+    if (mip_levels > 1)
+        usage |= LPZ_TEXTURE_USAGE_TRANSFER_SRC_BIT;
+
+    lpz_texture_t tex = existing_tex;
+    if (!tex) {
+        LpzTextureDesc td = {
+            .width = (uint32_t)w, .height = (uint32_t)h,
+            .depth = 1,
+            .array_layers = array_layers,
+            .sample_count = 1, .mip_levels = mip_levels,
+            .format = LPZ_FORMAT_RGBA8_UNORM,
+            .usage = usage, .texture_type = type,
+        };
+        if (app->api.device.CreateTexture(app->device, &td, &tex) != LPZ_SUCCESS)
+            return NULL;
+    }
+
     lpz_buffer_t stg = NULL;
     LpzBufferDesc bd = {.size = bytes, .usage = LPZ_BUFFER_USAGE_TRANSFER_SRC, .memory_usage = LPZ_MEMORY_USAGE_CPU_TO_GPU};
-    if (app->api.device.CreateBuffer(app->device, &bd, &stg) != LPZ_SUCCESS)
-    {
-        stbi_image_free(px);
-        app->api.device.DestroyTexture(tex);
-        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_DEVICE, LPZ_ALLOCATION_FAILED, "LoadTexture: staging buffer failed for '%s'.", path);
+    if (app->api.device.CreateBuffer(app->device, &bd, &stg) != LPZ_SUCCESS) {
+        if (!existing_tex) app->api.device.DestroyTexture(tex);
         return NULL;
     }
-
     void *m = app->api.device.MapMemory(app->device, stg, 0);
-    if (m)
-        memcpy(m, px, bytes);
+    if (m) memcpy(m, pixels, bytes);
     app->api.device.UnmapMemory(app->device, stg, 0);
-    stbi_image_free(px);
 
     app->api.renderer.BeginTransferPass(app->renderer);
-    app->api.renderer.CopyBufferToTexture(app->renderer, stg, 0, (uint32_t)(w * 4), tex, (uint32_t)w, (uint32_t)h);
+    if (face_index == 0 && array_layers == 1) {
+        // Standard 2D upload via CopyBufferToTexture
+        app->api.renderer.CopyBufferToTexture(app->renderer, stg, 0, (uint32_t)(w * 4), tex, (uint32_t)w, (uint32_t)h);
+    } else {
+        // Array / cubemap face upload via WriteTextureRegion
+        app->api.renderer.EndTransferPass(app->renderer);
+        app->api.device.WriteTextureRegion(app->device, tex, &(LpzTextureWriteDesc){
+            .mip_level = 0, .array_layer = face_index,
+            .x = 0, .y = 0, .width = (uint32_t)w, .height = (uint32_t)h,
+            .bytes_per_pixel = 4, .pixels = pixels,
+        });
+        app->api.renderer.BeginTransferPass(app->renderer);
+    }
+    if (mip_levels > 1)
+        app->api.renderer.GenerateMipmaps(app->renderer, tex);
     app->api.renderer.EndTransferPass(app->renderer);
     app->api.device.WaitIdle(app->device);
     app->api.device.DestroyBuffer(stg);
     return tex;
+}
+
+lpz_texture_t LoadTexture(lpz_app_t app, const char *path)
+{
+    if (!app || !path)
+        return NULL;
+    LpzFileBlob blob = LpzIO_ReadFile(path);
+    if (!blob.data) {
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_IO, LPZ_IO_ERROR, "LoadTexture: cannot read '%s'.", path);
+        return NULL;
+    }
+    int w = 0, h = 0, ch = 0;
+    unsigned char *px = stbi_load_from_memory((const unsigned char *)blob.data, (int)blob.size, &w, &h, &ch, 4);
+    LpzIO_FreeBlob(&blob);
+    if (!px) {
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_IO, LPZ_IO_ERROR, "LoadTexture: stbi_load failed for '%s': %s", path, stbi_failure_reason());
+        return NULL;
+    }
+    // Compute full mip chain
+    uint32_t dim = (uint32_t)(w > h ? w : h);
+    uint32_t mips = 1;
+    while (dim > 1) { dim >>= 1; mips++; }
+
+    lpz_texture_t tex = lpz_upload_texture_from_memory(app, px, w, h, mips, LPZ_TEXTURE_TYPE_2D, 1, 0, NULL);
+    stbi_image_free(px);
+    if (!tex)
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_DEVICE, LPZ_ALLOCATION_FAILED, "LoadTexture: upload failed for '%s'.", path);
+    return tex;
+}
+
+// ── LoadCubemap — load 6 face images (order: +X -X +Y -Y +Z -Z) ──────────────
+lpz_texture_t LoadCubemap(lpz_app_t app, const char *paths[6])
+{
+    if (!app || !paths) return NULL;
+
+    // Load all 6 faces first so we know dimensions
+    unsigned char *faces[6] = {0};
+    int w = 0, h = 0;
+    for (int i = 0; i < 6; i++) {
+        if (!paths[i]) {
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_IO, LPZ_IO_ERROR, "LoadCubemap: paths[%d] is NULL.", i);
+            goto fail;
+        }
+        LpzFileBlob blob = LpzIO_ReadFile(paths[i]);
+        if (!blob.data) {
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_IO, LPZ_IO_ERROR, "LoadCubemap: cannot read '%s'.", paths[i]);
+            goto fail;
+        }
+        int fw = 0, fh = 0, ch = 0;
+        faces[i] = stbi_load_from_memory((const unsigned char *)blob.data, (int)blob.size, &fw, &fh, &ch, 4);
+        LpzIO_FreeBlob(&blob);
+        if (!faces[i]) {
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_IO, LPZ_IO_ERROR, "LoadCubemap: stbi failed for '%s'.", paths[i]);
+            goto fail;
+        }
+        if (i == 0) { w = fw; h = fh; }
+        else if (fw != w || fh != h) {
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_IO, LPZ_IO_ERROR, "LoadCubemap: face %d size mismatch (%dx%d vs %dx%d).", i, fw, fh, w, h);
+            goto fail;
+        }
+    }
+
+    // Create cubemap texture (6 array layers)
+    uint32_t dim = (uint32_t)(w > h ? w : h);
+    uint32_t mips = 1; while (dim > 1) { dim >>= 1; mips++; }
+    lpz_texture_t tex = lpz_upload_texture_from_memory(app, faces[0], w, h, mips, LPZ_TEXTURE_TYPE_CUBE, 6, 0, NULL);
+    if (!tex) goto fail;
+    for (int i = 1; i < 6; i++) {
+        lpz_upload_texture_from_memory(app, faces[i], w, h, 1, LPZ_TEXTURE_TYPE_CUBE, 6, (uint32_t)i, tex);
+        stbi_image_free(faces[i]);
+    }
+    stbi_image_free(faces[0]);
+    return tex;
+
+fail:
+    for (int i = 0; i < 6; i++) if (faces[i]) stbi_image_free(faces[i]);
+    return NULL;
 }
 
 // ============================================================================
@@ -2633,6 +2996,513 @@ void DrawInfiniteGrid(lpz_app_t app, mat4 view_proj, float spacing)
                  .thickness = 2.0f,
                  .flags = LPZ_GRID_INFINITE,
              });
+}
+
+
+// ============================================================================
+// BLEND MODE
+// ============================================================================
+
+void SetBlendMode(lpz_app_t app, LpzBlendMode mode)
+{
+    if (!app || !app->default_pipeline_ready)
+        return;
+    uint32_t idx = (uint32_t)mode;
+    if (idx > 3) idx = 0;
+    app->active_blend_mode = idx;
+    lpz_pipeline_t pipe = app->blend_pipelines[idx];
+    if (pipe) {
+        app->api.renderer.BindPipeline(app->renderer, pipe);
+        app->api.renderer.BindDepthStencilState(app->renderer, app->default_scene_ds);
+    }
+}
+
+// ============================================================================
+// TEXTURED MESH RENDERING
+// ============================================================================
+
+// Per-call bind group for textured mesh: created lazily, destroyed after draw.
+// For performance-critical rendering users should manage their own bind groups.
+void DrawMeshTextured(lpz_app_t app, const Mesh *mesh, lpz_texture_t texture, lpz_sampler_t sampler)
+{
+    if (!app || !mesh || !mesh->vb || !mesh->ib || !texture || !sampler)
+        return;
+    if (!app->textured_pipeline_ready) {
+        LPZ_LOG_WARNING(LPZ_LOG_CATEGORY_RENDERER,
+            "DrawMeshTextured: textured pipeline not ready. "
+            "(scene.metal / scene.vert.spv must expose a texture binding at slot 1.)");
+        return;
+    }
+
+    // Build a per-call bind group: SSBO=NULL (use inst_buf if available), tex, sampler
+    // We build a minimal 2-entry BG (texture + sampler) when no SSBO needed.
+    LpzBindGroupEntry bg_entries[3];
+    uint32_t bg_count = 0;
+
+    // Slot 0: dummy SSBO — use the inst_buf if we have one, else skip.
+    // The textured shader reads instance transforms from binding 0; if no SSBO
+    // is bound the shader must use push constants / vertex attributes instead.
+    // For the easy API we always provide one instance transform via the SSBO.
+    if (app->inst_buf) {
+        bg_entries[bg_count++] = (LpzBindGroupEntry){.binding_index = 0, .buffer = app->inst_buf};
+    }
+    bg_entries[bg_count++] = (LpzBindGroupEntry){.binding_index = 1, .texture = texture};
+    bg_entries[bg_count++] = (LpzBindGroupEntry){.binding_index = 2, .sampler = sampler};
+
+    lpz_bind_group_t bg = app->api.device.CreateBindGroup(app->device,
+        &(LpzBindGroupDesc){.layout = app->textured_bgl, .entries = bg_entries, .entry_count = bg_count});
+    if (!bg) return;
+
+    app->api.renderer.BindPipeline(app->renderer, app->textured_pipeline);
+    app->api.renderer.BindDepthStencilState(app->renderer, app->default_scene_ds);
+    app->api.renderer.BindBindGroup(app->renderer, 0, bg, NULL, 0);
+    uint64_t off = 0;
+    app->api.renderer.BindVertexBuffers(app->renderer, 0, 1, &mesh->vb, &off);
+    app->api.renderer.BindIndexBuffer(app->renderer, mesh->ib, 0, mesh->index_type);
+    app->api.renderer.DrawIndexed(app->renderer, mesh->index_count, 1, 0, 0, 0);
+
+    // Deferred destroy: the bind group references the texture; destroy after frame.
+    // For now we accept the small driver overhead of an immediate destroy.
+    // TODO: queue for deferred destruction once that API is exposed to lpz.c.
+    app->api.device.WaitIdle(app->device);
+    app->api.device.DestroyBindGroup(bg);
+}
+
+// ============================================================================
+// SPRITE DRAWING
+// ============================================================================
+
+// Internal flush — called from EndDraw
+static void lpz_flush_sprites(struct LpzAppState *app)
+{
+    if (!app->sprite_count || !app->sprite_pipeline_ready)
+        return;
+    if (!app->sprite_frame_tex || !app->sprite_frame_sampler)
+        return;
+
+    uint32_t count = app->sprite_count;
+
+    // Grow GPU SSBO if needed
+    bool stale = (!app->sprite_buf || app->sprite_buf_cap < count);
+    if (stale) {
+        if (app->sprite_bg) { app->api.device.DestroyBindGroup(app->sprite_bg); app->sprite_bg = NULL; }
+        if (app->sprite_buf) {
+            for (uint32_t s = 0; s < LPZ_MAX_FRAMES_IN_FLIGHT; s++)
+                if (app->sprite_map_valid[s]) { app->api.device.UnmapMemory(app->device, app->sprite_buf, s); }
+            app->api.device.DestroyBuffer(app->sprite_buf); app->sprite_buf = NULL;
+        }
+        memset(app->sprite_map_valid, 0, sizeof(app->sprite_map_valid));
+        uint32_t cap = count > 1u ? 1u << (32u - (uint32_t)__builtin_clz(count - 1u)) : 1u;
+        if (cap < 64u) cap = 64u;
+        LpzBufferDesc bd = {
+            .size = (size_t)cap * sizeof(LpzSpriteInstance) * LPZ_MAX_FRAMES_IN_FLIGHT,
+            .usage = LPZ_BUFFER_USAGE_STORAGE_BIT,
+            .memory_usage = LPZ_MEMORY_USAGE_CPU_TO_GPU,
+            .ring_buffered = true,
+        };
+        if (app->api.device.CreateBuffer(app->device, &bd, &app->sprite_buf) != LPZ_SUCCESS) return;
+        app->sprite_buf_cap = cap;
+    }
+
+    // Persistent slot map
+    uint32_t slot = app->current_frame_index;
+    if (LAPIZ_UNLIKELY(!app->sprite_map_valid[slot])) {
+        app->sprite_mapped[slot] = app->api.device.MapMemory(app->device, app->sprite_buf, slot);
+        app->sprite_map_valid[slot] = (app->sprite_mapped[slot] != NULL);
+    }
+    if (app->sprite_mapped[slot])
+        memcpy(app->sprite_mapped[slot], app->sprite_cpu, count * sizeof(LpzSpriteInstance));
+
+    // Rebuild bind group when texture/sampler or buffer changed
+    bool bg_stale = stale
+        || !app->sprite_bg
+        || app->sprite_bg_tex     != app->sprite_frame_tex
+        || app->sprite_bg_sampler != app->sprite_frame_sampler;
+    if (bg_stale) {
+        if (app->sprite_bg) app->api.device.DestroyBindGroup(app->sprite_bg);
+        LpzBindGroupEntry bge[3] = {
+            {.binding_index = 0, .buffer  = app->sprite_buf},
+            {.binding_index = 1, .texture = app->sprite_frame_tex},
+            {.binding_index = 2, .sampler = app->sprite_frame_sampler},
+        };
+        app->sprite_bg = app->api.device.CreateBindGroup(app->device,
+            &(LpzBindGroupDesc){.layout = app->sprite_bgl, .entries = bge, .entry_count = 3});
+        app->sprite_bg_tex     = app->sprite_frame_tex;
+        app->sprite_bg_sampler = app->sprite_frame_sampler;
+    }
+    if (!app->sprite_bg) return;
+
+    app->api.renderer.BindPipeline(app->renderer, app->sprite_pipeline);
+    app->api.renderer.BindDepthStencilState(app->renderer, app->sprite_ds);
+    app->api.renderer.BindBindGroup(app->renderer, 0, app->sprite_bg, NULL, 0);
+    app->api.renderer.Draw(app->renderer, 6, count, 0, 0);
+}
+
+void DrawSprite(lpz_app_t app, lpz_texture_t texture, lpz_sampler_t sampler,
+                float x, float y, float w, float h, vec4 color)
+{
+    if (!app || !texture || !sampler || !app->sprite_pipeline_ready)
+        return;
+
+    // Grow CPU buffer
+    if (app->sprite_count >= app->sprite_cap_cpu) {
+        uint32_t new_cap = app->sprite_cap_cpu ? app->sprite_cap_cpu * 2u : 64u;
+        LpzSpriteInstance *tmp = (LpzSpriteInstance *)realloc(app->sprite_cpu,
+                                                               new_cap * sizeof(LpzSpriteInstance));
+        if (!tmp) return;
+        app->sprite_cpu    = tmp;
+        app->sprite_cap_cpu = new_cap;
+    }
+
+    // When texture changes mid-frame, flush the previous batch immediately.
+    // Simple implementation: one texture per frame. Multi-texture requires
+    // explicit batching by the caller.
+    if (app->sprite_frame_tex && app->sprite_frame_tex != texture) {
+        lpz_flush_sprites(app);
+        app->sprite_count = 0;
+    }
+    app->sprite_frame_tex     = texture;
+    app->sprite_frame_sampler = sampler;
+
+    LpzSpriteInstance *inst = &app->sprite_cpu[app->sprite_count++];
+    *inst = (LpzSpriteInstance){
+        .x = x, .y = y, .w = w, .h = h,
+        .u = 0.0f, .v = 0.0f, .uw = 1.0f, .vh = 1.0f,
+        .r = color[0], .g = color[1], .b = color[2], .a = color[3],
+        .screen_w = (float)app->fb_width, .screen_h = (float)app->fb_height,
+    };
+}
+
+void DrawSpriteRect(lpz_app_t app, lpz_texture_t texture, lpz_sampler_t sampler,
+                    float x, float y, float w, float h,
+                    float u, float v, float uw, float vh,
+                    vec4 color)
+{
+    if (!app || !texture || !sampler || !app->sprite_pipeline_ready)
+        return;
+
+    if (app->sprite_count >= app->sprite_cap_cpu) {
+        uint32_t new_cap = app->sprite_cap_cpu ? app->sprite_cap_cpu * 2u : 64u;
+        LpzSpriteInstance *tmp = (LpzSpriteInstance *)realloc(app->sprite_cpu,
+                                                               new_cap * sizeof(LpzSpriteInstance));
+        if (!tmp) return;
+        app->sprite_cpu     = tmp;
+        app->sprite_cap_cpu = new_cap;
+    }
+
+    if (app->sprite_frame_tex && app->sprite_frame_tex != texture) {
+        lpz_flush_sprites(app);
+        app->sprite_count = 0;
+    }
+    app->sprite_frame_tex     = texture;
+    app->sprite_frame_sampler = sampler;
+
+    LpzSpriteInstance *inst = &app->sprite_cpu[app->sprite_count++];
+    *inst = (LpzSpriteInstance){
+        .x = x, .y = y, .w = w, .h = h,
+        .u = u, .v = v, .uw = uw, .vh = vh,
+        .r = color[0], .g = color[1], .b = color[2], .a = color[3],
+        .screen_w = (float)app->fb_width, .screen_h = (float)app->fb_height,
+    };
+}
+
+// ============================================================================
+// RENDER TO TEXTURE
+// ============================================================================
+
+LpzResult CreateRenderTarget(lpz_app_t app, uint32_t width, uint32_t height,
+                              LpzFormat color_format, bool with_depth,
+                              LpzRenderTarget *out)
+{
+    if (!app || !out || !width || !height)
+        return LPZ_INVALID_ARGUMENT;
+
+    memset(out, 0, sizeof(*out));
+    out->width        = width;
+    out->height       = height;
+    out->color_format = color_format != LPZ_FORMAT_UNDEFINED ? color_format : LPZ_FORMAT_RGBA8_UNORM;
+    out->has_depth    = with_depth;
+
+    // Color attachment
+    LpzTextureDesc ct = {
+        .width = width, .height = height, .depth = 1, .array_layers = 1,
+        .sample_count = 1, .mip_levels = 1,
+        .format = out->color_format,
+        .usage  = LPZ_TEXTURE_USAGE_COLOR_ATTACHMENT_BIT
+                | LPZ_TEXTURE_USAGE_SAMPLED_BIT
+                | LPZ_TEXTURE_USAGE_TRANSFER_SRC_BIT,
+        .texture_type = LPZ_TEXTURE_TYPE_2D,
+    };
+    if (app->api.device.CreateTexture(app->device, &ct, &out->color_texture) != LPZ_SUCCESS) {
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_DEVICE, LPZ_ALLOCATION_FAILED,
+                      "CreateRenderTarget: color texture failed (%ux%u).", width, height);
+        return LPZ_ALLOCATION_FAILED;
+    }
+
+    // Depth attachment (optional)
+    if (with_depth) {
+        LpzTextureDesc dt = {
+            .width = width, .height = height, .depth = 1, .array_layers = 1,
+            .sample_count = 1, .mip_levels = 1,
+            .format = LPZ_FORMAT_DEPTH32_FLOAT,
+            .usage  = LPZ_TEXTURE_USAGE_DEPTH_ATTACHMENT_BIT,
+            .texture_type = LPZ_TEXTURE_TYPE_2D,
+        };
+        if (app->api.device.CreateTexture(app->device, &dt, &out->depth_texture) != LPZ_SUCCESS) {
+            app->api.device.DestroyTexture(out->color_texture);
+            out->color_texture = NULL;
+            LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_DEVICE, LPZ_ALLOCATION_FAILED,
+                          "CreateRenderTarget: depth texture failed (%ux%u).", width, height);
+            return LPZ_ALLOCATION_FAILED;
+        }
+    }
+
+    LPZ_LOG_INFO(LPZ_LOG_CATEGORY_GENERAL,
+                 "LpzApp: render target created (%ux%u, depth=%d).", width, height, with_depth);
+    return LPZ_SUCCESS;
+}
+
+void DestroyRenderTarget(lpz_app_t app, LpzRenderTarget *rt)
+{
+    if (!app || !rt) return;
+    if (rt->depth_texture) {
+        app->api.device.DestroyTexture(rt->depth_texture);
+        rt->depth_texture = NULL;
+    }
+    if (rt->color_texture) {
+        app->api.device.DestroyTexture(rt->color_texture);
+        rt->color_texture = NULL;
+    }
+    memset(rt, 0, sizeof(*rt));
+}
+
+void BeginRenderTarget(lpz_app_t app, const LpzRenderTarget *rt, Color clear_color)
+{
+    if (!app || !rt || !rt->color_texture) return;
+    if (app->in_render_target) {
+        LPZ_LOG_WARNING(LPZ_LOG_CATEGORY_RENDERER,
+            "BeginRenderTarget: already inside a render target — nested targets are not supported.");
+        return;
+    }
+    // End the current default pass before opening the off-screen one
+    app->api.renderer.EndRenderPass(app->renderer);
+
+    LpzColorAttachment ca = {
+        .texture    = rt->color_texture,
+        .load_op    = LPZ_LOAD_OP_CLEAR,
+        .store_op   = LPZ_STORE_OP_STORE,
+        .clear_color = clear_color,
+    };
+    LpzDepthAttachment da = {
+        .texture     = rt->depth_texture,
+        .load_op     = LPZ_LOAD_OP_CLEAR,
+        .store_op    = LPZ_STORE_OP_DONT_CARE,
+        .clear_depth = 1.0f,
+    };
+    LpzRenderPassDesc pass = {
+        .color_attachments      = &ca,
+        .color_attachment_count = 1,
+        .depth_attachment       = rt->has_depth ? &da : NULL,
+    };
+    app->api.renderer.BeginRenderPass(app->renderer, &pass);
+    app->api.renderer.SetViewport(app->renderer, 0, 0,
+                                   (float)rt->width, (float)rt->height, 0.0f, 1.0f);
+    app->api.renderer.SetScissor(app->renderer, 0, 0, rt->width, rt->height);
+    app->in_render_target = true;
+}
+
+void EndRenderTarget(lpz_app_t app)
+{
+    if (!app || !app->in_render_target) return;
+    app->api.renderer.EndRenderPass(app->renderer);
+    app->in_render_target = false;
+
+    // Re-open the main swapchain pass so the user can continue drawing to screen
+    lpz_begin_default_pass(app);
+    if (app->default_pipeline_ready) {
+        lpz_pipeline_t pipe = app->blend_pipelines[app->active_blend_mode];
+        if (!pipe) pipe = app->default_scene_pipeline;
+        app->api.renderer.BindPipeline(app->renderer, pipe);
+        app->api.renderer.BindDepthStencilState(app->renderer, app->default_scene_ds);
+    }
+}
+
+// ============================================================================
+// GPU READBACK
+// ============================================================================
+
+LpzResult ReadbackTexture(lpz_app_t app, lpz_texture_t texture,
+                           uint32_t width, uint32_t height,
+                           void **out_pixels, size_t *out_size)
+{
+    if (!app || !texture || !width || !height || !out_pixels || !out_size)
+        return LPZ_INVALID_ARGUMENT;
+
+    size_t bytes = (size_t)width * height * 4;  // assumes RGBA8
+    lpz_buffer_t stg = NULL;
+    LpzBufferDesc bd = {
+        .size = bytes,
+        .usage = LPZ_BUFFER_USAGE_TRANSFER_DST,
+        .memory_usage = LPZ_MEMORY_USAGE_GPU_TO_CPU,
+    };
+    if (app->api.device.CreateBuffer(app->device, &bd, &stg) != LPZ_SUCCESS) {
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_DEVICE, LPZ_ALLOCATION_FAILED,
+                      "ReadbackTexture: staging buffer failed.");
+        return LPZ_ALLOCATION_FAILED;
+    }
+
+    // ReadTexture schedules a copy on the device; WaitIdle ensures completion.
+    app->api.device.ReadTexture(app->device, texture, 0, 0, stg);
+    app->api.device.WaitIdle(app->device);
+
+    void *mapped = app->api.device.MapMemory(app->device, stg, 0);
+    if (!mapped) {
+        app->api.device.DestroyBuffer(stg);
+        return LPZ_FAILURE;
+    }
+
+    void *buf = malloc(bytes);
+    if (!buf) {
+        app->api.device.UnmapMemory(app->device, stg, 0);
+        app->api.device.DestroyBuffer(stg);
+        return LPZ_OUT_OF_MEMORY;
+    }
+    memcpy(buf, mapped, bytes);
+    app->api.device.UnmapMemory(app->device, stg, 0);
+    app->api.device.DestroyBuffer(stg);
+
+    *out_pixels = buf;
+    *out_size   = bytes;
+    return LPZ_SUCCESS;
+}
+
+LpzResult ReadbackBuffer(lpz_app_t app, lpz_buffer_t buffer,
+                          size_t byte_count,
+                          void **out_data, size_t *out_size)
+{
+    if (!app || !buffer || !byte_count || !out_data || !out_size)
+        return LPZ_INVALID_ARGUMENT;
+
+    lpz_buffer_t stg = NULL;
+    LpzBufferDesc bd = {
+        .size = byte_count,
+        .usage = LPZ_BUFFER_USAGE_TRANSFER_DST,
+        .memory_usage = LPZ_MEMORY_USAGE_GPU_TO_CPU,
+    };
+    if (app->api.device.CreateBuffer(app->device, &bd, &stg) != LPZ_SUCCESS) {
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_DEVICE, LPZ_ALLOCATION_FAILED,
+                      "ReadbackBuffer: staging buffer failed.");
+        return LPZ_ALLOCATION_FAILED;
+    }
+
+    app->api.renderer.BeginTransferPass(app->renderer);
+    app->api.renderer.CopyBufferToBuffer(app->renderer, buffer, 0, stg, 0, byte_count);
+    app->api.renderer.EndTransferPass(app->renderer);
+    app->api.device.WaitIdle(app->device);
+
+    void *mapped = app->api.device.MapMemory(app->device, stg, 0);
+    if (!mapped) {
+        app->api.device.DestroyBuffer(stg);
+        return LPZ_FAILURE;
+    }
+    void *buf = malloc(byte_count);
+    if (!buf) {
+        app->api.device.UnmapMemory(app->device, stg, 0);
+        app->api.device.DestroyBuffer(stg);
+        return LPZ_OUT_OF_MEMORY;
+    }
+    memcpy(buf, mapped, byte_count);
+    app->api.device.UnmapMemory(app->device, stg, 0);
+    app->api.device.DestroyBuffer(stg);
+    *out_data = buf;
+    *out_size = byte_count;
+    return LPZ_SUCCESS;
+}
+
+// ============================================================================
+// BUFFER SUBALLOCATOR  (LpzArena)
+// ============================================================================
+
+LpzResult LpzArenaCreate(lpz_app_t app, size_t capacity,
+                          LpzBufferUsage usage, LpzMemoryUsage memory_usage,
+                          LpzArena *out)
+{
+    if (!app || !out || !capacity)
+        return LPZ_INVALID_ARGUMENT;
+    memset(out, 0, sizeof(*out));
+
+    LpzBufferDesc bd = {
+        .size         = capacity,
+        .usage        = usage,
+        .memory_usage = memory_usage,
+    };
+    LpzResult r = app->api.device.CreateBuffer(app->device, &bd, &out->buffer);
+    if (r != LPZ_SUCCESS) {
+        LPZ_LOG_ERROR(LPZ_LOG_CATEGORY_MEMORY, r,
+                      "LpzArenaCreate: buffer allocation failed (%zu bytes).", capacity);
+        return r;
+    }
+    out->capacity = capacity;
+    out->used     = 0;
+
+    // Map immediately for CPU-writable arenas
+    if (memory_usage == LPZ_MEMORY_USAGE_CPU_TO_GPU) {
+        out->mapped = app->api.device.MapMemory(app->device, out->buffer, 0);
+    }
+
+    LPZ_LOG_INFO(LPZ_LOG_CATEGORY_MEMORY,
+                 "LpzArena: created %zu-byte arena (usage=%u).", capacity, usage);
+    return LPZ_SUCCESS;
+}
+
+LpzArenaAlloc LpzArenaAlloc_(LpzArena *arena, size_t size, size_t alignment)
+{
+    LpzArenaAlloc result = {0};
+    if (!arena || !size || !arena->buffer) return result;
+    if (alignment < 1) alignment = 16;
+
+    // Round up current offset to alignment
+    size_t aligned_off = (arena->used + alignment - 1u) & ~(alignment - 1u);
+    if (aligned_off + size > arena->capacity) {
+        LPZ_LOG_WARNING(LPZ_LOG_CATEGORY_MEMORY,
+            "LpzArena: out of space (need %zu, have %zu, used %zu).",
+            size, arena->capacity, arena->used);
+        return result;
+    }
+    result.buffer = arena->buffer;
+    result.offset = (uint64_t)aligned_off;
+    result.size   = size;
+    if (arena->mapped)
+        result.ptr = (uint8_t *)arena->mapped + aligned_off;
+    arena->used = aligned_off + size;
+    return result;
+}
+
+void LpzArenaReset(LpzArena *arena)
+{
+    if (arena) arena->used = 0;
+}
+
+void LpzArenaDestroy(lpz_app_t app, LpzArena *arena)
+{
+    if (!app || !arena || !arena->buffer) return;
+    if (arena->mapped)
+        app->api.device.UnmapMemory(app->device, arena->buffer, 0);
+    app->api.device.DestroyBuffer(arena->buffer);
+    memset(arena, 0, sizeof(*arena));
+}
+
+// ============================================================================
+// GLTF LOADING
+// ============================================================================
+
+// LoadGLTF loads a glTF 2.0 file (binary .glb or text .gltf) and returns one
+// Mesh per aiMesh node in the scene.  Materials, textures, and animations in
+// the glTF are not parsed — geometry only.  This is a thin wrapper over
+// LoadScene which already uses Assimp (glTF 2.0 is natively supported).
+bool LoadGLTF(const char *path, LpzLoadFlags flags, Mesh *out_meshes, uint32_t *out_count)
+{
+    return LoadScene(path, flags, out_meshes, out_count);
 }
 
 // ============================================================================

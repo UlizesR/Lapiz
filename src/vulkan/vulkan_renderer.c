@@ -836,6 +836,19 @@ static void lpz_vk_renderer_bind_depth_stencil_state(lpz_renderer_t renderer, lp
         g_vkCmdSetDepthWriteEnable(renderer->currentCmd, state->depth_write_enable);
     if (g_vkCmdSetDepthCompareOp)
         g_vkCmdSetDepthCompareOp(renderer->currentCmd, state->depth_compare_op);
+    if (g_vkCmdSetStencilTestEnable)
+        g_vkCmdSetStencilTestEnable(renderer->currentCmd, state->stencil_test_enable);
+    if (state->stencil_test_enable && g_vkCmdSetStencilOp) {
+        g_vkCmdSetStencilOp(renderer->currentCmd, VK_STENCIL_FACE_FRONT_BIT,
+            state->front.failOp, state->front.passOp, state->front.depthFailOp, state->front.compareOp);
+        g_vkCmdSetStencilOp(renderer->currentCmd, VK_STENCIL_FACE_BACK_BIT,
+            state->back.failOp, state->back.passOp, state->back.depthFailOp, state->back.compareOp);
+    }
+    if (state->stencil_test_enable && g_vkCmdSetStencilCompareMask)
+        g_vkCmdSetStencilCompareMask(renderer->currentCmd, VK_STENCIL_FACE_FRONT_AND_BACK, state->stencil_read_mask);
+    if (state->stencil_test_enable && g_vkCmdSetStencilWriteMask)
+        g_vkCmdSetStencilWriteMask(renderer->currentCmd, VK_STENCIL_FACE_FRONT_AND_BACK, state->stencil_write_mask);
+    vkCmdSetStencilReference(renderer->currentCmd, VK_STENCIL_FACE_FRONT_AND_BACK, state->stencil_reference);
 }
 
 static void lpz_vk_renderer_bind_compute_pipeline(lpz_renderer_t renderer, lpz_compute_pipeline_t pipeline)

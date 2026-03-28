@@ -130,6 +130,7 @@ set(LAPIZ_SOURCES
     src/io.c
     src/lpz.c
     src/log.c
+    src/geometry.c
 )
 set(LAPIZ_LIBS glfw cglm assimp)
 

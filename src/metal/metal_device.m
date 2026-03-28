@@ -781,6 +781,22 @@ static lpz_shader_t lpz_device_create_specialized_shader(lpz_device_t device, co
 // DEPTH / STENCIL STATE
 // ============================================================================
 
+
+LAPIZ_INLINE MTLStencilOperation LpzToMetalStencilOp(LpzStencilOp op)
+{
+    switch (op) {
+        case LPZ_STENCIL_OP_ZERO:                  return MTLStencilOperationZero;
+        case LPZ_STENCIL_OP_REPLACE:               return MTLStencilOperationReplace;
+        case LPZ_STENCIL_OP_INCREMENT_AND_CLAMP:   return MTLStencilOperationIncrementClamp;
+        case LPZ_STENCIL_OP_DECREMENT_AND_CLAMP:   return MTLStencilOperationDecrementClamp;
+        case LPZ_STENCIL_OP_INVERT:                return MTLStencilOperationInvert;
+        case LPZ_STENCIL_OP_INCREMENT_AND_WRAP:    return MTLStencilOperationIncrementWrap;
+        case LPZ_STENCIL_OP_DECREMENT_AND_WRAP:    return MTLStencilOperationDecrementWrap;
+        case LPZ_STENCIL_OP_KEEP:
+        default:                                    return MTLStencilOperationKeep;
+    }
+}
+
 static LpzResult lpz_device_create_depth_stencil_state(lpz_device_t device, const LpzDepthStencilStateDesc *desc, lpz_depth_stencil_state_t *out_state)
 {
     if (!out_state)
@@ -793,6 +809,28 @@ static LpzResult lpz_device_create_depth_stencil_state(lpz_device_t device, cons
 
     dsDesc.depthCompareFunction = desc->depth_test_enable ? LpzToMetalCompareOp(desc->depth_compare_op) : MTLCompareFunctionAlways;
     dsDesc.depthWriteEnabled = desc->depth_write_enable;
+
+    if (desc->stencil_test_enable) {
+        MTLStencilDescriptor *front = [[MTLStencilDescriptor alloc] init];
+        front.stencilFailureOperation   = LpzToMetalStencilOp(desc->front.fail_op);
+        front.depthFailureOperation     = LpzToMetalStencilOp(desc->front.depth_fail_op);
+        front.depthStencilPassOperation = LpzToMetalStencilOp(desc->front.pass_op);
+        front.stencilCompareFunction    = LpzToMetalCompareOp(desc->front.compare_op);
+        front.readMask                  = desc->stencil_read_mask;
+        front.writeMask                 = desc->stencil_write_mask;
+        dsDesc.frontFaceStencil         = front;
+        [front release];
+
+        MTLStencilDescriptor *back = [[MTLStencilDescriptor alloc] init];
+        back.stencilFailureOperation    = LpzToMetalStencilOp(desc->back.fail_op);
+        back.depthFailureOperation      = LpzToMetalStencilOp(desc->back.depth_fail_op);
+        back.depthStencilPassOperation  = LpzToMetalStencilOp(desc->back.pass_op);
+        back.stencilCompareFunction     = LpzToMetalCompareOp(desc->back.compare_op);
+        back.readMask                   = desc->stencil_read_mask;
+        back.writeMask                  = desc->stencil_write_mask;
+        dsDesc.backFaceStencil          = back;
+        [back release];
+    }
 
     ds->state = [device->device newDepthStencilStateWithDescriptor:dsDesc];
     [dsDesc release];

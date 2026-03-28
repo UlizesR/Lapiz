@@ -680,6 +680,68 @@ void PopDebugLabel(lpz_app_t app);
 // internally, then override individual fields before passing to CreatePipeline.
 // ============================================================================
 
+
+// ============================================================================
+// BLEND MODE
+// ============================================================================
+
+typedef enum LpzBlendMode {
+    LPZ_BLEND_OPAQUE       = 0,  // no blending (default)
+    LPZ_BLEND_ALPHA        = 1,  // standard alpha blend (src_alpha / 1-src_alpha)
+    LPZ_BLEND_ADDITIVE     = 2,  // additive glow / particles
+    LPZ_BLEND_PREMULTIPLIED = 3, // pre-multiplied alpha (UI textures)
+} LpzBlendMode;
+
+
+// ============================================================================
+// RENDER TARGET  (off-screen render-to-texture)
+// ============================================================================
+
+typedef struct LpzRenderTarget {
+    lpz_texture_t color_texture;  // RGBA render output — bind as sampled texture
+    lpz_texture_t depth_texture;  // NULL when with_depth=false
+    uint32_t      width;
+    uint32_t      height;
+    LpzFormat     color_format;
+    bool          has_depth;
+} LpzRenderTarget;
+
+
+// ============================================================================
+// BUFFER SUBALLOCATOR  (LpzArena)
+//
+// A linear bump allocator backed by a single GPU buffer.  Useful for packing
+// many small meshes, constant data, or per-frame compute arguments into one
+// allocation without individual CreateBuffer calls.
+//
+// Usage:
+//   LpzArena arena;
+//   LpzArenaCreate(app, 4 * 1024 * 1024,
+//       LPZ_BUFFER_USAGE_VERTEX_BIT | LPZ_BUFFER_USAGE_INDEX_BIT,
+//       LPZ_MEMORY_USAGE_CPU_TO_GPU, &arena);
+//
+//   LpzArenaAlloc verts = LpzArenaAlloc_(&arena, vertex_bytes, 16);
+//   memcpy(verts.ptr, my_verts, vertex_bytes);
+//   api->renderer.BindVertexBuffers(r, 0, 1, &verts.buffer, &verts.offset);
+//
+//   LpzArenaReset(&arena);  // rewind at frame start (discard all suballocs)
+//   LpzArenaDestroy(app, &arena);
+// ============================================================================
+
+typedef struct LpzArena {
+    lpz_buffer_t buffer;    // backing GPU buffer
+    size_t       capacity;  // total bytes
+    size_t       used;      // current bump offset
+    void        *mapped;    // non-NULL for CPU_TO_GPU arenas
+} LpzArena;
+
+typedef struct LpzArenaAlloc {
+    lpz_buffer_t buffer;    // same as arena->buffer
+    uint64_t     offset;    // byte offset within buffer
+    size_t       size;      // bytes allocated
+    void        *ptr;       // CPU pointer (NULL for GPU-only arenas)
+} LpzArenaAlloc;
+
 LAPIZ_INLINE void LpzFillDefaultMeshPipelineDesc(LpzPipelineDesc *pso, LpzDepthStencilStateDesc *ds, LpzFormat color_fmt, LpzFormat depth_fmt, lpz_shader_t vs, lpz_shader_t fs, const LpzVertexBindingDesc *binding, const LpzVertexAttributeDesc *attrs, uint32_t attr_count)
 {
     *pso = (LpzPipelineDesc){
@@ -737,6 +799,202 @@ LAPIZ_INLINE void LpzFillDefaultTextPipelineDesc(LpzPipelineDesc *pso, LpzDepthS
         .depth_compare_op = LPZ_COMPARE_OP_ALWAYS,
     };
 }
+
+
+// ============================================================================
+// BLEND MODE
+// ============================================================================
+
+/*
+ * SetBlendMode — switch the active mesh pipeline to the given blend mode.
+ * Call between BeginDraw and EndDraw; takes effect on the next DrawMesh call.
+ * Defaults to LPZ_BLEND_OPAQUE at BeginDraw.
+ */
+void SetBlendMode(lpz_app_t app, LpzBlendMode mode);
+
+// ============================================================================
+// TEXTURED MESH RENDERING
+// ============================================================================
+
+/*
+ * DrawMeshTextured — draw a mesh with a sampled texture.
+ * The texture is bound at set 0, binding 1; the sampler at binding 2.
+ * An SSBO carrying per-instance transforms is bound at binding 0.
+ * Requires LoadDefaultShaders + CreateContext.
+ *
+ * For best performance, pre-create a sampler (e.g. with CreateSampler) and
+ * reuse it across frames.  The bind group is rebuilt internally each call.
+ *
+ * Release texture with: GetAPI(app)->device.DestroyTexture(tex);
+ * Release sampler with:  GetAPI(app)->device.DestroySampler(smp);
+ */
+void DrawMeshTextured(lpz_app_t app, const Mesh *mesh,
+                      lpz_texture_t texture, lpz_sampler_t sampler);
+
+// ============================================================================
+// CUBEMAP LOADING
+// ============================================================================
+
+/*
+ * LoadCubemap — load 6 face images and upload as a GPU cube texture.
+ *
+ * paths[6] must be provided in +X -X +Y -Y +Z -Z order.
+ * All faces must be the same size.  Returns NULL on failure.
+ * Release with: GetAPI(app)->device.DestroyTexture(tex);
+ */
+lpz_texture_t LoadCubemap(lpz_app_t app, const char *paths[6]);
+
+// ============================================================================
+// SPRITE / 2D DRAWING
+// ============================================================================
+
+/*
+ * DrawSprite — draw a screen-space sprite quad.
+ *
+ *   texture  GPU texture to sample (e.g. from LoadTexture)
+ *   sampler  sampler to use (bilinear recommended for sprites)
+ *   x, y     top-left position in screen pixels (origin top-left, +Y down)
+ *   w, h     size in screen pixels
+ *   color    linear RGBA tint multiplied with the texture sample
+ *
+ * Sprites are batched per frame and flushed in a single instanced draw call
+ * inside EndDraw.  They always render after 3D geometry and before text.
+ * Requires sprite.metal / sprite.vert.spv + sprite.frag.spv at shader search path.
+ */
+void DrawSprite(lpz_app_t app, lpz_texture_t texture, lpz_sampler_t sampler,
+                float x, float y, float w, float h, vec4 color);
+
+/*
+ * DrawSpriteRect — draw a sprite with a sub-region UV rect (sprite atlas).
+ *
+ *   u, v     UV origin of the sub-region within the texture [0, 1]
+ *   uw, vh   UV extent of the sub-region [0, 1]
+ */
+void DrawSpriteRect(lpz_app_t app, lpz_texture_t texture, lpz_sampler_t sampler,
+                    float x, float y, float w, float h,
+                    float u, float v, float uw, float vh,
+                    vec4 color);
+
+// ============================================================================
+// RENDER TO TEXTURE
+// ============================================================================
+
+/*
+ * CreateRenderTarget — allocate a color (and optionally depth) texture pair
+ * suitable for off-screen rendering.
+ *
+ *   width, height   render resolution in pixels
+ *   color_format    pixel format for the color texture (LPZ_FORMAT_UNDEFINED
+ *                   defaults to LPZ_FORMAT_RGBA8_UNORM)
+ *   with_depth      allocate a Depth32Float depth attachment
+ *   out             filled on success
+ *
+ * The color_texture can be used as a sampled input in subsequent passes.
+ * Ownership of both textures belongs to the caller; release with
+ * DestroyRenderTarget.
+ */
+LpzResult CreateRenderTarget(lpz_app_t app,
+                              uint32_t width, uint32_t height,
+                              LpzFormat color_format, bool with_depth,
+                              LpzRenderTarget *out);
+
+/* Destroy both textures in an LpzRenderTarget and zero the struct. */
+void DestroyRenderTarget(lpz_app_t app, LpzRenderTarget *rt);
+
+/*
+ * BeginRenderTarget — end the current swapchain pass and open an off-screen
+ * render pass targeting rt->color_texture.
+ *
+ * After this call all draw commands render into the render target.
+ * Ends automatically on EndRenderTarget.  Only one level of nesting is
+ * supported in the easy API.
+ */
+void BeginRenderTarget(lpz_app_t app, const LpzRenderTarget *rt, Color clear_color);
+
+/*
+ * EndRenderTarget — close the off-screen pass and re-open the swapchain pass.
+ * The render target's color_texture is now complete and can be sampled.
+ */
+void EndRenderTarget(lpz_app_t app);
+
+// ============================================================================
+// GPU READBACK
+// ============================================================================
+
+/*
+ * ReadbackTexture — copy a GPU texture back to CPU-accessible memory.
+ *
+ *   texture        GPU texture to read (must have TRANSFER_SRC usage or be
+ *                  a render-target color attachment created by CreateRenderTarget)
+ *   width, height  pixel dimensions to read (full texture)
+ *   out_pixels     receives a malloc'd RGBA8 pixel buffer — caller must free()
+ *   out_size       receives the byte count of *out_pixels
+ *
+ * Calls WaitIdle internally; do not call during active rendering.
+ */
+LpzResult ReadbackTexture(lpz_app_t app, lpz_texture_t texture,
+                           uint32_t width, uint32_t height,
+                           void **out_pixels, size_t *out_size);
+
+/*
+ * ReadbackBuffer — copy a GPU buffer back to CPU-accessible memory.
+ *
+ *   buffer      GPU buffer to read
+ *   byte_count  number of bytes to copy from the start of the buffer
+ *   out_data    receives a malloc'd copy — caller must free()
+ *   out_size    receives byte_count
+ *
+ * Calls WaitIdle internally.
+ */
+LpzResult ReadbackBuffer(lpz_app_t app, lpz_buffer_t buffer,
+                          size_t byte_count,
+                          void **out_data, size_t *out_size);
+
+// ============================================================================
+// BUFFER SUBALLOCATOR
+// ============================================================================
+
+/*
+ * LpzArenaCreate — allocate a single large GPU buffer for suballocation.
+ * Typical use: pack many small vertex / index / constant buffers into one
+ * allocation to avoid per-object CreateBuffer overhead.
+ */
+LpzResult LpzArenaCreate(lpz_app_t app, size_t capacity,
+                          LpzBufferUsage usage, LpzMemoryUsage memory_usage,
+                          LpzArena *out);
+
+/*
+ * LpzArenaAlloc_ — bump-allocate `size` bytes from the arena at `alignment`.
+ * Returns a zeroed LpzArenaAlloc on failure (check result.buffer != NULL).
+ * Macro LpzArenaAlloc(arena, size) uses default 16-byte alignment.
+ */
+LpzArenaAlloc LpzArenaAlloc_(LpzArena *arena, size_t size, size_t alignment);
+#define LpzArenaAlloc(arena, size) LpzArenaAlloc_((arena), (size), 16u)
+
+/* Reset the bump offset to zero (discard all suballocations). */
+void LpzArenaReset(LpzArena *arena);
+
+/* Unmap and destroy the backing buffer; zeros the struct. */
+void LpzArenaDestroy(lpz_app_t app, LpzArena *arena);
+
+// ============================================================================
+// GLTF LOADING
+// ============================================================================
+
+/*
+ * LoadGLTF — load a glTF 2.0 or GLB file and return one Mesh per mesh node.
+ *
+ * This is a thin convenience wrapper around LoadScene; Assimp natively
+ * supports glTF 2.0.  Materials, textures, and animations are not parsed —
+ * geometry only.  See LoadScene / geometry.h for full flags documentation.
+ *
+ * Returns true on success.  out_meshes must point to a caller-allocated array
+ * of at least *out_count elements; pass out_meshes=NULL and out_count!=NULL
+ * for a dry-run count.
+ * Free with: FreeScene(meshes, count);
+ */
+bool LoadGLTF(const char *path, LpzLoadFlags flags,
+              Mesh *out_meshes, uint32_t *out_count);
 
 // ============================================================================
 // CORE ESCAPE HATCHES

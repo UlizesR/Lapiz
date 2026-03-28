@@ -1,5 +1,45 @@
 # Lapiz
-A C graphics library build on top of Metal and Vulkan.
+A cross-platform C graphics library built on top of Metal and Vulkan.
+
+---
+
+## About
+
+Lapiz is a personal project I built because I wanted a single graphics library I could reach for across my own projects without being locked into one API or platform. I've been writing Metal code for about three years, so that backend came naturally — Vulkan was the real challenge. I used AI to help clarify concepts, work through the synchronization model, and debug behaviour that was hard to reason about without a second perspective. The architecture, decisions, and all the actual code are my own; the AI was a sounding board and documentation aid, not a code generator.
+
+The name *Lapiz* is Spanish for *pencil* — a tool you pick up and draw with, without thinking about how it works.
+
+---
+
+## Features
+
+- **Dual-backend rendering** — Metal on Apple platforms, Vulkan everywhere else (including MoltenVK on macOS). The same application code runs on both without any `#ifdef` in user code.
+- **Easy API** — `InitApp` → `CreateContext` → `BeginDraw` / `EndDraw` loop. The library manages the swapchain, depth buffer, frame pacing, and pipeline binding automatically.
+- **Explicit API** — full access to every GPU object (`device.*`, `renderer.*`, `surface.*`) for when you need complete control over attachments, push constants, or custom pipeline state.
+- **3D mesh rendering** — upload indexed geometry with `UploadMesh`, draw with `DrawMesh` or `DrawMeshInstanced`. Built-in Blinn-Phong lighting with instanced transform SSBOs.
+- **Primitive drawing** — `DrawPoint`, `DrawPointCloud`, `DrawLine`, `DrawLineSegments` with additive blending for points and alpha-blended screen-space quads for lines. Handles 1M+ points per frame.
+- **Grid and axes** — `DrawGrid` with three composable modes: bounded XZ line grid, short axis arrows, and a shader-based infinite grid that fades at the horizon.
+- **SDF text rendering** — `DrawText` / `DrawTextFmt` backed by a stb_truetype SDF atlas. Anti-aliased at any scale via `fwidth()`. Kern table and advance cache built at atlas creation time.
+- **Custom shaders** — `LoadShaders` compiles Metal source or SPIR-V at runtime. Full pipeline override hooks (`LpzPipelineOverrides`) let you replace the built-in scene, text, or depth state.
+- **Texture loading** — `LoadTexture` reads PNG/JPEG/BMP via stb_image and uploads to GPU.
+- **Geometry generation** — `GenerateSphere`, `GenerateCylinder`, `GenerateTorus`, `GenerateCone`, `GeneratePlane`, `GeneratePolygon`, `GeneratePrism`, plus built-in `TRIANGLE_VERTICES`, `QUAD_VERTICES`, and `CUBE_VERTICES` constants.
+- **Compute** — explicit compute pass via `rendererExt.BeginComputePass` / `DispatchCompute`, with Metal 3 `dispatchThreads:` support.
+- **Event system** — typed input events (keyboard, mouse buttons, mouse move, character input) via a 256-capacity ring buffer.
+- **Triple-buffering** — ring-buffered SSBOs and persistent GPU memory mapping eliminate per-frame driver overhead.
+
+---
+
+## Lapiz 1.0.0
+
+- [x] Render using Metal and Vulkan
+- [x] Render 2D and 3D
+- [x] Render text
+- [x] Custom shaders
+- [x] Explicit and implicit implementations
+- [ ] Windows support (Vulkan path compiles; window backend untested)
+- [ ] Render bundles (ICB on Metal, secondary command buffers on Vulkan)
+- [x] MSAA
+- [ ] glTF scene loading
 
 ---
 
@@ -57,11 +97,13 @@ graph TD
 | Principle | Implementation |
 |---|---|
 | **Zero-allocation hot path** | Frame arena bump allocator; stack buffers for transient queries |
-| **State diffing** | Cached pipeline / viewport / scissor — GPU command only on change |
+| **State diffing** | Cached pipeline / viewport / scissor / MVP hash — GPU command only on change |
 | **Triple-buffering** | `LPZ_MAX_FRAMES_IN_FLIGHT = 3` ring buffers for all dynamic data |
+| **Persistent SSBO mapping** | GPU write-combine memory mapped once per slot, reused every frame |
 | **Atomic counters** | `_Atomic uint32_t` draw counter reset per frame, no mutex |
 | **Backend parity** | Both backends implement identical `LpzRendererAPI` function tables |
 | **Deferred destruction** | GPU objects queued for release only after their frame slot retires |
+| **Macro hygiene** | `LPZ_FREE`, `LPZ_MAX`, `LPZ_MIN`, `LAPIZ_UNLIKELY` from `internals.h` — no local re-definitions |
 
 ---
 
@@ -130,11 +172,11 @@ This allows async DMA uploads on discrete GPUs (which have dedicated DMA engines
 All optional features are stored as **module-level `bool` globals** in `vulkan_device.c` and declared `extern` in `vulkan_internal.h`. This lets every translation unit read the flags without passing context pointers through every call:
 
 ```c
-extern bool g_vk13;            // Vulkan 1.3 core features (sync2, dynRender)
-extern bool g_has_sync2;       // VK_KHR_synchronization2
-extern bool g_has_dynamic_render;  // vkCmdBeginRenderingKHR
-extern bool g_has_ext_dyn_state;   // dynamic depth/stencil state
-extern bool g_has_mesh_shader;     // VK_EXT_mesh_shader
+extern bool g_vk13;                    // Vulkan 1.3 core features (sync2, dynRender)
+extern bool g_has_sync2;               // VK_KHR_synchronization2
+extern bool g_has_dynamic_render;      // vkCmdBeginRenderingKHR
+extern bool g_has_ext_dyn_state;       // dynamic depth/stencil state
+extern bool g_has_mesh_shader;         // VK_EXT_mesh_shader
 extern bool g_has_draw_indirect_count;
 extern float g_timestamp_period;
 ```
@@ -142,8 +184,8 @@ extern float g_timestamp_period;
 The corresponding function pointers are loaded with `vkGetDeviceProcAddr` once at device create time and stored alongside the flags:
 
 ```c
-PFN_vkCmdBeginRenderingKHR g_vkCmdBeginRendering = NULL;
-PFN_vkCmdPipelineBarrier2KHR g_vkCmdPipelineBarrier2 = NULL;
+PFN_vkCmdBeginRenderingKHR    g_vkCmdBeginRendering   = NULL;
+PFN_vkCmdPipelineBarrier2KHR  g_vkCmdPipelineBarrier2 = NULL;
 ```
 
 ### 3.3 Swapchain & Surface
@@ -197,7 +239,7 @@ Lapiz uses `VK_KHR_dynamic_rendering` (core in Vulkan 1.3) rather than render-pa
 flowchart LR
     BP([BeginRenderPass]) --> TR[Transition all color attachments\nto COLOR_ATTACHMENT_OPTIMAL]
     TR --> TD[Transition depth attachment\nto DEPTH_STENCIL_ATTACHMENT_OPTIMAL]
-    TD --> BI[Build VkRenderingAttachmentInfo array\nfrom frame arena — O 1 alloc]
+    TD --> BI[Build VkRenderingAttachmentInfo array\nfrom frame arena — O(1) alloc]
     BI --> BR[vkCmdBeginRenderingKHR\nVkRenderingInfo]
     BR --> RS[lpz_vk_renderer_reset_state\nClear active pipeline / bind groups\nviewportValid = scissorValid = false]
     RS --> Draw["Draw calls…"]
@@ -291,7 +333,7 @@ flowchart TD
     BF([BeginFrame]) --> SW[LPZ_SEM_WAIT\ndispatch_semaphore_wait — blocks if\nall 3 frame slots are GPU-busy]
     SW --> FI[frameIndex = frameIndex+1 mod 3]
     FI --> Pool[NSAutoreleasePool alloc init]
-    Pool --> PF[Flush pending_free slot\nRelease deferred GPU objects\n guaranteed GPU-complete after sem]
+    Pool --> PF[Flush pending_free slot\nRelease deferred GPU objects\nguaranteed GPU-complete after sem]
     PF --> AR[lpz_mtl_frame_reset\narena offset=0, drawCounter=0]
     AR --> CB{Metal 3?}
     CB -- Yes --> CB3[commandBufferWithDescriptor cbDesc\nretainedReferences=NO\nreuse pre-allocated descriptor]
@@ -339,10 +381,7 @@ sequenceDiagram
 The vertex shader `vertex_scene` transforms surface normals using an explicit `float3x3` extraction instead of a 4×4 multiply:
 
 ```metal
-// Before (implicit 4x4 multiply with w=0 hint — compiler may not optimize):
-out.normal_world = (model * float4(in.normal, 0.0)).xyz;
-
-// After (explicit 3x3 — 9 muls + 6 adds vs 12 muls + 8 adds):
+// Explicit 3x3 — 9 muls + 6 adds vs 12 muls + 8 adds:
 out.normal_world = float3x3(model[0].xyz, model[1].xyz, model[2].xyz) * in.normal;
 ```
 
@@ -403,13 +442,53 @@ VkBuffer vk_buf = buffer->isRing ? buffer->buffers[renderer->frameIndex] : buffe
 | Text glyph SSBO | Rebuilt each frame from TextBatchAdd calls |
 | Transient upload ring (Metal) | Sub-allocated within `lpz_renderer_alloc_transient_bytes` |
 
+### Persistent SSBO Mapping
+
+All three dynamic SSBOs (point, line, instance) are **mapped once per in-flight slot** and the pointer is reused every frame. This eliminates one `MapMemory` + one `UnmapMemory` driver call per flush per frame — the equivalent of the text batch's persistent mapping strategy, now applied uniformly:
+
+```c
+// First access for this slot — map and cache:
+if (LAPIZ_UNLIKELY(!app->inst_map_valid[inst_slot])) {
+    app->inst_mapped_ptrs[inst_slot] =
+        app->api.device.MapMemory(app->device, app->inst_buf, inst_slot);
+    app->inst_map_valid[inst_slot] = (app->inst_mapped_ptrs[inst_slot] != NULL);
+}
+void *m = app->inst_mapped_ptrs[inst_slot];
+if (m) memcpy(m, instance_data, bytes);
+// No UnmapMemory — pointer stays valid until the buffer is destroyed or grown.
+```
+
+When the backing buffer is destroyed and recreated (capacity growth), all `*_map_valid` flags are cleared with `memset(..., 0, ...)` so the next access re-maps from the new allocation. `DestroyContext` calls `UnmapMemory` for every live slot before `DestroyBuffer`.
+
 ---
 
 ## 6. C11 Performance Features
 
-### 6.1 Frame Arena (Bump Allocator)
+### 6.1 `internals.h` — Shared Macro Infrastructure
 
-Both backends embed a **64 KB frame-lifetime bump allocator** directly inside `struct renderer_t`. This eliminates all heap allocations in the per-frame hot path.
+All performance-sensitive macros are defined once in `internals.h` and included by every translation unit that needs them. This eliminates local re-definitions and guarantees consistent behaviour across the codebase:
+
+```c
+// Safe free-and-null in one step:
+#define LPZ_FREE(x)   do { free((void *)(x)); (x) = NULL; } while (0)
+
+// Min / max without type-unsafe system macros:
+#define LPZ_MAX(a, b) ((a) > (b) ? (a) : (b))
+#define LPZ_MIN(a, b) ((a) < (b) ? (a) : (b))
+
+// Branch prediction hints (expand to __builtin_expect on GCC/Clang):
+#define LAPIZ_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define LAPIZ_UNLIKELY(x) __builtin_expect(!!(x), 0)
+
+// Alignment:
+#define LAPIZ_ALIGN(X) __attribute__((aligned(X)))  // GCC/Clang
+```
+
+`lpz.c` no longer defines a local `MAX` — it uses `LPZ_MAX` from `internals.h` exclusively. All `__builtin_expect` calls in the hot path have been replaced with `LAPIZ_UNLIKELY`.
+
+### 6.2 Frame Arena (Bump Allocator)
+
+Both backends embed a **64 KB frame-lifetime bump allocator** directly inside `struct renderer_t`. This eliminates all heap allocations in the per-frame hot path. The capacity is defined as `LPZ_FRAME_ARENA_SIZE` in `internals.h` and shared by both backends.
 
 ```
 struct renderer_t memory layout:
@@ -428,9 +507,9 @@ struct renderer_t memory layout:
 
 ```c
 LAPIZ_INLINE void *lpz_vk_frame_alloc(struct renderer_t *r, size_t size) {
-    size_t aligned = (size + 15u) & ~15u;           // round up to 16-byte boundary
-    if (r->frameArenaOffset + aligned > LPZ_VK_FRAME_ARENA_SIZE)
-        return NULL;                                 // exhausted → caller uses malloc
+    size_t aligned = (size + 15u) & ~15u;
+    if (r->frameArenaOffset + aligned > LPZ_FRAME_ARENA_SIZE)
+        return NULL;  // exhausted → caller uses malloc
     void *p = r->frameArena + r->frameArenaOffset;
     r->frameArenaOffset += aligned;
     return p;
@@ -448,70 +527,31 @@ LAPIZ_INLINE void lpz_vk_frame_reset(struct renderer_t *r) {
 
 **What uses the arena:**
 
-| Allocation | Before (heap) | After (arena) |
+| Allocation | Before | After |
 |---|---|---|
-| `VkRenderingAttachmentInfo colorAtts[]` in `BeginRenderPass` | `calloc(N, sizeof(...))` + `free(...)` | `lpz_vk_frame_alloc(renderer, N * sizeof(...))` |
-| `VkCommandBuffer vkCmds[]` in `SubmitCommandBuffers` | `malloc(count * sizeof(...))` + `free(...)` | `lpz_vk_frame_alloc(renderer, count * sizeof(...))` |
+| `VkRenderingAttachmentInfo colorAtts[]` | `calloc` + `free` | `lpz_vk_frame_alloc` |
+| `VkCommandBuffer vkCmds[]` in `SubmitCommandBuffers` | `malloc` + `free` | `lpz_vk_frame_alloc` |
 
-The arena falls back to `malloc` only when exhausted (in practice: never for normal scenes, since 64 KB covers hundreds of attachment descriptors).
+### 6.3 C11 Atomics — `_Atomic uint32_t drawCounter`
 
-```mermaid
-flowchart LR
-    A[lpz_vk_frame_alloc called] --> B{offset + aligned_size\n≤ 64 KB?}
-    B -- Yes --> C[Return frameArena + offset\noffset += aligned_size\nO 1 — one add + one compare]
-    B -- No --> D[Return NULL]
-    D --> E[Caller falls back\nto malloc]
-```
-
-### 6.2 C11 Atomics — `_Atomic uint32_t drawCounter`
-
-The draw counter is incremented in every `Draw` and `DrawIndexed` call using `memory_order_relaxed`. This is the weakest memory order: it guarantees no lost increments (atomicity) but imposes no ordering constraints on other memory operations — the cheapest possible atomic operation, typically compiling to a single `LDADD` (ARM) or `LOCK XADD` (x86).
+The draw counter uses `memory_order_relaxed` — the weakest memory order, guaranteeing no lost increments without any barrier or fence. On ARM this compiles to `LDADD`; on x86 to `LOCK XADD`.
 
 ```c
-// In lpz_vk_renderer_draw / lpz_renderer_draw:
-atomic_fetch_add_explicit(&renderer->drawCounter, 1, memory_order_relaxed);
-
-// At BeginFrame (inside lpz_vk_frame_reset / lpz_mtl_frame_reset):
-atomic_store_explicit(&renderer->drawCounter, 0, memory_order_relaxed);
+atomic_fetch_add_explicit(&renderer->drawCounter, 1, memory_order_relaxed);  // in Draw
+atomic_store_explicit(&renderer->drawCounter, 0, memory_order_relaxed);       // in BeginFrame
 ```
 
-`memory_order_relaxed` is correct here because the counter is a diagnostic counter — its value is only read at profiling time after the frame is complete, not used to synchronize any shared state.
+`memory_order_relaxed` is correct here because the counter is read only at profiling time after the frame completes, not used to synchronize any shared state.
 
-```mermaid
-flowchart LR
-    D[Draw called] --> A[atomic_fetch_add drawCounter\nmemory_order_relaxed\nno fence no barrier]
-    A --> G[vkCmdDraw / drawPrimitives]
-    BF[BeginFrame] --> R[atomic_store drawCounter = 0\nmemory_order_relaxed]
-```
+### 6.4 `_Alignas(16)` — SIMD-Safe Alignment
 
-### 6.3 `_Alignas(16)` — SIMD-Safe Alignment
+The frame arena and the `prim_mvp` matrix are both declared `_Alignas(16)` / `LAPIZ_ALIGN(16)`, ensuring every arena allocation is 16-byte aligned and the MVP matrix is safe for SIMD load/store instructions on both ARM (NEON) and x86 (SSE).
 
-The frame arena is declared with `_Alignas(16)`:
+### 6.5 `_Thread_local` — Per-Thread Arenas (Prepared)
 
-```c
-_Alignas(16) char frameArena[LPZ_VK_FRAME_ARENA_SIZE];
-```
+`internals.h` defines `LAPIZ_THREAD_LOCAL` as `_Thread_local` on C11. The infrastructure is in place for thread-local allocators when multi-threaded command recording is added — each thread would get its own bump pointer with no synchronization overhead.
 
-This ensures that the base of the arena is 16-byte aligned. Since each allocation is rounded up to a multiple of 16, every allocation is also 16-byte aligned. This is required for:
-- `VkRenderingAttachmentInfo` which contains `VkClearValue` (16-byte aligned)
-- `mat4` / `vec4` types in push constant structs (`LAPIZ_ALIGN(16)` in the easy API)
-- Any SIMD loads/stores used in geometry processing
-
-### 6.4 `_Thread_local` — Per-Thread Arenas (Prepared)
-
-`internals.h` defines `LAPIZ_THREAD_LOCAL` as `_Thread_local` on C11 and later:
-
-```c
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-#define LAPIZ_THREAD_LOCAL _Thread_local
-#else
-#define LAPIZ_THREAD_LOCAL  // silent degradation on C99
-#endif
-```
-
-The infrastructure is in place for thread-local allocators when multi-threaded command recording is added. Each thread would get its own bump pointer with no synchronization required, since `_Thread_local` storage is per-thread by definition.
-
-### 6.5 `_Static_assert` — Compile-Time Layout Verification
+### 6.6 `_Static_assert` — Compile-Time Layout Verification
 
 Critical struct layouts that must match the GPU shader are verified at compile time:
 
@@ -525,32 +565,31 @@ _Static_assert(offsetof(Vertex, color) == 32, "color at offset 32");
 // lpz.c:
 _Static_assert(sizeof(LpzPrimPC) == 80,
     "LpzPrimPC must be exactly 80 bytes to match the GPU push-constant range");
+_Static_assert(sizeof(/*infinite grid PC*/) == 80,
+    "infinite grid push-constant must be 80 bytes");
 ```
 
-If padding is inadvertently introduced (e.g. by compiler struct reordering or a new field), the build fails immediately — no runtime mismatch possible.
+### 6.7 `LAPIZ_UNLIKELY` — Branch Prediction Hints
 
-### 6.6 `__builtin_expect` — Branch Prediction Hints
-
-Performance-critical conditional paths are marked with `LAPIZ_LIKELY` / `LAPIZ_UNLIKELY`, which expand to `__builtin_expect` on GCC/Clang:
+All slow-path conditions in the hot path use `LAPIZ_UNLIKELY` (which expands to `__builtin_expect(..., 0)` on GCC/Clang):
 
 ```c
-// In lpz_cpu_push_points — fast path: buffer already large enough
-if (__builtin_expect(need > app->prim_point_cap_cpu, 0))
-{
-    // slow path: realloc
-}
+// Slow path: CPU staging buffer needs to grow (rare — only on first frame or after spike)
+if (LAPIZ_UNLIKELY(need > app->prim_point_cap_cpu)) { /* realloc */ }
 
-// In lpz_flush_points — fast path: buffer already exists and is large enough
-if (__builtin_expect(!app->point_buf || app->point_buf_cap < gpu_need, 0))
-{
-    if (!lpz_prim_ensure_gpu_buf(...))
-        return;
-}
+// Slow path: GPU SSBO needs to grow or bind group is missing
+if (LAPIZ_UNLIKELY(!app->point_buf || app->point_buf_cap < gpu_need)) { /* grow */ }
+
+// Slow path: persistent map not yet established for this slot
+if (LAPIZ_UNLIKELY(!app->inst_map_valid[inst_slot])) { /* MapMemory + cache */ }
+
+// Slow path: trim over-allocated CPU buffers (peak < cap/4)
+if (LAPIZ_UNLIKELY(app->prim_point_cap_cpu > MIN_CAP)) { /* maybe shrink */ }
 ```
 
-The `0` (not-expected) hint tells the branch predictor that the slow path (realloc / buffer creation) is rare, keeping the predicted path through the fast `memcpy` inline.
+The `LAPIZ_LIKELY` / `LAPIZ_UNLIKELY` pair replaces direct `__builtin_expect` calls throughout, keeping the code portable (the macros degrade to no-ops on MSVC).
 
-### 6.7 `LAPIZ_INLINE` — Forced Inlining for Hot Helpers
+### 6.8 `LAPIZ_INLINE` — Forced Inlining for Hot Helpers
 
 All shared helpers in `vulkan_internal.h` and `metal_internal.h` are marked `LAPIZ_INLINE`:
 
@@ -559,13 +598,13 @@ All shared helpers in `vulkan_internal.h` and `metal_internal.h` are marked `LAP
 #define LAPIZ_INLINE static __inline     // MSVC
 ```
 
-This includes `lpz_vk_frame_alloc`, `lpz_vk_frame_reset`, `lpz_vk_renderer_reset_state`, `lpz_buffer_get_mtl`, and all barrier helpers. These are called in the frame hot path; inlining eliminates the function call overhead and allows the compiler to constant-fold and register-allocate across the call boundary.
+This includes `lpz_vk_frame_alloc`, `lpz_vk_frame_reset`, `lpz_vk_renderer_reset_state`, `lpz_buffer_get_mtl`, and all barrier helpers. Inlining these eliminates the function call overhead and allows the compiler to constant-fold across call boundaries.
 
 ---
 
 ## 7. Easy API — Implicit Path
 
-The easy API in `lpz.c` manages the complete GPU lifecycle with zero boilerplate. The caller creates a descriptor, enters a loop, and calls three functions per frame.
+The easy API in `lpz.c` manages the complete GPU lifecycle with zero boilerplate.
 
 ### 7.1 Initialization Sequence
 
@@ -588,28 +627,16 @@ flowchart TD
     DT --> TS[lpz_build_text_system\nFont atlas + text pipeline]
     TS --> DP[lpz_build_default_pipelines\nScene + Instanced pipelines]
     DP --> PP[lpz_build_prim_pipelines\nPoints + Lines pipelines]
-    PP --> RET3([Context ready])
+    PP --> IG[lpz_build_infinite_grid_pipeline\ngrid.metal / grid.vert.spv + grid.frag.spv]
+    IG --> RET3([Context ready])
 ```
 
 ### 7.2 Main Loop
 
 ```mermaid
 flowchart TD
-    R([Run]) --> SC{window.ShouldClose?}
-    SC -- No --> loop[Continue loop]
-    SC -- Yes --> stop([app.run = false\nReturn false])
-
-    PE([PollEvents]) --> PW[window.PollEvents]
-    PW --> TYP[Drain typed characters → event queue]
-    TYP --> MM[Mouse move delta → event queue]
-    MM --> MB[Mouse button transitions → event queue]
-    MB --> KP[Key transitions for 24 polled keys → event queue]
-    KP --> ESC{ESC pressed?}
-    ESC -- Yes --> app_run_false[app.run = false]
-    ESC -- No --> done[Done]
-
-    BD([BeginDraw]) --> TRIM[Trim CPU prim buffers\nhysteresis: only shrink if peak < cap/4]
-    TRIM --> RST[Reset prim_point_count\nprim_line_count = 0\nclear direct fast-path slot]
+    BD([BeginDraw]) --> TRIM[Trim CPU prim buffers\nhysteresis: LPZ_MAX + LAPIZ_UNLIKELY guards\nonly shrink if peak < cap/4]
+    TRIM --> RST[Reset prim counts to 0\nclear direct fast-path slot\nprim_mvp_hash = 0]
     RST --> DT[Compute dt = now - last_frame_time]
     DT --> RZ{needs_resize?}
     RZ -- Yes --> HZ[lpz_handle_resize\nWaitIdle + Resize surface + rebuild depth]
@@ -623,20 +650,21 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    ED([EndDraw]) --> FP{prim_point_count > 0\nOR prim_direct_count > 0?}
-    FP -- Yes --> LP[lpz_flush_points\nUpload SSBO + Draw]
+    ED([EndDraw]) --> IG[lpz_flush_infinite_grid\nDraw 3-vertex fullscreen triangle\nif infinite_grid_pending]
+    IG --> FP{prim_point_count > 0\nOR prim_direct_count > 0?}
+    FP -- Yes --> LP[lpz_flush_points\nUpload via persistent map + Draw]
     FP -- No --> FL
     LP --> FL{prim_line_count > 0?}
-    FL -- Yes --> LL[lpz_flush_lines\nUpload SSBO + Draw]
+    FL -- Yes --> LL[lpz_flush_lines\nUpload via persistent map + Draw]
     FL -- No --> TP
     LL --> TP{text_pending?}
     TP -- Yes --> TF[TextBatchFlush → upload glyph SSBO\nBindPipeline text\nDraw 6 verts × glyph_count instanced]
     TP -- No --> ER
     TF --> ER[renderer.EndRenderPass\nClose the single scene pass]
-    ER --> SUB[renderer.Submit\npresentDrawable + addCompletedHandler\ncommit + drain pool]
+    ER --> SUB[renderer.Submit\ncommit + drain pool]
 ```
 
-> **Key insight:** Text rendering was moved *inside* the main pass before `EndRenderPass`. Previously it opened a second pass with `LOAD_OP_LOAD`, which on TBDR GPUs (Apple Silicon) forces a full tile-memory evict and reload — the most expensive per-pass operation. Merging text into the main pass eliminates this entirely.
+> **Key insight:** Text rendering, primitive draws, and the infinite grid all execute inside the **single main pass** before `EndRenderPass`. This was especially important for the text system: previously it opened a second pass with `LOAD_OP_LOAD`, which on TBDR GPUs (Apple Silicon) forces a full tile-memory evict and reload — the most expensive per-pass operation.
 
 ### 7.3 App State Summary
 
@@ -650,10 +678,14 @@ The `LpzAppState` struct (private to `lpz.c`) holds all implicit state. Key fiel
 | **Timing** | `start_time`, `last_frame_time`, `dt`, `elapsed` | Frame delta time |
 | **Primitives** | `prim_point_cpu[]`, `prim_line_cpu[]` | CPU staging arrays |
 | **Prim GPU** | `point_buf`, `line_buf`, `point_bg`, `line_bg` | Ring-buffered SSBOs |
+| **Prim persistent maps** | `point_map_valid[]`, `line_map_valid[]` | Per-slot map cache |
 | **Prim fast path** | `prim_direct_pts`, `prim_direct_count` | Zero-copy single-call path |
+| **MVP hash** | `prim_mvp_hash` | 64-bit fingerprint; skip memcpy on match |
 | **Text** | `font`, `text_batch`, `text_pipeline`, `text_bg` | Text render system |
 | **Pipelines** | `default_scene_pipeline`, `prim_point_pipeline`, `prim_line_pipeline` | Cached PSOs |
-| **Grid cache** | `grid_cache[]`, `grid_cache_valid` | Line geometry for axes/grid |
+| **Infinite grid** | `infinite_grid_pipeline`, `infinite_grid_inv_view_proj[]`, `infinite_grid_vp_dirty` | Shader-based infinite grid |
+| **Infinite grid fades** | `infinite_grid_near_fade`, `infinite_grid_far_fade` | Horizon fade distances (20/80 wu) |
+| **Grid cache** | `grid_cache[]`, `grid_cache_valid` | Line geometry for bounded grid/axes |
 | **Events** | `LpzEventQueue` (ring buffer, 256 cap) | Input event queue |
 
 ---
@@ -682,36 +714,29 @@ api->device.CreateBindGroup(dev, &bg_desc, &my_bg);
 // --- Per frame ---
 while (Run(app)) {
     PollEvents(app);
-
-    // Advance frame — waits on in-flight fence
     api->renderer.BeginFrame(renderer);
     uint32_t fi = api->renderer.GetCurrentFrameIndex(renderer);
 
-    // Acquire swapchain image
     api->surface.AcquireNextImage(surface);
     lpz_texture_t swapTex = api->surface.GetCurrentTexture(surface);
 
-    // Open render pass manually — full control over attachments
     LpzColorAttachment ca = {
-        .texture  = swapTex,
-        .load_op  = LPZ_LOAD_OP_CLEAR,
+        .texture = swapTex,
+        .load_op = LPZ_LOAD_OP_CLEAR,
         .store_op = LPZ_STORE_OP_STORE,
         .clear_color = {0.1f, 0.1f, 0.1f, 1.0f},
     };
     LpzRenderPassDesc pass = {
-        .color_attachments      = &ca,
+        .color_attachments = &ca,
         .color_attachment_count = 1,
     };
     api->renderer.BeginRenderPass(renderer, &pass);
-
-    // Full state control
     api->renderer.SetViewport(renderer, 0, 0, w, h, 0, 1);
     api->renderer.BindPipeline(renderer, my_pipeline);
     api->renderer.BindBindGroup(renderer, 0, my_bg, NULL, 0);
     api->renderer.PushConstants(renderer, LPZ_SHADER_STAGE_ALL_GRAPHICS,
                                  0, sizeof(my_pc), &my_pc);
     api->renderer.DrawIndexed(renderer, index_count, 1, 0, 0, 0);
-
     api->renderer.EndRenderPass(renderer);
     api->renderer.Submit(renderer, surface);
 }
@@ -720,119 +745,54 @@ while (Run(app)) {
 api->device.WaitIdle(dev);
 api->device.DestroyBindGroup(my_bg);
 api->device.DestroyPipeline(my_pipeline);
-// ...
 ```
 
-### 8.2 Pipeline Object Lifecycle
+### 8.2 State Diffing — How Redundant GPU Commands Are Eliminated
 
-```mermaid
-flowchart LR
-    subgraph Setup ["One-time setup"]
-        S1[CreateShader SPIR-V/MSL] --> S2[CreateBindGroupLayout\nDefine binding slots]
-        S2 --> S3[CreatePipeline\nVertex attrs · topology · blend\nattachment formats · BGL]
-        S3 --> S4[CreateDepthStencilState\ntest / write / compare op]
-        S4 --> S5[CreateBuffer + CreateBindGroup]
-    end
-
-    subgraph Frame ["Per-frame use (no creation cost)"]
-        F1[BindPipeline\ncached — no GPU command if same] --> F2[BindDepthStencilState]
-        F2 --> F3[BindVertexBuffers\ndiff-checked per slot]
-        F3 --> F4[BindIndexBuffer\ndiff-checked]
-        F4 --> F5[BindBindGroup\ndiff-checked per set]
-        F5 --> F6[PushConstants\nalways issued — no caching]
-        F6 --> F7[Draw / DrawIndexed]
-    end
-
-    Setup --> Frame
-```
-
-### 8.3 State Diffing — How Redundant GPU Commands Are Eliminated
-
-Every `Bind*` and `Set*` function in the renderer checks cached state before issuing the underlying GPU command:
+Every `Bind*` and `Set*` function checks cached state before issuing the underlying GPU command:
 
 ```c
 // BindPipeline (Vulkan):
-if (renderer->activePipeline == pipeline) return;  // skip
+if (renderer->activePipeline == pipeline) return;
 renderer->activePipeline = pipeline;
 vkCmdBindPipeline(cmd, pipeline->bindPoint, pipeline->pipeline);
 
 // SetViewport:
-VkViewport vp = { x, height-y, width, -height, min_depth, max_depth };
 if (renderer->viewportValid && memcmp(&renderer->cachedViewport, &vp, sizeof(vp)) == 0)
-    return;  // skip
+    return;
 renderer->cachedViewport = vp;
-renderer->viewportValid = true;
+renderer->viewportValid  = true;
 vkCmdSetViewport(cmd, 0, 1, &vp);
-
-// BindVertexBuffers — per-slot diffing:
-for (uint32_t i = 0; i < count; i++) {
-    if (renderer->activeVertexBuffers[idx].buffer != buffers[i] ||
-        renderer->activeVertexBuffers[idx].offset != offsets[i])
-        changed = true;
-}
-if (!changed) return;  // skip entire bind call
 ```
 
-State is reset to "unknown" at the start of every render pass (`lpz_vk_renderer_reset_state` / `lpz_renderer_reset_frame_state`), ensuring the first bind after `BeginRenderPass` always issues the GPU command correctly.
+State is reset to "unknown" at the start of every render pass, ensuring the first bind after `BeginRenderPass` always issues correctly.
 
-### 8.4 Transfer Pass — Mesh Upload
+### 8.3 Transfer Pass — Mesh Upload
 
 ```mermaid
 flowchart LR
-    UM([UploadMesh]) --> GB[Create GPU-only VB + IB\nLPZ_MEMORY_USAGE_GPU_ONLY]
-    GB --> SB[Create CPU-visible staging VB + IB\nLPZ_MEMORY_USAGE_CPU_TO_GPU]
-    SB --> MAP[MapMemory → memcpy → UnmapMemory\nfor vertex and index data]
-    MAP --> BT[renderer.BeginTransferPass\nallocate transfer command buffer]
-    BT --> COPY[CopyBufferToBuffer ×2\nstaging VB → GPU VB\nstaging IB → GPU IB]
-    COPY --> ET[renderer.EndTransferPass\nsubmit + wait for completion]
-    ET --> FREE[DestroyBuffer staging VB + IB]
-    FREE --> RET([Mesh.vb + Mesh.ib ready\nfor DrawMesh / DrawIndexed])
+    UM([UploadMesh]) --> GB[Create GPU-only VB + IB]
+    GB --> SB[Create CPU-visible staging VB + IB]
+    SB --> MAP[MapMemory → memcpy → UnmapMemory]
+    MAP --> BT[renderer.BeginTransferPass]
+    BT --> COPY[CopyBufferToBuffer ×2]
+    COPY --> ET[renderer.EndTransferPass\nsubmit + wait]
+    ET --> FREE[LPZ_FREE staging buffers]
+    FREE --> RET([Mesh.vb + Mesh.ib ready])
 ```
 
-### 8.5 Compute Pass (Extended API)
+### 8.4 Compute Pass (Extended API)
 
 ```c
-LpzAPI *api = GetAPI(app);
-
 api->rendererExt.BeginComputePass(renderer);
-// Emits a pipeline barrier: ALL_GRAPHICS+TRANSFER → COMPUTE_SHADER
-
 api->rendererExt.BindComputePipeline(renderer, compute_pipeline);
 api->renderer.BindBindGroup(renderer, 0, compute_bg, NULL, 0);
-api->rendererExt.DispatchCompute(renderer,
-    group_x, group_y, group_z,
-    thread_x, thread_y, thread_z);
-
+api->rendererExt.DispatchCompute(renderer, group_x, group_y, group_z,
+                                  thread_x, thread_y, thread_z);
 api->rendererExt.EndComputePass(renderer);
-// Emits reverse barrier: COMPUTE_SHADER → ALL_GRAPHICS+TRANSFER
 ```
 
-On Metal 3+, `DispatchCompute` uses `dispatchThreads:threadsPerThreadgroup:` which automatically handles partial last-threadgroup clipping. On Metal 2 it falls back to `dispatchThreadgroups:threadsPerThreadgroup:`, requiring the caller to round up counts.
-
-### 8.6 Explicit Text Renderer
-
-The advanced text path separates atlas management, batch management, and rendering into independent objects:
-
-```mermaid
-flowchart TD
-    subgraph Setup["Explicit Text Setup"]
-        A1[LpzFontAtlasCreate\nTTF → SDF rasterize → GPU R8_UNORM texture\n stb_truetype + LpzIO_ReadFile]
-        A2[TextBatchCreate\nallocate ring-buffered SSBO\nmax_glyphs × LPZ_MAX_FRAMES_IN_FLIGHT]
-        A3[TextRendererCreate\nBuild pipeline + BGL + bind group\nsampler bilinear clamp-to-edge]
-    end
-
-    subgraph Frame["Per-Frame Explicit Text"]
-        B1[TextBatchBegin\nreset glyph count to 0]
-        B2[TextBatchAdd × N\nAppend LpzGlyphInstance records\nCPU side only]
-        B3[TextBatchFlush\nupload glyph SSBO for current frame_index]
-        B4[BeginRenderPass overlay]
-        B5[TextRendererDrawBatch\nbindPipeline + bindGroup\nDraw 6 × glyph_count instances]
-        B6[EndRenderPass]
-        B1 --> B2 --> B3 --> B4 --> B5 --> B6
-    end
-
-    Setup --> Frame
-```
+On Metal 3+, `DispatchCompute` uses `dispatchThreads:threadsPerThreadgroup:` which automatically clips the last partial threadgroup. On Metal 2 it falls back to `dispatchThreadgroups:`, requiring the caller to round up counts.
 
 ---
 
@@ -840,58 +800,111 @@ flowchart TD
 
 ### 9.1 Point & Line Batching
 
-All `DrawPoint`, `DrawPointCloud`, `DrawLine`, and `DrawLineSegments` calls accumulate into CPU arrays during the frame. A single GPU upload + draw is issued per type at `EndDraw` — this eliminates the SSBO overwrite problem that occurred when multiple calls shared the same ring-buffer slot in a single frame.
+All `DrawPoint`, `DrawPointCloud`, `DrawLine`, and `DrawLineSegments` calls accumulate into CPU arrays. A single GPU upload + draw is issued per type in `EndDraw`.
 
 ```mermaid
 flowchart TD
-    DPC([DrawPointCloud]) --> FP{First point call\nthis frame?}
-    FP -- Yes, count=0 --> DP[Fast path:\nStore pointer directly\nprim_direct_pts = points\nprim_direct_count = count\nZero memcpy]
-    FP -- No, second call --> PROM[Promote direct batch\nto CPU buffer first]
-    PROM --> PUSH[lpz_cpu_push_points\nmemcpy into prim_point_cpu]
-    PUSH --> DONE([Done — no GPU work yet])
-    DP --> DONE
+    DPC([DrawPointCloud]) --> HASH[lpz_mvp_hash view_proj\nXOR of bytes 0-7 and 56-63]
+    HASH --> HCK{hash == prim_mvp_hash?}
+    HCK -- Same → skip memcpy
+    HCK -- Different --> COPY[memcpy prim_mvp\nupdate hash]
+    COPY --> FP{First point call\nthis frame?}
+    FP -- Yes --> DP[Fast path:\nStore pointer directly\nprim_direct_pts = points\nZero memcpy]
+    FP -- No --> PUSH[lpz_cpu_push_points\nmemcpy into CPU buffer]
+    DP & PUSH --> DONE([Done — no GPU work yet])
 
-    FLP([lpz_flush_points in EndDraw]) --> RES{direct_count > 0?}
-    RES -- Yes, fast path --> SRC1[src = prim_direct_pts\nNo intermediate copy]
-    RES -- No, slow path --> SRC2[src = prim_point_cpu]
-    SRC1 & SRC2 --> GPU[MapMemory → memcpy → UnmapMemory\ninto ring-buffered point SSBO]
-    GPU --> BIND[BindPipeline point\nBindBindGroup SSBO\nPushConstants MVP + flags]
-    BIND --> DRAW[Draw vertex_count=count, instances=1]
+    FLP([lpz_flush_points in EndDraw]) --> PM{persistent map\nvalid for slot?}
+    PM -- No → MapMemory + cache slot
+    PM -- Yes → reuse
+    PM --> GPU[memcpy into persistent mapped ptr]
+    GPU --> BIND[BindPipeline · BindBindGroup · PushConstants]
+    BIND --> DRAW[Draw count=N, instances=1]
 ```
+
+#### MVP Hash
+
+Rather than a 64-byte `memcmp` on every `DrawPoint*` / `DrawLine*` call, Lapiz computes a 64-bit fingerprint of the view-projection matrix and compares a single integer:
+
+```c
+static inline uint64_t lpz_mvp_hash(const void *m) {
+    uint64_t a, b;
+    memcpy(&a, (const char *)m,      8);   // bytes 0-7  (first two floats)
+    memcpy(&b, (const char *)m + 56, 8);   // bytes 56-63 (last two floats)
+    return a ^ b;
+}
+```
+
+Any camera movement changes at least one of the sampled positions. The hash mismatch triggers a `memcpy` of the full 64-byte matrix; a hash match skips it entirely. Accepts `const void *` so both `float[16]` and `mat4` (`float(*)[4]`) pass without a cast.
 
 ### 9.2 GPU Buffer Growth Strategy
 
-Point and line SSBOs use **power-of-two growth with a high-watermark trim heuristic**. The buffer never shrinks below `MIN_CAP = 256` and only grows when the current peak exceeds capacity:
+Point and line SSBOs use **power-of-two growth with a high-watermark trim heuristic**:
 
 ```c
-// Growth (lpz_prim_ensure_gpu_buf):
+// Growth: round up to next power of 2, minimum 64 elements
 uint32_t cap = need_count > 1u
-    ? 1u << (32u - (uint32_t)__builtin_clz(need_count - 1u))  // next power of 2
+    ? 1u << (32u - (uint32_t)__builtin_clz(need_count - 1u))
     : 1u;
 if (cap < 64u) cap = 64u;
 
-// Trim (BeginDraw — only when both current cap >> floor AND peak << cap):
-if (prim_point_peak < prim_point_cap_cpu / SHRINK_FACTOR) {
-    uint32_t new_cap = MAX(MIN_CAP, prim_point_peak * 2u);
-    realloc(prim_point_cpu, new_cap * sizeof(LpzPoint));
+// Trim in BeginDraw (only when peak dropped well below current cap):
+if (LAPIZ_UNLIKELY(prim_point_cap_cpu > MIN_CAP)) {
+    if (prim_point_peak < prim_point_cap_cpu / SHRINK_FACTOR) {
+        uint32_t new_cap = LPZ_MAX(MIN_CAP, prim_point_peak * 2u);
+        realloc(prim_point_cpu, new_cap * sizeof(LpzPoint));
+    }
 }
 ```
 
 This prevents the pathological oscillation where a 1M-point workload would cause `trim(32MB → 8MB)` then `grow(8MB → 32MB)` on alternate frames.
 
-### 9.3 Grid/Axes Caching
+### 9.3 Grid System
 
-`DrawGridAndAxes` rebuilds the line geometry only when parameters change (grid size, axis size, thickness, or flags). The rebuilt geometry is stored in `grid_cache[]` and reused every frame until invalidation:
+`DrawGrid` is the single unified entry point for all grid and axis rendering. It accepts an `LpzGridDesc` that independently controls each rendering mode:
 
 ```c
-bool rebuild = !app->grid_cache_valid
-    || app->grid_cache_grid_size != grid_size
-    || app->grid_cache_axis_size != axis_size
-    || app->grid_cache_thickness != thickness
-    || app->grid_cache_flags != (uint32_t)flags;
+typedef struct LpzGridDesc {
+    int          grid_size;  // bounded grid half-extent (lines at -N..+N)
+    float        axis_size;  // axis arrow length from origin (0 = no axes)
+    float        spacing;    // infinite grid cell size in world units
+    float        thickness;  // line thickness in pixels (for bounded + axes)
+    LpzGridFlags flags;      // combination of LpzGridFlags values
+} LpzGridDesc;
 ```
 
-On stable parameters, `DrawGridAndAxes` costs only a single `lpz_cpu_push_lines` (a `memcpy` of the cached geometry).
+Three rendering modes, combinable in any order:
+
+| Flag | Mode | Implementation |
+|---|---|---|
+| `LPZ_GRID_DRAW_GRID` | Bounded XZ line grid | CPU line geometry, cached |
+| `LPZ_GRID_DRAW_AXES` | Short axis arrows (+X red, +Y green, +Z blue) | CPU line geometry, part of same cache |
+| `LPZ_GRID_INFINITE` | Shader-based infinite grid | Fullscreen triangle, depth OFF, deferred to EndDraw |
+
+#### Bounded Grid Caching
+
+The bounded line geometry (grid lines + axis arrows) is rebuilt only when `LpzGridDesc` fields change. `LPZ_GRID_INFINITE` is **masked out** of the cache key so switching between `LPZ_GRID_DRAW_ALL` and `LPZ_GRID_ALL` doesn't invalidate the CPU lines.
+
+Centre lines (x=0, z=0) are rendered brighter (brightness 0.52 vs 0.28) and slightly thicker (0.75× vs 0.5× of thickness) than regular grid lines. They are not coloured — axis colours belong only to the short arrows drawn by `LPZ_GRID_DRAW_AXES`.
+
+#### Infinite Grid (Shader-Based)
+
+The infinite grid is drawn in `EndDraw` before point/line flushes, so it appears as a background layer. A single fullscreen triangle is emitted (no vertex buffer); the fragment shader computes the XZ plane intersection from interpolated world-space rays derived from the inverse view-projection matrix:
+
+```mermaid
+flowchart LR
+    VS([grid_vertex\n3 vertices]) --> UP[Unproject NDC corners\nto near/far world-space rays\nusing inv_view_proj]
+    UP --> INTERP[Interpolate ray\nper fragment]
+    INTERP --> FS([grid_fragment])
+    FS --> INT[Intersect ray with y=0 plane\nt = -near.y / far.y-near.y]
+    INT --> GRID[Compute grid-space coords\ngxz = xz / spacing]
+    GRID --> AA[fwidth-based AA\n abs fract - 0.5 / deriv]
+    AA --> FADE[Distance fade\nsmoothstep near_fade far_fade]
+    FADE --> OUT[Output grey pixel\nbrighter on centre lines]
+```
+
+The inverse view-projection matrix is computed in `DrawGrid` (early in the frame) and cached in `infinite_grid_inv_view_proj`. If `view_proj` hasn't changed since the last call (`memcmp` guard + `vp_dirty` flag), the inversion is skipped entirely — `glm_mat4_inv` only runs on camera movement.
+
+Legacy wrappers `DrawGridAndAxes` and `DrawInfiniteGrid` are kept for source compatibility and forward to `DrawGrid`.
 
 ---
 
@@ -908,43 +921,81 @@ The font atlas uses **Signed Distance Field** rasterization via `stb_truetype`. 
 | `< 0.5` | Outside (background) |
 | `< 0.01` | Far outside — early `discard` |
 
-### 10.2 Fragment Shader Anti-Aliasing
+### 10.2 Kern Table & Advance Cache
+
+`LpzFontAtlasCreate` builds two lookup tables at atlas creation time, eliminating per-character stbtt calls from the hot path:
+
+#### Kern Table
+
+For contiguous codepoint sets ≤ 512 codepoints (the default printable ASCII set is 95 codepoints = 9,025 pairs ≈ 18 KB), a flat 2-D table is populated once:
+
+```c
+int16_t *kern_table;    // [prev_idx * cp_range + cur_idx], NULL if not built
+uint32_t kern_cp_min;   // lowest codepoint in the table
+uint32_t kern_cp_range; // table dimension
+```
+
+Per-character kern lookup collapses from a `stbtt_GetCodepointKernAdvance` binary search to a single array dereference:
+
+```c
+// Hot path (95%+ of characters):
+uint32_t row = prev_cp - atlas->kern_cp_min;
+uint32_t col = cp      - atlas->kern_cp_min;
+kern = atlas->kern_table[row * atlas->kern_cp_range + col];
+
+// Fallback (out-of-range codepoints such as emoji):
+kern = stbtt_GetCodepointKernAdvance(&atlas->font_info, prev_cp, cp);
+```
+
+#### Scaled Advance Cache
+
+```c
+float *advance_scaled;  // advance_scaled[i] = glyphs[i].advance_width * font_scale
+```
+
+Precomputing `advance_width * font_scale` at atlas build time means `TextBatchAdd` only multiplies by the per-call `scale = font_size / atlas_size` instead of two separate multiplies. Indexed by `g - atlas->glyphs` (pointer difference into the sorted glyph array).
+
+Both tables are freed in `LpzFontAtlasDestroy` via `LPZ_FREE`.
+
+### 10.3 Fragment Shader Anti-Aliasing
 
 ```glsl
-// text.frag — SDF with fwidth-based AA:
 float sdf   = texture(sampler2D(u_atlas, u_sampler), v_uv).r;
-if (sdf < 0.01) discard;                  // early-out: far outside glyph
+if (sdf < 0.01) discard;               // early-out: far outside glyph
 
-float w     = fwidth(sdf);                // screen-space derivative
+float w     = fwidth(sdf);             // screen-space derivative
 float alpha = smoothstep(0.5-w, 0.5+w, sdf);  // AA band = ±1 pixel
 
-if (alpha < 0.004) discard;               // discard SDF ringing artefacts
+if (alpha < 0.004) discard;            // discard SDF ringing artefacts
 out_color = vec4(v_color.rgb, v_color.a * alpha);
 ```
 
-`fwidth(sdf)` returns `abs(dFdx(sdf)) + abs(dFdy(sdf))` — automatically scaling the AA band to the screen-space texel size, giving correct antialiasing at any text scale, rotation, or perspective projection.
+`fwidth(sdf)` automatically scales the AA band to screen-space texel size, giving correct antialiasing at any text scale, rotation, or perspective projection — no manual tuning.
 
-### 10.3 Glyph Instance Layout
+### 10.4 Glyph Instance Layout
 
-Each glyph is a `LpzGlyphInstance` (64 bytes, 16 × float) uploaded to the ring-buffered SSBO:
-
-```
-offset  0: pos_x, pos_y         — screen-space top-left (pixels)
-offset  8: size_x, size_y       — quad size (pixels)
-offset 16: uv_x, uv_y           — atlas UV origin [0,1]
-offset 24: uv_w, uv_h           — atlas UV extent [0,1]
-offset 32: r, g, b, a           — linear RGBA color
-offset 48: screen_w, screen_h   — framebuffer dimensions for NDC
-offset 56: font_size, _pad      — em-size in pixels + padding to 64 bytes
-```
-
-The vertex shader reads this SSBO indexed by `gl_InstanceIndex`, generates all 6 corners of the glyph quad procedurally (no vertex buffer), and converts screen-space coordinates to NDC using a single FMA:
+Each glyph is a `LpzGlyphInstance` (64 bytes, 16 × float) in the ring-buffered SSBO. The vertex shader generates all 6 quad corners from a `CORNERS[6]` constant array indexed by `gl_VertexIndex`, with NDC conversion using a single FMA:
 
 ```glsl
-// text.vert — NDC conversion with Y-flip baked in:
+// NDC conversion with Y-flip baked in:
 vec2 ndc = fma(screen_pos, vec2(2.0, -2.0) / g.screen, vec2(-1.0, 1.0));
-//         ↑ single fused multiply-add replaces: div + mul + sub + negate
 ```
+
+### 10.5 Persistent Glyph Buffer Mapping
+
+`TextBatchFlush` maps each ring-buffer slot once and reuses the pointer:
+
+```c
+if (!batch->map_valid[slot]) {
+    mapped = Lpz.device.MapMemory(device, batch->gpu_buffer, frame_index);
+    batch->mapped_ptrs[slot] = mapped;
+    batch->map_valid[slot]   = (mapped != NULL);
+}
+if (!mapped) return;
+memcpy(mapped, batch->cpu, (size_t)batch->glyph_count * sizeof(LpzGlyphInstance));
+```
+
+This was the original motivation for the pattern now applied to all three dynamic SSBOs.
 
 ---
 
@@ -960,16 +1011,16 @@ flowchart TD
     CC([CreateContext]) --> |Creates| S[Surface\nlpz_surface_t]
     CC --> |Creates| R[Renderer\nlpz_renderer_t]
     CC --> |Creates| DT[Depth Texture\nlpz_texture_t]
-    CC --> |Creates| PP[Pipelines ×4\nlpz_pipeline_t]
+    CC --> |Creates| PP[Pipelines ×5\nscene · inst · point · line · infinite grid]
     CC --> |Creates| BUF[GPU Buffers\npoint/line/inst SSBOs]
-    CC --> |Creates| FA[Font Atlas\nLpzFontAtlas]
+    CC --> |Creates| FA[Font Atlas\nLpzFontAtlas + kern/advance tables]
     CC --> |Creates| TB[Text Batch\nTextBatch]
 
     ML["Main Loop\nRun / BeginDraw / EndDraw"] --> |Uses| R
     ML --> |Uses| S
     ML --> |Uses| BUF
 
-    DC([DestroyContext]) --> |Destroys in order| BUF2[GPU Buffers\npoint/line/inst/text]
+    DC([DestroyContext]) --> |Unmaps then destroys| BUF2[SSBO persistent maps\n→ GPU Buffers]
     DC --> |Destroys| PP2[Pipelines + DS states + BGLs]
     DC --> |Destroys| TB2[TextBatch + FontAtlas]
     DC --> |Destroys| DT2[Depth Texture]
@@ -990,10 +1041,14 @@ flowchart TD
 | `lpz_surface_t` | `CreateContext` / `DestroyContext` | Before device |
 | `lpz_renderer_t` | `CreateContext` / `DestroyContext` | Before device, after surface |
 | `lpz_pipeline_t` | Caller | Anytime after `WaitIdle` |
-| `lpz_buffer_t` | Caller | Anytime after `WaitIdle` |
+| `lpz_buffer_t` | Caller | Anytime after `WaitIdle`; unmap first if persistently mapped |
 | `lpz_texture_t` | Caller | Anytime after `WaitIdle` |
 | `lpz_bind_group_t` | Caller | Anytime after `WaitIdle` |
-| `Mesh.vb / Mesh.ib` | Caller via `DestroyMesh` | Anytime after `WaitIdle` |
+| `Mesh.vb / Mesh.ib` | Caller via `DestroyMesh` | Anytime after `WaitIdle` (CPU memory only; vb/ib must be destroyed separately via `Lpz.device.DestroyBuffer`) |
+
+#### `geometry.h` — Extern Constant Arrays
+
+The built-in primitive geometry arrays (`TRIANGLE_VERTICES`, `QUAD_VERTICES`, `CUBE_VERTICES`, and their index counterparts) are declared `extern const` in `geometry.h` and defined once in `geometry.c`. This avoids the `static const` pattern that would cause a fresh copy of each array to be emitted in every translation unit that includes the header.
 
 ### 11.3 Synchronization Summary
 
@@ -1007,6 +1062,7 @@ flowchart TD
 | `_Atomic uint32_t` | Draw counter (stats only, no ordering) | Both |
 | `@autoreleasepool` | ObjC teardown outside active pool | Metal |
 | Deferred free queue | GPU object lifetime with retainedReferences=NO | Metal |
+| Persistent SSBO maps | Point / line / instance / text buffer reuse | Both |
 
 ---
 
@@ -1026,9 +1082,12 @@ flowchart TD
 | Transfer queue | Graphics queue (Metal only has one) | Dedicated DMA queue when available |
 | GPU timeline | `MTLSharedEvent` | `VkFence` + `VkSemaphore` |
 | Image layout tracking | N/A (automatic) | Per-texture `currentLayout` + `layoutKnown` |
-| Frame arena size | 64 KB (`LPZ_MTL_FRAME_ARENA_SIZE`) | 64 KB (`LPZ_VK_FRAME_ARENA_SIZE`) |
+| Frame arena size | 64 KB (`LPZ_FRAME_ARENA_SIZE` from `internals.h`) | 64 KB (`LPZ_FRAME_ARENA_SIZE` from `internals.h`) |
 | Atomic draw counter | `_Atomic uint32_t`, relaxed | `_Atomic uint32_t`, relaxed |
 | Present modes | FIFO / non-FIFO via `displaySyncEnabled` | FIFO / MAILBOX / IMMEDIATE (with fallback) |
+| Persistent SSBO mapping | ✓ (point, line, inst, text) | ✓ (point, line, inst, text) |
+| Kern table cache | ✓ (built at atlas create time) | ✓ (built at atlas create time) |
+| MVP hash | ✓ (64-bit XOR fingerprint) | ✓ (64-bit XOR fingerprint) |
 
 ### Per-Frame Cost Comparison
 
@@ -1036,16 +1095,18 @@ flowchart TD
 |---|---|---|
 | Frame synchronization | `dispatch_semaphore_wait` | `vkWaitForFences` |
 | Arena reset | `arenaOffset = 0` (1 store) | `arenaOffset = 0` (1 store) |
-| Command buffer begin | `commandBufferWithDescriptor:` (reused desc) | `vkResetCommandBuffer` + `vkBeginCommandBuffer` |
+| Command buffer begin | `commandBufferWithDescriptor:` (reused desc) | `vkResetCommandPool` + `vkBeginCommandBuffer` |
 | Render pass begin | `renderCommandEncoderWithDescriptor:` | `vkCmdBeginRenderingKHR` |
 | State reset after pass | `lpz_renderer_reset_frame_state` | `lpz_vk_renderer_reset_state` |
+| SSBO upload (per frame) | `memcpy` into persistent mapped ptr | `memcpy` into persistent mapped ptr |
+| MVP matrix check | 64-bit hash compare | 64-bit hash compare |
 | Submit | `commit` + `addCompletedHandler` | `vkQueueSubmit` |
 | Present | `presentDrawable:` (inside commit) | `vkQueuePresentKHR` |
 | Pool teardown | `NSAutoreleasePool drain` | N/A |
 
 ### Vulkan Barrier Strategy
 
-Lapiz uses `VK_KHR_synchronization2` (Vulkan 1.3 core) when available, falling back to the legacy `vkCmdPipelineBarrier`. The choice is made once at device creation and dispatched through the `lpz_vk_image_barrier` inline helper:
+Lapiz uses `VK_KHR_synchronization2` (Vulkan 1.3 core) when available, falling back to the legacy `vkCmdPipelineBarrier`:
 
 ```mermaid
 flowchart LR
@@ -1054,4 +1115,4 @@ flowchart LR
     S2 -- No --> LB[VkImageMemoryBarrier\nsrcStageMask / dstStageMask\nvkCmdPipelineBarrier legacy]
 ```
 
-Sync2 allows more precise stage masks (e.g. `VK_PIPELINE_STAGE_2_BLIT_BIT_KHR`) and is required for correct mipmap generation on Vulkan 1.3 drivers.
+Sync2 allows more precise stage masks and is required for correct mipmap generation on Vulkan 1.3 drivers.

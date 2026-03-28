@@ -49,6 +49,11 @@ extern PFN_vkCmdEndRenderingKHR g_vkCmdEndRendering;
 extern PFN_vkCmdSetDepthTestEnableEXT g_vkCmdSetDepthTestEnable;
 extern PFN_vkCmdSetDepthWriteEnableEXT g_vkCmdSetDepthWriteEnable;
 extern PFN_vkCmdSetDepthCompareOpEXT g_vkCmdSetDepthCompareOp;
+extern PFN_vkCmdSetStencilTestEnableEXT  g_vkCmdSetStencilTestEnable;
+extern PFN_vkCmdSetStencilOpEXT          g_vkCmdSetStencilOp;
+/* CompareMask / WriteMask are Vulkan core (no EXT suffix): */
+extern PFN_vkCmdSetStencilCompareMask    g_vkCmdSetStencilCompareMask;
+extern PFN_vkCmdSetStencilWriteMask      g_vkCmdSetStencilWriteMask;
 
 typedef void(VKAPI_PTR *PFN_vkCmdDrawMeshTasksEXT_t)(VkCommandBuffer, uint32_t, uint32_t, uint32_t);
 extern PFN_vkCmdDrawMeshTasksEXT_t g_vkCmdDrawMeshTasksEXT;
@@ -140,6 +145,12 @@ struct depth_stencil_state_t {
     bool depth_test_enable;
     bool depth_write_enable;
     VkCompareOp depth_compare_op;
+    bool stencil_test_enable;
+    VkStencilOpState front;
+    VkStencilOpState back;
+    uint8_t stencil_read_mask;
+    uint8_t stencil_write_mask;
+    uint32_t stencil_reference;
 };
 
 struct pipeline_t {
@@ -765,6 +776,22 @@ LAPIZ_INLINE VkAttachmentLoadOp LpzToVkLoadOp(LpzLoadOp op)
 LAPIZ_INLINE VkAttachmentStoreOp LpzToVkStoreOp(LpzStoreOp op)
 {
     return (op == LPZ_STORE_OP_DONT_CARE) ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+}
+
+
+LAPIZ_INLINE VkStencilOp LpzToVkStencilOp(LpzStencilOp op)
+{
+    switch (op) {
+        case LPZ_STENCIL_OP_ZERO:                return VK_STENCIL_OP_ZERO;
+        case LPZ_STENCIL_OP_REPLACE:             return VK_STENCIL_OP_REPLACE;
+        case LPZ_STENCIL_OP_INCREMENT_AND_CLAMP: return VK_STENCIL_OP_INCREMENT_AND_CLAMP;
+        case LPZ_STENCIL_OP_DECREMENT_AND_CLAMP: return VK_STENCIL_OP_DECREMENT_AND_CLAMP;
+        case LPZ_STENCIL_OP_INVERT:              return VK_STENCIL_OP_INVERT;
+        case LPZ_STENCIL_OP_INCREMENT_AND_WRAP:  return VK_STENCIL_OP_INCREMENT_AND_WRAP;
+        case LPZ_STENCIL_OP_DECREMENT_AND_WRAP:  return VK_STENCIL_OP_DECREMENT_AND_WRAP;
+        case LPZ_STENCIL_OP_KEEP:
+        default:                                 return VK_STENCIL_OP_KEEP;
+    }
 }
 
 LAPIZ_INLINE VkBlendFactor LpzToVkBlendFactor(LpzBlendFactor f)

@@ -26,6 +26,10 @@ PFN_vkCmdEndRenderingKHR g_vkCmdEndRendering = NULL;
 PFN_vkCmdSetDepthTestEnableEXT g_vkCmdSetDepthTestEnable = NULL;
 PFN_vkCmdSetDepthWriteEnableEXT g_vkCmdSetDepthWriteEnable = NULL;
 PFN_vkCmdSetDepthCompareOpEXT g_vkCmdSetDepthCompareOp = NULL;
+PFN_vkCmdSetStencilTestEnableEXT  g_vkCmdSetStencilTestEnable  = NULL;
+PFN_vkCmdSetStencilOpEXT          g_vkCmdSetStencilOp          = NULL;
+PFN_vkCmdSetStencilCompareMask    g_vkCmdSetStencilCompareMask = NULL;
+PFN_vkCmdSetStencilWriteMask      g_vkCmdSetStencilWriteMask   = NULL;
 PFN_vkCmdDrawMeshTasksEXT_t g_vkCmdDrawMeshTasksEXT = NULL;
 PFN_vkCmdDrawIndirectCountKHR_t g_vkCmdDrawIndirectCount = NULL;
 PFN_vkCmdDrawIndexedIndirectCountKHR_t g_vkCmdDrawIndexedIndirectCount = NULL;
@@ -579,7 +583,12 @@ static LpzResult lpz_vk_device_create(lpz_device_t *out_device)
     {
         g_vkCmdSetDepthTestEnable = (PFN_vkCmdSetDepthTestEnableEXT)vkGetDeviceProcAddr(dev->device, g_vk13 ? "vkCmdSetDepthTestEnable" : "vkCmdSetDepthTestEnableEXT");
         g_vkCmdSetDepthWriteEnable = (PFN_vkCmdSetDepthWriteEnableEXT)vkGetDeviceProcAddr(dev->device, g_vk13 ? "vkCmdSetDepthWriteEnable" : "vkCmdSetDepthWriteEnableEXT");
-        g_vkCmdSetDepthCompareOp = (PFN_vkCmdSetDepthCompareOpEXT)vkGetDeviceProcAddr(dev->device, g_vk13 ? "vkCmdSetDepthCompareOp" : "vkCmdSetDepthCompareOpEXT");
+        g_vkCmdSetDepthCompareOp    = (PFN_vkCmdSetDepthCompareOpEXT)vkGetDeviceProcAddr(dev->device, g_vk13 ? "vkCmdSetDepthCompareOp" : "vkCmdSetDepthCompareOpEXT");
+        g_vkCmdSetStencilTestEnable = (PFN_vkCmdSetStencilTestEnableEXT)vkGetDeviceProcAddr(dev->device, g_vk13 ? "vkCmdSetStencilTestEnable" : "vkCmdSetStencilTestEnableEXT");
+        g_vkCmdSetStencilOp         = (PFN_vkCmdSetStencilOpEXT)vkGetDeviceProcAddr(dev->device, g_vk13 ? "vkCmdSetStencilOp" : "vkCmdSetStencilOpEXT");
+        /* CompareMask/WriteMask are Vulkan core — always available, no EXT variant: */
+        g_vkCmdSetStencilCompareMask = (PFN_vkCmdSetStencilCompareMask)vkGetDeviceProcAddr(dev->device, "vkCmdSetStencilCompareMask");
+        g_vkCmdSetStencilWriteMask   = (PFN_vkCmdSetStencilWriteMask)vkGetDeviceProcAddr(dev->device, "vkCmdSetStencilWriteMask");
     }
     if (hasMeshShader)
         g_vkCmdDrawMeshTasksEXT = (PFN_vkCmdDrawMeshTasksEXT_t)vkGetDeviceProcAddr(dev->device, "vkCmdDrawMeshTasksEXT");
@@ -1312,9 +1321,31 @@ static LpzResult lpz_vk_device_create_depth_stencil_state(lpz_device_t device, c
     if (!out)
         return LPZ_FAILURE;
     struct depth_stencil_state_t *ds = calloc(1, sizeof(struct depth_stencil_state_t));
-    ds->depth_test_enable = desc->depth_test_enable;
+    ds->depth_test_enable  = desc->depth_test_enable;
     ds->depth_write_enable = desc->depth_write_enable;
-    ds->depth_compare_op = LpzToVkCompareOp(desc->depth_compare_op);
+    ds->depth_compare_op   = LpzToVkCompareOp(desc->depth_compare_op);
+    ds->stencil_test_enable = desc->stencil_test_enable;
+    ds->stencil_read_mask   = desc->stencil_read_mask;
+    ds->stencil_write_mask  = desc->stencil_write_mask;
+    ds->stencil_reference   = desc->stencil_reference;
+    ds->front = (VkStencilOpState){
+        .failOp      = LpzToVkStencilOp(desc->front.fail_op),
+        .passOp      = LpzToVkStencilOp(desc->front.pass_op),
+        .depthFailOp = LpzToVkStencilOp(desc->front.depth_fail_op),
+        .compareOp   = LpzToVkCompareOp(desc->front.compare_op),
+        .compareMask = desc->stencil_read_mask,
+        .writeMask   = desc->stencil_write_mask,
+        .reference   = desc->stencil_reference,
+    };
+    ds->back = (VkStencilOpState){
+        .failOp      = LpzToVkStencilOp(desc->back.fail_op),
+        .passOp      = LpzToVkStencilOp(desc->back.pass_op),
+        .depthFailOp = LpzToVkStencilOp(desc->back.depth_fail_op),
+        .compareOp   = LpzToVkCompareOp(desc->back.compare_op),
+        .compareMask = desc->stencil_read_mask,
+        .writeMask   = desc->stencil_write_mask,
+        .reference   = desc->stencil_reference,
+    };
     *out = ds;
     return LPZ_SUCCESS;
 }
@@ -1467,7 +1498,10 @@ static LpzResult lpz_vk_device_create_pipeline(lpz_device_t device, const LpzPip
     // Dynamic state
     VkDynamicState dynBase[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkDynamicState dynExtended[] = {
-        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
+        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+        VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
+        VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP,
+        VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
     };
     VkPipelineDynamicStateCreateInfo dynState = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
