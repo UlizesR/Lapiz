@@ -1,0 +1,90 @@
+---
+# Language: Cpp
+BasedOnStyle: LLVM
+
+# Column limit
+ColumnLimit: 300
+
+# Brace wrapping — Allman style for functions, control flow, etc.
+# but NOT for initialiser lists / aggregate init (= { ... })
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterFunction:     true
+  AfterControlStatement: Always   # if / else / for / while / switch / do
+  AfterEnum:         false
+  AfterStruct:       false
+  AfterUnion:        false
+  AfterClass:        false
+  AfterNamespace:    false
+  BeforeElse:        true         # put closing } and else on separate lines
+  BeforeCatch:       true
+  IndentBraces:      false
+  SplitEmptyFunction: false
+  SplitEmptyRecord:   false
+
+# Force single-line if/for/while bodies onto their own line
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine:        false
+AllowShortCaseLabelsOnASingleLine:   false
+AllowShortBlocksOnASingleLine:       Never
+AllowShortFunctionsOnASingleLine:    None
+
+# Always newline after a semicolon (no multiple statements on one line)
+# clang-format does not have a direct "newline after ;" toggle, but
+# disabling all single-line compaction achieves the same effect.
+AllowShortEnumsOnASingleLine: false
+
+# Spacing around assignment operators (exactly one space each side)
+SpaceBeforeAssignmentOperators: true   # guarantees the space before =
+# clang-format always emits one space after = — no knob needed.
+
+# General spacing
+SpaceAfterCStyleCast:             false
+SpaceAfterLogicalNot:             false
+SpaceAroundPointerQualifiers:     Default
+SpaceBeforeParens:                ControlStatements
+SpaceBeforeSquareBrackets:        false
+SpaceInEmptyBlock:                false
+SpaceInEmptyParentheses:          false
+SpacesBeforeTrailingComments:     2
+SpacesInAngles:                   Never
+SpacesInCStyleCastParentheses:    false
+SpacesInConditionalStatement:     false
+SpacesInContainerLiterals:        false
+SpacesInParentheses:              false
+SpacesInSquareBrackets:           false
+
+# Indentation
+IndentWidth:              4
+TabWidth:                 4
+UseTab:                   Never
+IndentCaseLabels:         true
+IndentCaseBlocks:         false
+IndentGotoLabels:         false
+IndentPPDirectives:       None
+ContinuationIndentWidth:  4
+
+# Alignment
+AlignAfterOpenBracket:        Align
+AlignConsecutiveAssignments:  false
+AlignConsecutiveDeclarations: false
+AlignEscapedNewlines:         Right
+AlignOperands:                Align
+AlignTrailingComments:        true
+
+# Line breaking
+BreakBeforeBinaryOperators:   None
+BreakBeforeTernaryOperators:  true
+BreakStringLiterals:          false
+BreakConstructorInitializers: BeforeComma
+
+# Include sorting
+SortIncludes:        CaseSensitive
+IncludeBlocks:       Preserve
+
+# Misc
+MaxEmptyLinesToKeep:        1
+KeepEmptyLinesAtTheStartOfBlocks: false
+PointerAlignment:           Right
+DerivePointerAlignment:     false
+ReflowComments:             false
