@@ -1,0 +1,1093 @@
+/* platform_sdl3.c — Lapiz SDL3 Platform Backend
+ *
+ * Implements LpzPlatformAPI using SDL3. Exports LpzSDL3Platform and defines
+ * g_lpz_platform_api (required by the Metal surface backend in mtl_surface.m).
+ *
+ * Changes from old platform_sdl3.c:
+ *   - Includes updated: old core/log.h + core/window.h removed; uses lapiz.h.
+ *   - lpz_window_t is now a typed handle {lpz_handle_t h}; window structs are
+ *     managed via a static LpzPool (g_sdl_win_pool).
+ *   - Init() takes const LpzPlatformInitDesc * (was void).
+ *   - CreateWindow() gains uint32_t flags (LpzWindowFlags); applies them at
+ *     SDL window creation time.
+ *   - GetKey() parameter: LpzKey (was int).
+ *   - GetMouseButton() parameter: LpzMouseButton (was int).
+ *   - PopTypedChar renamed GetNextTypedChar.
+ *   - API table renamed LpzSDL3Platform (was LpzWindow_SDL, type LpzWindowAPI).
+ *   - g_lpz_platform_api defined here; set in Init() for mtl_surface.m.
+ *   - GetNativeHandle returns NSWindow* on macOS (via SDL Cocoa property) so
+ *     mtl_surface.m can attach CAMetalLayer correctly.
+ */
+
+#define LPZ_INTERNAL
+#include "../../include/lapiz.h"
+#include "platform_common.h"
+
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+
+#include <stdlib.h>
+#include <string.h>
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+/* Pointer consumed by mtl_surface.m to call GetNativeHandle during surface
+ * creation. Set once in Init() and never changed afterwards. */
+const LpzPlatformAPI *g_lpz_platform_api = NULL;
+
+/* Pool for window_t objects. Initialised on first CreateWindow call. */
+static LpzPool g_sdl_win_pool;
+static bool g_sdl_win_pool_ready = false;
+
+/* Graphics backend selected at Init() time — drives the window creation flags. */
+static LpzGraphicsBackend s_graphics_backend = LPZ_GRAPHICS_BACKEND_METAL;
+
+#define LPZ_SDL_PROP_WINDOW "lpz.window"
+#define LPZ_SDL_WIN_POOL_CAPACITY 64u
+
+// ============================================================================
+// WINDOW STATE — defined before ensure_win_pool so sizeof(struct window_t) is valid
+// ============================================================================
+
+struct window_t {
+    SDL_Window *handle;
+
+    /* self_h lets event callbacks reconstruct the typed handle when invoking
+     * the user's LpzWindowResizeCallback (which takes lpz_window_t). */
+    lpz_handle_t self_h;
+
+    uint8_t keys[LPZ_KEY_LAST + 1];
+    uint8_t mouse_buttons[LPZ_MOUSE_BUTTON_COUNT];
+
+    float mouse_x;
+    float mouse_y;
+    float content_scale_x;
+    float content_scale_y;
+
+    uint32_t flags;
+    bool resized_last_frame;
+    bool should_close;
+    bool ready;
+
+    int windowed_x;
+    int windowed_y;
+    int windowed_w;
+    int windowed_h;
+
+    lpz_char_queue_t char_queue;
+
+    LpzWindowResizeCallback resize_callback;
+    void *resize_userdata;
+};
+
+/* Resolve handle → struct pointer (all public API functions go through this). */
+LPZ_INLINE struct window_t *win_get(lpz_window_t h)
+{
+    if (!LPZ_HANDLE_VALID(h))
+        return NULL;
+    return LPZ_POOL_GET(&g_sdl_win_pool, h.h, struct window_t);
+}
+
+static void ensure_win_pool(void)
+{
+    if (!g_sdl_win_pool_ready)
+    {
+        lpz_pool_init(&g_sdl_win_pool, LPZ_SDL_WIN_POOL_CAPACITY, sizeof(struct window_t));
+        g_sdl_win_pool_ready = true;
+    }
+}
+
+// ============================================================================
+// FORWARD DECLARATIONS
+// ============================================================================
+
+static void lpz_sdl_toggle_fullscreen(lpz_window_t window);
+static void lpz_sdl_toggle_borderless_windowed(lpz_window_t window);
+static bool lpz_sdl_is_fullscreen(lpz_window_t window);
+static SDL_Scancode lpz_key_to_sdl_scancode(int key);
+
+// ============================================================================
+// INTERNAL HELPERS
+// ============================================================================
+
+static void sdl_log_output(void *userdata, int category, SDL_LogPriority priority, const char *message)
+{
+    (void)userdata;
+    (void)category;
+
+    switch (priority)
+    {
+        case SDL_LOG_PRIORITY_TRACE:
+        case SDL_LOG_PRIORITY_VERBOSE:
+        case SDL_LOG_PRIORITY_DEBUG:
+            LPZ_DEBUG("[SDL] %s", message ? message : "(null)");
+            break;
+        case SDL_LOG_PRIORITY_INFO:
+            LPZ_INFO("[SDL] %s", message ? message : "(null)");
+            break;
+        case SDL_LOG_PRIORITY_WARN:
+            LPZ_WARN("[SDL] %s", message ? message : "(null)");
+            break;
+        case SDL_LOG_PRIORITY_ERROR:
+        case SDL_LOG_PRIORITY_CRITICAL:
+        default:
+            LPZ_ERROR("[SDL] %s", message ? message : "(null)");
+            break;
+    }
+}
+
+/* Look up an internal window_t* from an SDL window ID (used by event dispatch). */
+static struct window_t *lpz_sdl_get_window_from_id(SDL_WindowID id)
+{
+    SDL_Window *sdl_window = SDL_GetWindowFromID(id);
+    if (!sdl_window)
+        return NULL;
+
+    SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window);
+    return (struct window_t *)SDL_GetPointerProperty(props, LPZ_SDL_PROP_WINDOW, NULL);
+}
+
+// ============================================================================
+// LIFECYCLE
+// ============================================================================
+
+static bool lpz_sdl_init(const LpzPlatformInitDesc *desc)
+{
+    if (desc)
+        s_graphics_backend = desc->graphics_backend;
+
+    SDL_SetLogOutputFunction(sdl_log_output, NULL);
+
+    if (!SDL_Init(SDL_INIT_VIDEO))
+    {
+        LPZ_ERROR("[SDL] Failed to initialise SDL video: %s", SDL_GetError());
+        return false;
+    }
+
+    ensure_win_pool();
+
+    /* Expose this vtable globally for the Metal surface backend. */
+    extern const LpzPlatformAPI LpzSDL3Platform;
+    g_lpz_platform_api = &LpzSDL3Platform;
+
+    return true;
+}
+
+static void lpz_sdl_terminate(void)
+{
+    SDL_Quit();
+}
+
+// ============================================================================
+// WINDOW MANAGEMENT
+// ============================================================================
+
+static lpz_window_t lpz_sdl_create_window(const char *title, uint32_t width, uint32_t height, uint32_t flags)
+{
+    ensure_win_pool();
+
+    /* Pick exactly one graphics-API flag — SDL3 rejects Metal|Vulkan together. */
+    SDL_WindowFlags sdl_flags = SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    if (s_graphics_backend == LPZ_GRAPHICS_BACKEND_VULKAN)
+        sdl_flags |= SDL_WINDOW_VULKAN;
+    else
+        sdl_flags |= SDL_WINDOW_METAL;
+
+    if (flags & LPZ_WINDOW_FLAG_RESIZABLE)
+        sdl_flags |= SDL_WINDOW_RESIZABLE;
+    if (flags & LPZ_WINDOW_FLAG_UNDECORATED)
+        sdl_flags |= SDL_WINDOW_BORDERLESS;
+    if (flags & LPZ_WINDOW_FLAG_HIDDEN)
+        sdl_flags |= SDL_WINDOW_HIDDEN;
+    if (flags & LPZ_WINDOW_FLAG_FULLSCREEN)
+        sdl_flags |= SDL_WINDOW_FULLSCREEN;
+    if (flags & LPZ_WINDOW_FLAG_ALWAYS_ON_TOP)
+        sdl_flags |= SDL_WINDOW_ALWAYS_ON_TOP;
+    if (flags & LPZ_WINDOW_FLAG_TRANSPARENT)
+        sdl_flags |= SDL_WINDOW_TRANSPARENT;
+
+    SDL_Window *sdl_window = SDL_CreateWindow(title ? title : "Lapiz", (int)width, (int)height, sdl_flags);
+    if (!sdl_window)
+    {
+        LPZ_ERROR("[SDL] Failed to create window: %s", SDL_GetError());
+        return LPZ_WINDOW_NULL;
+    }
+
+    lpz_handle_t h = lpz_pool_alloc(&g_sdl_win_pool);
+    if (h == LPZ_HANDLE_NULL)
+    {
+        SDL_DestroyWindow(sdl_window);
+        LPZ_ERROR("[SDL] Window pool exhausted (capacity %u)", LPZ_SDL_WIN_POOL_CAPACITY);
+        return LPZ_WINDOW_NULL;
+    }
+
+    struct window_t *win = LPZ_POOL_GET(&g_sdl_win_pool, h, struct window_t);
+    memset(win, 0, sizeof(*win));
+
+    win->handle = sdl_window;
+    win->self_h = h;
+    win->ready = true;
+    win->flags = flags;
+    win->windowed_w = (int)width;
+    win->windowed_h = (int)height;
+
+    char_queue_init(&win->char_queue);
+
+    float scale = SDL_GetWindowDisplayScale(sdl_window);
+    win->content_scale_x = (scale > 0.0f) ? scale : 1.0f;
+    win->content_scale_y = win->content_scale_x;
+
+    SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window);
+    SDL_SetPointerProperty(props, LPZ_SDL_PROP_WINDOW, win);
+
+    return (lpz_window_t){h};
+}
+
+static void lpz_sdl_destroy_window(lpz_window_t window)
+{
+    struct window_t *win = win_get(window);
+    if (!win)
+        return;
+
+    SDL_PropertiesID props = SDL_GetWindowProperties(win->handle);
+    SDL_SetPointerProperty(props, LPZ_SDL_PROP_WINDOW, NULL);
+
+    char_queue_destroy(&win->char_queue);
+    SDL_DestroyWindow(win->handle);
+
+    lpz_pool_free(&g_sdl_win_pool, window.h);
+}
+
+static bool lpz_sdl_should_close(lpz_window_t window)
+{
+    struct window_t *win = win_get(window);
+    return win ? win->should_close : true;
+}
+
+// ============================================================================
+// EVENT POLLING
+// ============================================================================
+
+static void lpz_sdl_poll_events(void)
+{
+    SDL_Event event;
+    while (SDL_PollEvent(&event))
+    {
+        switch (event.type)
+        {
+            case SDL_EVENT_QUIT:
+                break;
+
+            case SDL_EVENT_WINDOW_CLOSE_REQUESTED: {
+                struct window_t *win = lpz_sdl_get_window_from_id(event.window.windowID);
+                if (win)
+                    win->should_close = true;
+            }
+            break;
+
+            case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: {
+                struct window_t *win = lpz_sdl_get_window_from_id(event.window.windowID);
+                if (win)
+                {
+                    win->resized_last_frame = true;
+                    if (win->resize_callback)
+                    {
+                        int w = 0, h = 0;
+                        SDL_GetWindowSizeInPixels(win->handle, &w, &h);
+                        win->resize_callback((lpz_window_t){win->self_h}, (uint32_t)w, (uint32_t)h, win->resize_userdata);
+                    }
+                }
+            }
+            break;
+
+            case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED: {
+                struct window_t *win = lpz_sdl_get_window_from_id(event.window.windowID);
+                if (win)
+                {
+                    float scale = SDL_GetWindowDisplayScale(win->handle);
+                    win->content_scale_x = (scale > 0.0f) ? scale : 1.0f;
+                    win->content_scale_y = win->content_scale_x;
+                }
+            }
+            break;
+
+            case SDL_EVENT_KEY_DOWN: {
+                struct window_t *win = lpz_sdl_get_window_from_id(event.key.windowID);
+                if (win)
+                {
+                    SDL_Scancode sc = event.key.scancode;
+                    /* Reverse-map scancode to LpzKey. We iterate rather than
+                     * keeping a separate lookup table; key events are rare. */
+                    for (int k = 0; k <= LPZ_KEY_LAST; ++k)
+                    {
+                        if (lpz_key_to_sdl_scancode(k) == sc)
+                        {
+                            win->keys[k] = event.key.repeat ? (uint8_t)LPZ_KEY_REPEAT : (uint8_t)LPZ_KEY_PRESS;
+                            break;
+                        }
+                    }
+                }
+            }
+            break;
+
+            case SDL_EVENT_KEY_UP: {
+                struct window_t *win = lpz_sdl_get_window_from_id(event.key.windowID);
+                if (win)
+                {
+                    SDL_Scancode sc = event.key.scancode;
+                    for (int k = 0; k <= LPZ_KEY_LAST; ++k)
+                    {
+                        if (lpz_key_to_sdl_scancode(k) == sc)
+                        {
+                            win->keys[k] = (uint8_t)LPZ_KEY_RELEASE;
+                            break;
+                        }
+                    }
+                }
+            }
+            break;
+
+            case SDL_EVENT_TEXT_INPUT: {
+                struct window_t *win = lpz_sdl_get_window_from_id(event.text.windowID);
+                if (win && event.text.text[0] != '\0')
+                {
+                    const unsigned char *p = (const unsigned char *)event.text.text;
+                    while (*p)
+                    {
+                        uint32_t cp = 0;
+                        if ((*p & 0x80u) == 0)
+                        {
+                            cp = *p++;
+                        }
+                        else if ((*p & 0xE0u) == 0xC0u && p[1])
+                        {
+                            cp = ((p[0] & 0x1Fu) << 6) | (p[1] & 0x3Fu);
+                            p += 2;
+                        }
+                        else if ((*p & 0xF0u) == 0xE0u && p[1] && p[2])
+                        {
+                            cp = ((p[0] & 0x0Fu) << 12) | ((p[1] & 0x3Fu) << 6) | (p[2] & 0x3Fu);
+                            p += 3;
+                        }
+                        else if ((*p & 0xF8u) == 0xF0u && p[1] && p[2] && p[3])
+                        {
+                            cp = ((p[0] & 0x07u) << 18) | ((p[1] & 0x3Fu) << 12) | ((p[2] & 0x3Fu) << 6) | (p[3] & 0x3Fu);
+                            p += 4;
+                        }
+                        else
+                        {
+                            ++p;
+                            continue;
+                        }
+                        char_queue_push(&win->char_queue, cp);
+                    }
+                }
+            }
+            break;
+
+            case SDL_EVENT_MOUSE_MOTION: {
+                struct window_t *win = lpz_sdl_get_window_from_id(event.motion.windowID);
+                if (win)
+                {
+                    win->mouse_x = event.motion.x;
+                    win->mouse_y = event.motion.y;
+                }
+            }
+            break;
+
+            case SDL_EVENT_MOUSE_BUTTON_DOWN: {
+                struct window_t *win = lpz_sdl_get_window_from_id(event.button.windowID);
+                if (win)
+                {
+                    int b = -1;
+                    switch (event.button.button)
+                    {
+                        case SDL_BUTTON_LEFT:
+                            b = LPZ_MOUSE_BUTTON_LEFT;
+                            break;
+                        case SDL_BUTTON_RIGHT:
+                            b = LPZ_MOUSE_BUTTON_RIGHT;
+                            break;
+                        case SDL_BUTTON_MIDDLE:
+                            b = LPZ_MOUSE_BUTTON_MIDDLE;
+                            break;
+                        case SDL_BUTTON_X1:
+                            b = LPZ_MOUSE_BUTTON_4;
+                            break;
+                        case SDL_BUTTON_X2:
+                            b = LPZ_MOUSE_BUTTON_5;
+                            break;
+                        default:
+                            break;
+                    }
+                    if (b >= 0 && b < LPZ_MOUSE_BUTTON_COUNT)
+                        win->mouse_buttons[b] = 1;
+                }
+            }
+            break;
+
+            case SDL_EVENT_MOUSE_BUTTON_UP: {
+                struct window_t *win = lpz_sdl_get_window_from_id(event.button.windowID);
+                if (win)
+                {
+                    int b = -1;
+                    switch (event.button.button)
+                    {
+                        case SDL_BUTTON_LEFT:
+                            b = LPZ_MOUSE_BUTTON_LEFT;
+                            break;
+                        case SDL_BUTTON_RIGHT:
+                            b = LPZ_MOUSE_BUTTON_RIGHT;
+                            break;
+                        case SDL_BUTTON_MIDDLE:
+                            b = LPZ_MOUSE_BUTTON_MIDDLE;
+                            break;
+                        case SDL_BUTTON_X1:
+                            b = LPZ_MOUSE_BUTTON_4;
+                            break;
+                        case SDL_BUTTON_X2:
+                            b = LPZ_MOUSE_BUTTON_5;
+                            break;
+                        default:
+                            break;
+                    }
+                    if (b >= 0 && b < LPZ_MOUSE_BUTTON_COUNT)
+                        win->mouse_buttons[b] = 0;
+                }
+            }
+            break;
+
+            default:
+                break;
+        }
+    }
+}
+
+// ============================================================================
+// KEY / MOUSE MAPPING
+// ============================================================================
+
+/* Maps LpzKey enum values to SDL scancodes.
+ * Called during key events to reverse-map, and from GetKey for direct lookup. */
+static SDL_Scancode lpz_key_to_sdl_scancode(int key)
+{
+    switch (key)
+    {
+        case LPZ_KEY_SPACE:
+            return SDL_SCANCODE_SPACE;
+        case LPZ_KEY_APOSTROPHE:
+            return SDL_SCANCODE_APOSTROPHE;
+        case LPZ_KEY_COMMA:
+            return SDL_SCANCODE_COMMA;
+        case LPZ_KEY_MINUS:
+            return SDL_SCANCODE_MINUS;
+        case LPZ_KEY_PERIOD:
+            return SDL_SCANCODE_PERIOD;
+        case LPZ_KEY_SLASH:
+            return SDL_SCANCODE_SLASH;
+        case LPZ_KEY_0:
+            return SDL_SCANCODE_0;
+        case LPZ_KEY_1:
+            return SDL_SCANCODE_1;
+        case LPZ_KEY_2:
+            return SDL_SCANCODE_2;
+        case LPZ_KEY_3:
+            return SDL_SCANCODE_3;
+        case LPZ_KEY_4:
+            return SDL_SCANCODE_4;
+        case LPZ_KEY_5:
+            return SDL_SCANCODE_5;
+        case LPZ_KEY_6:
+            return SDL_SCANCODE_6;
+        case LPZ_KEY_7:
+            return SDL_SCANCODE_7;
+        case LPZ_KEY_8:
+            return SDL_SCANCODE_8;
+        case LPZ_KEY_9:
+            return SDL_SCANCODE_9;
+        case LPZ_KEY_SEMICOLON:
+            return SDL_SCANCODE_SEMICOLON;
+        case LPZ_KEY_EQUAL:
+            return SDL_SCANCODE_EQUALS;
+        case LPZ_KEY_A:
+            return SDL_SCANCODE_A;
+        case LPZ_KEY_B:
+            return SDL_SCANCODE_B;
+        case LPZ_KEY_C:
+            return SDL_SCANCODE_C;
+        case LPZ_KEY_D:
+            return SDL_SCANCODE_D;
+        case LPZ_KEY_E:
+            return SDL_SCANCODE_E;
+        case LPZ_KEY_F:
+            return SDL_SCANCODE_F;
+        case LPZ_KEY_G:
+            return SDL_SCANCODE_G;
+        case LPZ_KEY_H:
+            return SDL_SCANCODE_H;
+        case LPZ_KEY_I:
+            return SDL_SCANCODE_I;
+        case LPZ_KEY_J:
+            return SDL_SCANCODE_J;
+        case LPZ_KEY_K:
+            return SDL_SCANCODE_K;
+        case LPZ_KEY_L:
+            return SDL_SCANCODE_L;
+        case LPZ_KEY_M:
+            return SDL_SCANCODE_M;
+        case LPZ_KEY_N:
+            return SDL_SCANCODE_N;
+        case LPZ_KEY_O:
+            return SDL_SCANCODE_O;
+        case LPZ_KEY_P:
+            return SDL_SCANCODE_P;
+        case LPZ_KEY_Q:
+            return SDL_SCANCODE_Q;
+        case LPZ_KEY_R:
+            return SDL_SCANCODE_R;
+        case LPZ_KEY_S:
+            return SDL_SCANCODE_S;
+        case LPZ_KEY_T:
+            return SDL_SCANCODE_T;
+        case LPZ_KEY_U:
+            return SDL_SCANCODE_U;
+        case LPZ_KEY_V:
+            return SDL_SCANCODE_V;
+        case LPZ_KEY_W:
+            return SDL_SCANCODE_W;
+        case LPZ_KEY_X:
+            return SDL_SCANCODE_X;
+        case LPZ_KEY_Y:
+            return SDL_SCANCODE_Y;
+        case LPZ_KEY_Z:
+            return SDL_SCANCODE_Z;
+        case LPZ_KEY_LEFT_BRACKET:
+            return SDL_SCANCODE_LEFTBRACKET;
+        case LPZ_KEY_BACKSLASH:
+            return SDL_SCANCODE_BACKSLASH;
+        case LPZ_KEY_RIGHT_BRACKET:
+            return SDL_SCANCODE_RIGHTBRACKET;
+        case LPZ_KEY_GRAVE_ACCENT:
+            return SDL_SCANCODE_GRAVE;
+        case LPZ_KEY_ESCAPE:
+            return SDL_SCANCODE_ESCAPE;
+        case LPZ_KEY_ENTER:
+            return SDL_SCANCODE_RETURN;
+        case LPZ_KEY_TAB:
+            return SDL_SCANCODE_TAB;
+        case LPZ_KEY_BACKSPACE:
+            return SDL_SCANCODE_BACKSPACE;
+        case LPZ_KEY_INSERT:
+            return SDL_SCANCODE_INSERT;
+        case LPZ_KEY_DELETE:
+            return SDL_SCANCODE_DELETE;
+        case LPZ_KEY_RIGHT:
+            return SDL_SCANCODE_RIGHT;
+        case LPZ_KEY_LEFT:
+            return SDL_SCANCODE_LEFT;
+        case LPZ_KEY_DOWN:
+            return SDL_SCANCODE_DOWN;
+        case LPZ_KEY_UP:
+            return SDL_SCANCODE_UP;
+        case LPZ_KEY_PAGE_UP:
+            return SDL_SCANCODE_PAGEUP;
+        case LPZ_KEY_PAGE_DOWN:
+            return SDL_SCANCODE_PAGEDOWN;
+        case LPZ_KEY_HOME:
+            return SDL_SCANCODE_HOME;
+        case LPZ_KEY_END:
+            return SDL_SCANCODE_END;
+        case LPZ_KEY_CAPS_LOCK:
+            return SDL_SCANCODE_CAPSLOCK;
+        case LPZ_KEY_SCROLL_LOCK:
+            return SDL_SCANCODE_SCROLLLOCK;
+        case LPZ_KEY_NUM_LOCK:
+            return SDL_SCANCODE_NUMLOCKCLEAR;
+        case LPZ_KEY_PRINT_SCREEN:
+            return SDL_SCANCODE_PRINTSCREEN;
+        case LPZ_KEY_PAUSE:
+            return SDL_SCANCODE_PAUSE;
+        case LPZ_KEY_F1:
+            return SDL_SCANCODE_F1;
+        case LPZ_KEY_F2:
+            return SDL_SCANCODE_F2;
+        case LPZ_KEY_F3:
+            return SDL_SCANCODE_F3;
+        case LPZ_KEY_F4:
+            return SDL_SCANCODE_F4;
+        case LPZ_KEY_F5:
+            return SDL_SCANCODE_F5;
+        case LPZ_KEY_F6:
+            return SDL_SCANCODE_F6;
+        case LPZ_KEY_F7:
+            return SDL_SCANCODE_F7;
+        case LPZ_KEY_F8:
+            return SDL_SCANCODE_F8;
+        case LPZ_KEY_F9:
+            return SDL_SCANCODE_F9;
+        case LPZ_KEY_F10:
+            return SDL_SCANCODE_F10;
+        case LPZ_KEY_F11:
+            return SDL_SCANCODE_F11;
+        case LPZ_KEY_F12:
+            return SDL_SCANCODE_F12;
+        case LPZ_KEY_LEFT_SHIFT:
+            return SDL_SCANCODE_LSHIFT;
+        case LPZ_KEY_LEFT_CONTROL:
+            return SDL_SCANCODE_LCTRL;
+        case LPZ_KEY_LEFT_ALT:
+            return SDL_SCANCODE_LALT;
+        case LPZ_KEY_LEFT_SUPER:
+            return SDL_SCANCODE_LGUI;
+        case LPZ_KEY_RIGHT_SHIFT:
+            return SDL_SCANCODE_RSHIFT;
+        case LPZ_KEY_RIGHT_CONTROL:
+            return SDL_SCANCODE_RCTRL;
+        case LPZ_KEY_RIGHT_ALT:
+            return SDL_SCANCODE_RALT;
+        case LPZ_KEY_RIGHT_SUPER:
+            return SDL_SCANCODE_RGUI;
+        case LPZ_KEY_MENU:
+            return SDL_SCANCODE_MENU;
+        default:
+            return SDL_SCANCODE_UNKNOWN;
+    }
+}
+
+// ============================================================================
+// INPUT QUERIES
+// ============================================================================
+
+static void lpz_sdl_set_resize_callback(lpz_window_t window, LpzWindowResizeCallback callback, void *userdata)
+{
+    struct window_t *win = win_get(window);
+    if (!win)
+        return;
+    win->resize_callback = callback;
+    win->resize_userdata = userdata;
+}
+
+static void lpz_sdl_get_framebuffer_size(lpz_window_t window, uint32_t *width, uint32_t *height)
+{
+    struct window_t *win = win_get(window);
+    if (!win)
+        return;
+    int w = 0, h = 0;
+    SDL_GetWindowSizeInPixels(win->handle, &w, &h);
+    if (width)
+        *width = (uint32_t)w;
+    if (height)
+        *height = (uint32_t)h;
+}
+
+static bool lpz_sdl_was_resized(lpz_window_t window)
+{
+    struct window_t *win = win_get(window);
+    if (!win)
+        return false;
+    bool r = win->resized_last_frame;
+    win->resized_last_frame = false;
+    return r;
+}
+
+static LpzInputAction lpz_sdl_get_key(lpz_window_t window, LpzKey key)
+{
+    struct window_t *win = win_get(window);
+    if (!win || (int)key < 0 || (int)key > LPZ_KEY_LAST)
+        return LPZ_KEY_RELEASE;
+    return (LpzInputAction)win->keys[(int)key];
+}
+
+static bool lpz_sdl_get_mouse_button(lpz_window_t window, LpzMouseButton button)
+{
+    struct window_t *win = win_get(window);
+    if (!win || (int)button < 0 || (int)button >= LPZ_MOUSE_BUTTON_COUNT)
+        return false;
+    return win->mouse_buttons[(int)button] != 0;
+}
+
+static void lpz_sdl_get_mouse_position(lpz_window_t window, float *x, float *y)
+{
+    struct window_t *win = win_get(window);
+    if (!win)
+        return;
+    if (x)
+        *x = win->mouse_x;
+    if (y)
+        *y = win->mouse_y;
+}
+
+static uint32_t lpz_sdl_get_next_typed_char(lpz_window_t window)
+{
+    struct window_t *win = win_get(window);
+    if (!win)
+        return 0;
+    return char_queue_pop(&win->char_queue);
+}
+
+static void lpz_sdl_set_cursor_mode(lpz_window_t window, bool locked_and_hidden)
+{
+    struct window_t *win = win_get(window);
+    if (!win)
+        return;
+    SDL_SetWindowRelativeMouseMode(win->handle, locked_and_hidden);
+    if (locked_and_hidden)
+        SDL_HideCursor();
+    else
+        SDL_ShowCursor();
+}
+
+// ============================================================================
+// WINDOW STATE QUERIES
+// ============================================================================
+
+static bool lpz_sdl_is_ready(lpz_window_t window)
+{
+    struct window_t *win = win_get(window);
+    return win ? win->ready : false;
+}
+
+static bool lpz_sdl_is_fullscreen(lpz_window_t window)
+{
+    struct window_t *win = win_get(window);
+    return win ? ((SDL_GetWindowFlags(win->handle) & SDL_WINDOW_FULLSCREEN) != 0) : false;
+}
+
+static bool lpz_sdl_is_hidden(lpz_window_t window)
+{
+    struct window_t *win = win_get(window);
+    return win ? ((SDL_GetWindowFlags(win->handle) & SDL_WINDOW_HIDDEN) != 0) : false;
+}
+
+static bool lpz_sdl_is_minimized(lpz_window_t window)
+{
+    struct window_t *win = win_get(window);
+    return win ? ((SDL_GetWindowFlags(win->handle) & SDL_WINDOW_MINIMIZED) != 0) : false;
+}
+
+static bool lpz_sdl_is_maximized(lpz_window_t window)
+{
+    struct window_t *win = win_get(window);
+    return win ? ((SDL_GetWindowFlags(win->handle) & SDL_WINDOW_MAXIMIZED) != 0) : false;
+}
+
+static bool lpz_sdl_is_focused(lpz_window_t window)
+{
+    struct window_t *win = win_get(window);
+    return win ? ((SDL_GetWindowFlags(win->handle) & SDL_WINDOW_INPUT_FOCUS) != 0) : false;
+}
+
+// ============================================================================
+// WINDOW STATE MUTATIONS
+// ============================================================================
+
+static bool lpz_sdl_is_state(lpz_window_t window, uint32_t flags)
+{
+    struct window_t *win = win_get(window);
+    if (!win)
+        return false;
+    SDL_WindowFlags sdl = SDL_GetWindowFlags(win->handle);
+    if ((flags & LPZ_WINDOW_FLAG_RESIZABLE) && !(sdl & SDL_WINDOW_RESIZABLE))
+        return false;
+    if ((flags & LPZ_WINDOW_FLAG_UNDECORATED) && !(sdl & SDL_WINDOW_BORDERLESS))
+        return false;
+    if ((flags & LPZ_WINDOW_FLAG_HIDDEN) && !(sdl & SDL_WINDOW_HIDDEN))
+        return false;
+    if ((flags & LPZ_WINDOW_FLAG_FULLSCREEN) && !(sdl & SDL_WINDOW_FULLSCREEN))
+        return false;
+    if ((flags & LPZ_WINDOW_FLAG_ALWAYS_ON_TOP) && !(sdl & SDL_WINDOW_ALWAYS_ON_TOP))
+        return false;
+    if ((flags & LPZ_WINDOW_FLAG_TRANSPARENT) && !(sdl & SDL_WINDOW_TRANSPARENT))
+        return false;
+    return true;
+}
+
+static void lpz_sdl_set_state(lpz_window_t window, uint32_t flags)
+{
+    struct window_t *win = win_get(window);
+    if (!win)
+        return;
+    if (flags & LPZ_WINDOW_FLAG_RESIZABLE)
+        SDL_SetWindowResizable(win->handle, true);
+    if (flags & LPZ_WINDOW_FLAG_UNDECORATED)
+        SDL_SetWindowBordered(win->handle, false);
+    if (flags & LPZ_WINDOW_FLAG_HIDDEN)
+        SDL_HideWindow(win->handle);
+    if (flags & LPZ_WINDOW_FLAG_ALWAYS_ON_TOP)
+        SDL_SetWindowAlwaysOnTop(win->handle, true);
+    if (flags & LPZ_WINDOW_FLAG_FULLSCREEN)
+        lpz_sdl_toggle_fullscreen(window);
+    if (flags & LPZ_WINDOW_FLAG_BORDERLESS_WINDOWED)
+        lpz_sdl_toggle_borderless_windowed(window);
+    win->flags |= flags;
+}
+
+static void lpz_sdl_clear_state(lpz_window_t window, uint32_t flags)
+{
+    struct window_t *win = win_get(window);
+    if (!win)
+        return;
+    if (flags & LPZ_WINDOW_FLAG_RESIZABLE)
+        SDL_SetWindowResizable(win->handle, false);
+    if (flags & LPZ_WINDOW_FLAG_UNDECORATED)
+        SDL_SetWindowBordered(win->handle, true);
+    if (flags & LPZ_WINDOW_FLAG_HIDDEN)
+        SDL_ShowWindow(win->handle);
+    if (flags & LPZ_WINDOW_FLAG_ALWAYS_ON_TOP)
+        SDL_SetWindowAlwaysOnTop(win->handle, false);
+    if ((flags & LPZ_WINDOW_FLAG_FULLSCREEN) && lpz_sdl_is_fullscreen(window))
+        lpz_sdl_toggle_fullscreen(window);
+    if ((flags & LPZ_WINDOW_FLAG_BORDERLESS_WINDOWED) && !lpz_sdl_is_fullscreen(window))
+    {
+        SDL_SetWindowBordered(win->handle, true);
+        if (win->windowed_w > 0)
+        {
+            SDL_SetWindowSize(win->handle, win->windowed_w, win->windowed_h);
+            SDL_SetWindowPosition(win->handle, win->windowed_x, win->windowed_y);
+        }
+    }
+    win->flags &= ~flags;
+}
+
+static void lpz_sdl_toggle_fullscreen(lpz_window_t window)
+{
+    struct window_t *win = win_get(window);
+    if (!win)
+        return;
+    SDL_WindowFlags sdl_flags = SDL_GetWindowFlags(win->handle);
+    if (sdl_flags & SDL_WINDOW_FULLSCREEN)
+    {
+        SDL_SetWindowFullscreen(win->handle, false);
+    }
+    else
+    {
+        SDL_GetWindowPosition(win->handle, &win->windowed_x, &win->windowed_y);
+        SDL_GetWindowSize(win->handle, &win->windowed_w, &win->windowed_h);
+        SDL_SetWindowFullscreen(win->handle, true);
+    }
+}
+
+static void lpz_sdl_toggle_borderless_windowed(lpz_window_t window)
+{
+    struct window_t *win = win_get(window);
+    if (!win)
+        return;
+    SDL_WindowFlags sdl_flags = SDL_GetWindowFlags(win->handle);
+    bool currently_fullscreen = (sdl_flags & SDL_WINDOW_FULLSCREEN) != 0;
+    bool currently_borderless = (sdl_flags & SDL_WINDOW_BORDERLESS) != 0;
+
+    if (currently_fullscreen || currently_borderless)
+    {
+        SDL_SetWindowFullscreen(win->handle, false);
+        SDL_SetWindowBordered(win->handle, true);
+        if (win->windowed_w > 0 && win->windowed_h > 0)
+            SDL_SetWindowSize(win->handle, win->windowed_w, win->windowed_h);
+        SDL_SetWindowPosition(win->handle, win->windowed_x, win->windowed_y);
+    }
+    else
+    {
+        SDL_GetWindowPosition(win->handle, &win->windowed_x, &win->windowed_y);
+        SDL_GetWindowSize(win->handle, &win->windowed_w, &win->windowed_h);
+        const SDL_DisplayMode *mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(win->handle));
+        if (mode)
+        {
+            SDL_SetWindowBordered(win->handle, false);
+            SDL_SetWindowPosition(win->handle, 0, 0);
+            SDL_SetWindowSize(win->handle, mode->w, mode->h);
+        }
+    }
+}
+
+static void lpz_sdl_maximize(lpz_window_t window)
+{
+    struct window_t *win = win_get(window);
+    if (win)
+        SDL_MaximizeWindow(win->handle);
+}
+
+static void lpz_sdl_minimize(lpz_window_t window)
+{
+    struct window_t *win = win_get(window);
+    if (win)
+        SDL_MinimizeWindow(win->handle);
+}
+
+static void lpz_sdl_restore(lpz_window_t window)
+{
+    struct window_t *win = win_get(window);
+    if (win)
+        SDL_RestoreWindow(win->handle);
+}
+
+// ============================================================================
+// WINDOW PROPERTIES
+// ============================================================================
+
+static void lpz_sdl_set_title(lpz_window_t window, const char *title)
+{
+    struct window_t *win = win_get(window);
+    if (win && title)
+        SDL_SetWindowTitle(win->handle, title);
+}
+
+static void lpz_sdl_set_position(lpz_window_t window, int x, int y)
+{
+    struct window_t *win = win_get(window);
+    if (win)
+        SDL_SetWindowPosition(win->handle, x, y);
+}
+
+static void lpz_sdl_set_size(lpz_window_t window, int width, int height)
+{
+    struct window_t *win = win_get(window);
+    if (win)
+        SDL_SetWindowSize(win->handle, width, height);
+}
+
+static void lpz_sdl_set_min_size(lpz_window_t window, int width, int height)
+{
+    struct window_t *win = win_get(window);
+    if (win)
+        SDL_SetWindowMinimumSize(win->handle, width, height);
+}
+
+static void lpz_sdl_set_max_size(lpz_window_t window, int width, int height)
+{
+    struct window_t *win = win_get(window);
+    if (win)
+        SDL_SetWindowMaximumSize(win->handle, width, height);
+}
+
+static void lpz_sdl_set_opacity(lpz_window_t window, float opacity)
+{
+    struct window_t *win = win_get(window);
+    if (!win)
+        return;
+    if (opacity < 0.0f)
+        opacity = 0.0f;
+    if (opacity > 1.0f)
+        opacity = 1.0f;
+    SDL_SetWindowOpacity(win->handle, opacity);
+}
+
+static void lpz_sdl_focus_window(lpz_window_t window)
+{
+    struct window_t *win = win_get(window);
+    if (win)
+        SDL_RaiseWindow(win->handle);
+}
+
+// ============================================================================
+// TIME
+// ============================================================================
+
+static double lpz_sdl_get_time(void)
+{
+    return (double)SDL_GetTicksNS() / 1.0e9;
+}
+
+// ============================================================================
+// NATIVE HANDLE
+// ============================================================================
+
+static void *lpz_sdl_get_native_handle(lpz_window_t window)
+{
+    struct window_t *win = win_get(window);
+    if (!win)
+        return NULL;
+
+#if defined(__APPLE__)
+    /* mtl_surface.m casts this to NSWindow*. SDL3 exposes the underlying
+     * Cocoa window via its property API. */
+    SDL_PropertiesID props = SDL_GetWindowProperties(win->handle);
+    return SDL_GetPointerProperty(props, SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, NULL);
+#elif defined(_WIN32)
+    SDL_PropertiesID props = SDL_GetWindowProperties(win->handle);
+    return SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+#else
+    /* Wayland / X11: return the SDL_Window* and let the caller decide. */
+    return (void *)win->handle;
+#endif
+}
+
+// ============================================================================
+// VULKAN HELPERS
+// ============================================================================
+
+static const char **lpz_sdl_get_required_vulkan_extensions(lpz_window_t window, uint32_t *out_count)
+{
+    (void)window;
+    return (const char **)SDL_Vulkan_GetInstanceExtensions(out_count);
+}
+
+static int lpz_sdl_create_vulkan_surface(lpz_window_t window, void *vk_instance, void *vk_allocator, void *out_surface)
+{
+    (void)vk_allocator;
+    struct window_t *win = win_get(window);
+    if (!win)
+        return -1;
+    if (!SDL_Vulkan_CreateSurface(win->handle, (VkInstance)vk_instance, NULL, (VkSurfaceKHR *)out_surface))
+    {
+        LPZ_ERROR("[SDL] Failed to create Vulkan surface: %s", SDL_GetError());
+        return -1;
+    }
+    return 0;
+}
+
+// ============================================================================
+// API TABLE
+// ============================================================================
+
+const LpzPlatformAPI LpzSDL3Platform = {
+    .api_version = LPZ_PLATFORM_API_VERSION,
+
+    .Init = lpz_sdl_init,
+    .Terminate = lpz_sdl_terminate,
+
+    .CreateWindow = lpz_sdl_create_window,
+    .DestroyWindow = lpz_sdl_destroy_window,
+    .ShouldClose = lpz_sdl_should_close,
+    .PollEvents = lpz_sdl_poll_events,
+
+    .SetTitle = lpz_sdl_set_title,
+    .SetPosition = lpz_sdl_set_position,
+    .SetSize = lpz_sdl_set_size,
+    .SetMinSize = lpz_sdl_set_min_size,
+    .SetMaxSize = lpz_sdl_set_max_size,
+    .SetOpacity = lpz_sdl_set_opacity,
+    .FocusWindow = lpz_sdl_focus_window,
+
+    .GetFramebufferSize = lpz_sdl_get_framebuffer_size,
+    .WasResized = lpz_sdl_was_resized,
+    .SetResizeCallback = lpz_sdl_set_resize_callback,
+
+    .GetKey = lpz_sdl_get_key,
+    .GetNextTypedChar = lpz_sdl_get_next_typed_char,
+    .GetMouseButton = lpz_sdl_get_mouse_button,
+    .GetMousePosition = lpz_sdl_get_mouse_position,
+    .SetCursorMode = lpz_sdl_set_cursor_mode,
+
+    .IsReady = lpz_sdl_is_ready,
+    .IsFullscreen = lpz_sdl_is_fullscreen,
+    .IsHidden = lpz_sdl_is_hidden,
+    .IsMinimized = lpz_sdl_is_minimized,
+    .IsMaximized = lpz_sdl_is_maximized,
+    .IsFocused = lpz_sdl_is_focused,
+    .IsState = lpz_sdl_is_state,
+    .SetState = lpz_sdl_set_state,
+    .ClearState = lpz_sdl_clear_state,
+
+    .ToggleFullscreen = lpz_sdl_toggle_fullscreen,
+    .ToggleBorderlessWindowed = lpz_sdl_toggle_borderless_windowed,
+    .Maximize = lpz_sdl_maximize,
+    .Minimize = lpz_sdl_minimize,
+    .Restore = lpz_sdl_restore,
+
+    .GetTime = lpz_sdl_get_time,
+
+    .GetNativeHandle = lpz_sdl_get_native_handle,
+    .GetRequiredVulkanExtensions = lpz_sdl_get_required_vulkan_extensions,
+    .CreateVulkanSurface = lpz_sdl_create_vulkan_surface,
+};
